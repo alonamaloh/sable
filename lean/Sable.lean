@@ -15,6 +15,7 @@ import Sable.SVMEval
 import Sable.OwnershipFrame
 import Sable.SVMArrayTests
 import Sable.SVMOptionTests
+import Sable.SVMSlotTests
 import Sable.SVMRawTests
 import Sable.MMIO
 import Sable.SVMUart

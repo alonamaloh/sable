@@ -1,0 +1,57 @@
+// Phase-one SVM differential subjects for direct local `slots<bool>`.
+// This file intentionally has no slot parameters/results, classes, members,
+// destructors, or Vec surface: those remain outside the formal bridge.
+
+fn slots_bool_roundtrip() -> bool {
+    mut slots<bool> cells = alloc_slots<bool>(2);
+    bool incoming = true;
+    slot_put(&mut cells, 1, incoming);
+    bool restored = slot_take(&mut cells, 1);
+    return restored;
+}
+
+fn slots_bool_len() -> u64 {
+    slots<bool> cells = alloc_slots<bool>(3);
+    return cells.len;
+}
+
+fn slots_bool_empty_take() -> bool {
+    mut slots<bool> cells = alloc_slots<bool>(1);
+    return slot_take(&mut cells, 0);
+}
+
+fn slots_bool_occupied_put() -> bool {
+    mut slots<bool> cells = alloc_slots<bool>(1);
+    slot_put(&mut cells, 0, false);
+    slot_put(&mut cells, 0, true);
+    return false;
+}
+
+fn slots_bool_oob_take() -> bool {
+    mut slots<bool> cells = alloc_slots<bool>(1);
+    return slot_take(&mut cells, 4);
+}
+
+fn slots_bool_oom() -> u64 {
+    slots<bool> cells = alloc_slots<bool>(50000001);
+    return cells.len;
+}
+
+// Index evaluation precedes value staging. Both operands would trap; the
+// overflowing index must win before the value's out-of-bounds read.
+fn slots_bool_put_index_trap_first() -> bool {
+    mut slots<bool> cells = alloc_slots<bool>(1);
+    [bool] source = [true];
+    u64 largest = 18446744073709551615;
+    slot_put(&mut cells, largest + 1, source[7]);
+    return false;
+}
+
+// Once the index value exists, the incoming value is staged before either
+// bounds or occupancy is consulted, so its trap beats the destination OOB.
+fn slots_bool_put_value_trap_before_guard() -> bool {
+    mut slots<bool> cells = alloc_slots<bool>(1);
+    [bool] source = [true];
+    slot_put(&mut cells, 99, source[7]);
+    return false;
+}

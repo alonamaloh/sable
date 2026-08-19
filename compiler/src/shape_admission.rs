@@ -128,6 +128,15 @@ pub(crate) fn samples() -> Vec<(&'static str, Ty)> {
         ("&mut [bool]", Ty::array_ref(Ty::Bool, Mutability::Mut)),
         ("[record]", Ty::array(Ty::Record(0))),
         ("[type parameter]", Ty::array(Ty::Param(param()))),
+        ("slots<bool>", Ty::slots(Ty::Bool)),
+        (
+            "&slots<bool>",
+            Ty::borrow(Mutability::Shared, Ty::slots(Ty::Bool)),
+        ),
+        (
+            "&mut slots<bool>",
+            Ty::borrow(Mutability::Mut, Ty::slots(Ty::Bool)),
+        ),
         ("slots<u64>", Ty::slots(Ty::Int(IntTy::U64))),
         ("slots<class>", Ty::slots(Ty::Class(0))),
         (
@@ -1283,6 +1292,48 @@ fn every_constructor_has_a_sample() {
         assert!(
             covered.contains(expected),
             "`Ty::{expected}` has no sample in the shape-admission table"
+        );
+    }
+}
+
+/// The one slot payload admitted by the phase-one SVM needs positive as well
+/// as negative matrix coverage.  `svm type` is the representation gate used
+/// by local lowering; parameters and owned returns remain a deliberately
+/// closed call ABI, while borrowed returns retain the more general loan-return
+/// refusal.
+#[test]
+fn svm_boolean_slot_rows_pin_local_representation_and_closed_call_abi() {
+    fn gate(ty: &Ty, name: &str) -> String {
+        let index = GATES
+            .iter()
+            .position(|candidate| candidate.name == name)
+            .expect("the named SVM gate is a matrix column");
+        answers(ty, "Boolean slot ratchet")[index].render()
+    }
+
+    let owned = Ty::slots(Ty::Bool);
+    assert_eq!(gate(&owned, "svm type"), "yes");
+    assert_eq!(
+        gate(&owned, "svm parameter"),
+        "`svm.slots_call_abi_unsupported`"
+    );
+    assert_eq!(
+        gate(&owned, "svm return"),
+        "`svm.slots_call_abi_unsupported`"
+    );
+
+    for borrowed in [
+        Ty::borrow(Mutability::Shared, owned.clone()),
+        Ty::borrow(Mutability::Mut, owned),
+    ] {
+        assert_eq!(gate(&borrowed, "svm type"), "yes");
+        assert_eq!(
+            gate(&borrowed, "svm parameter"),
+            "`svm.slots_call_abi_unsupported`"
+        );
+        assert_eq!(
+            gate(&borrowed, "svm return"),
+            "`svm.borrow_return_unsupported`"
         );
     }
 }

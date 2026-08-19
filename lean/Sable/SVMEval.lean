@@ -179,6 +179,7 @@ def evalE (cap : Int) (ρ : Env) : Expr → EOut
   | .len x =>
       match ρ x with
       | some (.arr _ a) => .ok (.int a.len)
+      | some (.slots _ cells) => .ok (.int cells.len)
       | _               => .abort .undef
   | .index x e =>
       (evalE cap ρ e).bindInt fun n =>
@@ -291,7 +292,8 @@ theorem Eval.evalE_eq {cap : Int} {ρ : Env} {e : Expr} {out : EOut}
   | or_undef₂ h₁ h₂ hv ih₁ ih₂ => simp [evalE, ih₁, ih₂, EOut.bindBool_ok_of_ne _ hv]
   | or_abort₂ h₁ h₂ ih₁ ih₂ => simp [evalE, ih₁, ih₂]
   | len h => simp [evalE, h]
-  | len_undef h =>
+  | len_slots h => simp [evalE, h]
+  | len_undef ha hs =>
       simp only [evalE]
   | index_ok hi ha h₀ h₁ ih => simp [evalE, ih, ha, h₀, h₁]
   | index_oob hi ha hoob ih =>
@@ -376,6 +378,7 @@ private theorem eval_bindInt {cap : Int} {ρ : Env} {e tgt : Expr} {f : Int → 
     | unit => simpa [EOut.bindInt] using Hundef _ ih nofun
     | bool b => simpa [EOut.bindInt] using Hundef _ ih nofun
     | arr t a => simpa [EOut.bindInt] using Hundef _ ih nofun
+    | slots t cells => simpa [EOut.bindInt] using Hundef _ ih nofun
     | opt o => simpa [EOut.bindInt] using Hundef _ ih nofun
     | ptr a k => simpa [EOut.bindInt] using Hundef _ ih nofun
     | record tag fields => simpa [EOut.bindInt] using Hundef _ ih nofun
@@ -396,6 +399,7 @@ private theorem eval_bindBool {cap : Int} {ρ : Env} {e tgt : Expr} {f : Bool �
     | unit => simpa [EOut.bindBool] using Hundef _ ih nofun
     | int n => simpa [EOut.bindBool] using Hundef _ ih nofun
     | arr t a => simpa [EOut.bindBool] using Hundef _ ih nofun
+    | slots t cells => simpa [EOut.bindBool] using Hundef _ ih nofun
     | ptr a k => simpa [EOut.bindBool] using Hundef _ ih nofun
     | opt o => simpa [EOut.bindBool] using Hundef _ ih nofun
     | record tag fields => simpa [EOut.bindBool] using Hundef _ ih nofun
@@ -437,6 +441,7 @@ private theorem eval_bindPtr {cap : Int} {ρ : Env} {e tgt : Expr} {f : Int → 
     | int n => simpa [EOut.bindPtr] using Hundef _ ih nofun
     | bool b => simpa [EOut.bindPtr] using Hundef _ ih nofun
     | arr t a => simpa [EOut.bindPtr] using Hundef _ ih nofun
+    | slots t cells => simpa [EOut.bindPtr] using Hundef _ ih nofun
     | opt o => simpa [EOut.bindPtr] using Hundef _ ih nofun
     | record tag fields => simpa [EOut.bindPtr] using Hundef _ ih nofun
 
@@ -458,6 +463,7 @@ private theorem eval_bindOpt {cap : Int} {ρ : Env} {e tgt : Expr}
     | int n => simpa [EOut.bindOpt] using Hundef _ ih nofun
     | bool b => simpa [EOut.bindOpt] using Hundef _ ih nofun
     | arr t a => simpa [EOut.bindOpt] using Hundef _ ih nofun
+    | slots t cells => simpa [EOut.bindOpt] using Hundef _ ih nofun
     | ptr a k => simpa [EOut.bindOpt] using Hundef _ ih nofun
     | record tag fields => simpa [EOut.bindOpt] using Hundef _ ih nofun
 
@@ -572,11 +578,18 @@ theorem evalE_eval (cap : Int) (ρ : Env) : ∀ e, Eval cap ρ e (evalE cap ρ e
             (fun v h₂ hv => .or_undef₂ h₁ h₂ hv) fun c h₂ => .or_false h₁ h₂
   | len x =>
       cases hx : ρ x with
-      | none => simpa [evalE, hx] using Eval.len_undef (fun t a h => by simp [hx] at h)
+      | none =>
+          simpa [evalE, hx] using Eval.len_undef
+            (fun t a h => by simp [hx] at h)
+            (fun t cells h => by simp [hx] at h)
       | some v =>
           cases v with
           | arr t a => simpa [evalE, hx] using Eval.len hx
-          | _ => simpa [evalE, hx] using Eval.len_undef (fun t a h => by simp [hx] at h)
+          | slots t cells => simpa [evalE, hx] using Eval.len_slots hx
+          | _ =>
+              simpa [evalE, hx] using Eval.len_undef
+                (fun t a h => by simp [hx] at h)
+                (fun t cells h => by simp [hx] at h)
   | index x e ih =>
       simp only [evalE]
       refine eval_bindInt ih (fun a h => .index_abort h)
@@ -806,6 +819,47 @@ def stepF (P : Prog) (cap : Int) : Config → Option Config
             match ρ src with
             | some value => .run k ((ρ.clear src).update dst value) σ μ
             | none => .undef)
+  | .run (.slotAlloc dst elem e :: k) ρ σ μ =>
+      some ((evalE cap ρ e).stepInt fun n =>
+        if n < 0 then .undef
+        else if n ≤ cap then
+          .run k (ρ.update dst (.slots elem (Seq.replicate n none))) σ μ
+        else .trapped (.oom n))
+  | .run (.slotTake dst container elem e :: k) ρ σ μ =>
+      some (if dst = container then .undef else
+        (evalE cap ρ e).stepInt fun n =>
+          match ρ container with
+          | some (.slots actual cells) =>
+              if actual = elem then
+                if 0 ≤ n ∧ n < cells.len then
+                  match cells.get n with
+                  | some value =>
+                      .run k ((ρ.update container (.slots elem (cells.set n none))).update
+                        dst value) σ μ
+                  | none => .trapped (.slotEmpty n)
+                else .trapped (.indexOOB n cells.len)
+              else .undef
+          | _ => .undef)
+  | .run (.slotPut container elem e staged :: k) ρ σ μ =>
+      some (if container = staged then .undef else
+        match ρ staged with
+        | none => .undef
+        | some value =>
+            if value.slotTag? = some elem then
+              (evalE cap ρ e).stepInt fun n =>
+                match ρ container with
+                | some (.slots actual cells) =>
+                    if actual = elem then
+                      if 0 ≤ n ∧ n < cells.len then
+                        match cells.get n with
+                        | none =>
+                            .run k ((ρ.clear staged).update container
+                              (.slots elem (cells.set n (some value)))) σ μ
+                        | some _ => .trapped (.slotOccupied n)
+                      else .trapped (.indexOOB n cells.len)
+                    else .undef
+                | _ => .undef
+            else .undef)
   | .run (.optTake dst src :: k) ρ σ μ =>
       some (if dst = src then .undef else
         match ρ src with
@@ -962,6 +1016,22 @@ def stepF (P : Prog) (cap : Int) : Config → Option Config
 
 /-! ## Step agreement -/
 
+private theorem slotContainer_undef {ρ : Env} {container : String} {elem : SlotTag}
+    (f : Seq (Option Val) → Config)
+    (hc : ∀ cells, ρ container ≠ some (.slots elem cells)) :
+    (match ρ container with
+     | some (.slots actual cells) => if actual = elem then f cells else .undef
+     | _ => .undef) = .undef := by
+  cases hs : ρ container with
+  | none => rfl
+  | some value =>
+      cases value with
+      | slots actual cells =>
+          by_cases ht : actual = elem
+          · subst actual; exact absurd hs (hc cells)
+          · simp [ht]
+      | _ => rfl
+
 /-- Every step computes. -/
 theorem Step.stepF_eq {P : Prog} {cap : Int} {c c' : Config} (h : Step P cap c c') :
     stepF P cap c = some c' := by
@@ -973,6 +1043,52 @@ theorem Step.stepF_eq {P : Prog} {cap : Int} {c c' : Config} (h : Step P cap c c
   | moveLocal_undef_alias heq => simp [stepF, heq]
   | moveLocal_undef_dst hne hd => simp [stepF, hne, hd]
   | moveLocal_undef_src hne hd hs => simp [stepF, hne, hd, hs]
+  | slotAlloc_ok h h₀ hc =>
+      simp only [stepF, h.evalE_eq, EOut.stepInt_int]
+      rw [if_neg (by omega), if_pos hc]
+  | slotAlloc_oom h h₀ hc =>
+      simp only [stepF, h.evalE_eq, EOut.stepInt_int]
+      rw [if_neg (by omega), if_neg (by omega)]
+  | slotAlloc_neg h h₀ => simp [stepF, h.evalE_eq, h₀]
+  | slotAlloc_undef_len h hv =>
+      simp [stepF, h.evalE_eq, EOut.stepInt_ok_of_ne _ hv]
+  | slotAlloc_abort h => simp [stepF, h.evalE_eq]
+  | slotTake_ok hne hi hc h₀ h₁ hv =>
+      simp [stepF, hne, hi.evalE_eq, hc, h₀, h₁, hv]
+  | slotTake_empty hne hi hc h₀ h₁ hv =>
+      simp [stepF, hne, hi.evalE_eq, hc, h₀, h₁, hv]
+  | slotTake_oob hne hi hc hoob =>
+      simp only [stepF, hne, ↓reduceIte, hi.evalE_eq,
+        EOut.stepInt_int, hc, ↓reduceIte]
+      rw [if_neg (by omega)]
+  | slotTake_undef_alias heq => simp [stepF, heq]
+  | slotTake_undef_idx hne hi hv =>
+      simp [stepF, hne, hi.evalE_eq, EOut.stepInt_ok_of_ne _ hv]
+  | slotTake_abort hne hi => simp [stepF, hne, hi.evalE_eq]
+  | slotTake_undef_container hne hi hc =>
+      simp only [stepF, hne, ↓reduceIte, hi.evalE_eq,
+        EOut.stepInt_int]
+      congr 1
+      exact slotContainer_undef _ hc
+  | slotPut_ok hne hs ht hi hc h₀ h₁ he =>
+      simp [stepF, hne, hs, ht, hi.evalE_eq, hc, h₀, h₁, he]
+  | slotPut_occupied hne hs ht hi hc h₀ h₁ he =>
+      simp [stepF, hne, hs, ht, hi.evalE_eq, hc, h₀, h₁, he]
+  | slotPut_oob hne hs ht hi hc hoob =>
+      simp only [stepF, hne, ↓reduceIte, hs, ht,
+        hi.evalE_eq, EOut.stepInt_int, hc, ↓reduceIte]
+      rw [if_neg (by omega)]
+  | slotPut_undef_alias heq => simp [stepF, heq]
+  | slotPut_undef_staged hne hs => simp [stepF, hne, hs]
+  | slotPut_undef_tag hne hs ht => simp [stepF, hne, hs, ht]
+  | slotPut_undef_idx hne hs ht hi hv =>
+      simp [stepF, hne, hs, ht, hi.evalE_eq, EOut.stepInt_ok_of_ne _ hv]
+  | slotPut_abort hne hs ht hi => simp [stepF, hne, hs, ht, hi.evalE_eq]
+  | slotPut_undef_container hne hs ht hi hc =>
+      simp only [stepF, hne, ↓reduceIte, hs, ht,
+        hi.evalE_eq, EOut.stepInt_int]
+      congr 1
+      exact slotContainer_undef _ hc
   | optTake_ok hne hs => simp [stepF, hne, hs]
   | optTake_none hne hs => simp [stepF, hne, hs]
   | optTake_undef_alias heq => simp [stepF, heq]
@@ -1151,6 +1267,7 @@ private theorem step_stepInt {P : Prog} {cap : Int} {ρ : Env} {e : Expr} {c₀ 
     | bool b => simpa [EOut.stepInt] using Hundef _ ih nofun
     | ptr a k => simpa [EOut.stepInt] using Hundef _ ih nofun
     | arr t a => simpa [EOut.stepInt] using Hundef _ ih nofun
+    | slots t cells => simpa [EOut.stepInt] using Hundef _ ih nofun
     | opt o => simpa [EOut.stepInt] using Hundef _ ih nofun
     | record tag fields => simpa [EOut.stepInt] using Hundef _ ih nofun
 
@@ -1171,6 +1288,7 @@ private theorem step_stepBool {P : Prog} {cap : Int} {ρ : Env} {e : Expr} {c₀
     | int n => simpa [EOut.stepBool] using Hundef _ ih nofun
     | ptr a k => simpa [EOut.stepBool] using Hundef _ ih nofun
     | arr t a => simpa [EOut.stepBool] using Hundef _ ih nofun
+    | slots t cells => simpa [EOut.stepBool] using Hundef _ ih nofun
     | opt o => simpa [EOut.stepBool] using Hundef _ ih nofun
     | record tag fields => simpa [EOut.stepBool] using Hundef _ ih nofun
 
@@ -1207,6 +1325,7 @@ private theorem step_stepPtr {P : Prog} {cap : Int} {ρ : Env} {e : Expr} {c₀ 
     | int n => simpa [EOut.stepPtr] using Hundef _ ih nofun
     | bool b => simpa [EOut.stepPtr] using Hundef _ ih nofun
     | arr t a => simpa [EOut.stepPtr] using Hundef _ ih nofun
+    | slots t cells => simpa [EOut.stepPtr] using Hundef _ ih nofun
     | opt o => simpa [EOut.stepPtr] using Hundef _ ih nofun
     | record tag fields => simpa [EOut.stepPtr] using Hundef _ ih nofun
 
@@ -1261,6 +1380,104 @@ theorem stepF_sound {P : Prog} {cap : Int} {c c' : Config}
                     simpa [hd, hs] using
                       Step.moveLocal_ok (P := P) (k := k) (σ := σ) (μ := μ)
                         heq hd hs
+      | slotAlloc dst elem e =>
+          simp only [stepF, Option.some.injEq] at h
+          subst h
+          refine step_stepInt (fun ab he => .slotAlloc_abort he)
+            (fun v he hv => .slotAlloc_undef_len he hv) fun n he => ?_
+          by_cases hneg : n < 0
+          · rw [if_pos hneg]; exact .slotAlloc_neg he hneg
+          · rw [if_neg hneg]
+            by_cases hc : n ≤ cap
+            · rw [if_pos hc]; exact .slotAlloc_ok he (by omega) hc
+            · rw [if_neg hc]; exact .slotAlloc_oom he (by omega) (by omega)
+      | slotTake dst container elem e =>
+          simp only [stepF, Option.some.injEq] at h
+          subst h
+          by_cases heq : dst = container
+          · rw [if_pos heq]; exact .slotTake_undef_alias heq
+          · rw [if_neg heq]
+            refine step_stepInt (fun ab hi => .slotTake_abort heq hi)
+              (fun v hi hv => .slotTake_undef_idx heq hi hv) fun n hi => ?_
+            cases hc : ρ container with
+            | none =>
+                simpa [hc] using
+                  Step.slotTake_undef_container (P := P) (k := k) (σ := σ) (μ := μ)
+                    heq hi (by simp [hc])
+            | some containerValue =>
+                cases containerValue with
+                | slots actual cells =>
+                    by_cases ht : actual = elem
+                    · subst actual
+                      simp only [↓reduceIte]
+                      by_cases hb : 0 ≤ n ∧ n < cells.len
+                      · rw [if_pos hb]
+                        cases hv : cells.get n with
+                        | none => exact .slotTake_empty heq hi hc hb.1 hb.2 hv
+                        | some value => exact .slotTake_ok heq hi hc hb.1 hb.2 hv
+                      · rw [if_neg hb]
+                        exact .slotTake_oob heq hi hc (by omega)
+                    · simpa [ht] using
+                        Step.slotTake_undef_container (P := P) (k := k) (σ := σ)
+                          (μ := μ) heq hi (by
+                            intro cells' hsame
+                            rw [hc] at hsame
+                            have hval := Option.some.inj hsame
+                            injection hval with htag
+                            exact ht htag)
+                | _ =>
+                    simpa [hc] using
+                      Step.slotTake_undef_container (P := P) (k := k) (σ := σ)
+                        (μ := μ) heq hi (by simp [hc])
+      | slotPut container elem e staged =>
+          simp only [stepF, Option.some.injEq] at h
+          subst h
+          by_cases heq : container = staged
+          · rw [if_pos heq]; exact .slotPut_undef_alias heq
+          · rw [if_neg heq]
+            cases hs : ρ staged with
+            | none =>
+                simpa [hs] using
+                  (Step.slotPut_undef_staged (P := P) (k := k) (σ := σ)
+                    (μ := μ) heq hs)
+            | some value =>
+                by_cases ht : value.slotTag? = some elem
+                · simp only [if_pos ht]
+                  refine step_stepInt (fun ab hi => .slotPut_abort heq hs ht hi)
+                    (fun v hi hv => .slotPut_undef_idx heq hs ht hi hv) fun n hi => ?_
+                  cases hc : ρ container with
+                  | none =>
+                      simpa [hc] using
+                        Step.slotPut_undef_container (P := P) (k := k) (σ := σ)
+                          (μ := μ) heq hs ht hi (by simp [hc])
+                  | some containerValue =>
+                      cases containerValue with
+                      | slots actual cells =>
+                          by_cases htag : actual = elem
+                          · subst actual
+                            simp only [↓reduceIte]
+                            by_cases hb : 0 ≤ n ∧ n < cells.len
+                            · rw [if_pos hb]
+                              cases he : cells.get n with
+                              | none => exact .slotPut_ok heq hs ht hi hc hb.1 hb.2 he
+                              | some existing =>
+                                  exact .slotPut_occupied heq hs ht hi hc hb.1 hb.2 he
+                            · rw [if_neg hb]
+                              exact .slotPut_oob heq hs ht hi hc (by omega)
+                          · simpa [htag] using
+                              Step.slotPut_undef_container (P := P) (k := k) (σ := σ)
+                                (μ := μ) heq hs ht hi (by
+                                  intro cells' hsame
+                                  rw [hc] at hsame
+                                  have hval := Option.some.inj hsame
+                                  injection hval with htag'
+                                  exact htag htag')
+                      | _ =>
+                          simpa [hc] using
+                            Step.slotPut_undef_container (P := P) (k := k) (σ := σ)
+                              (μ := μ) heq hs ht hi (by simp [hc])
+                · simp only [if_neg ht]
+                  exact .slotPut_undef_tag heq hs ht
       | optTake dst src =>
           simp only [stepF, Option.some.injEq] at h
           subst h
@@ -1298,6 +1515,10 @@ theorem stepF_sound {P : Prog} {cap : Int} {c c' : Config}
                       Step.optTake_undef_src (P := P) (k := k) (σ := σ) (μ := μ)
                         heq (by simp [hs])
                 | arr t a =>
+                    simpa [hs] using
+                      Step.optTake_undef_src (P := P) (k := k) (σ := σ) (μ := μ)
+                        heq (by simp [hs])
+                | slots t cells =>
                     simpa [hs] using
                       Step.optTake_undef_src (P := P) (k := k) (σ := σ) (μ := μ)
                         heq (by simp [hs])
@@ -1641,6 +1862,13 @@ partial def Val.render : Val → String
       "arr [" ++ String.intercalate ", "
         ((List.range a.len.toNat).map fun i => (a.get (Int.ofNat i)).renderInner)
         ++ "]"
+  | .slots _ cells =>
+      "slots [" ++ String.intercalate ", "
+        ((List.range cells.len.toNat).map fun i =>
+          match cells.get (Int.ofNat i) with
+          | none => "none"
+          | some value => "some " ++ value.renderInner)
+        ++ "]"
   | .opt none => "opt none"
   | .opt (some value) => "opt some " ++ value.renderInner
   | .record tag fields =>
@@ -1665,6 +1893,8 @@ def Trap.render : Trap → String
   | .indexOOB i len => s!"trap indexOOB {i} {len}"
   | .narrowOOB t n => s!"trap narrowOOB {t.render} {n}"
   | .oom len => s!"trap oom {len}"
+  | .slotEmpty i => s!"trap slotEmpty {i}"
+  | .slotOccupied i => s!"trap slotOccupied {i}"
   | .deferViolation name => s!"trap deferViolation {name}"
 
 def Config.render : Config → String

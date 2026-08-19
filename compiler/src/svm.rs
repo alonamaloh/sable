@@ -17,12 +17,12 @@ use crate::ast::*;
 use crate::control::summarize_block;
 use crate::control::{
     AssignmentStaging, BlockKind, BodyPlan, BranchArm, BranchArmPlan, CompilerTempKind,
-    ControlProgram, ExitKind, ExitRoute, FlowSummary, ScopeId, TrapSite, ValueDropAction,
-    ValueDropRecipe,
+    ControlProgram, ExitKind, ExitRoute, FlowSummary, ScopeId, SlotAction, SlotActionKind,
+    TrapSite, ValueDropAction, ValueDropRecipe,
 };
 use crate::interp::{MmioEvent, ObservedRun, RtArray, RtVal};
 use crate::ownership::ValueTransferSink;
-use crate::place::Place;
+use crate::place::{BorrowedPlace, Place};
 use crate::transition::CallOwner;
 use std::collections::{HashMap, HashSet};
 
@@ -511,6 +511,155 @@ fn consume_statement_trap_sites(ctx: &LowerCtx<'_>, statement: &Stmt) -> Result<
     consume_trap_sites(plan, &sites)
 }
 
+/// Resolve the exact checker-sealed slot action and its complete direct trap
+/// inventory.  Slot lowering never reconstructs staging, destination, or trap
+/// identities from syntax: syntax is only the key used to authenticate the
+/// retained action.
+fn checked_slot_action<'a>(
+    ctx: &LowerCtx<'a>,
+    expression: &Expr,
+) -> Result<&'a SlotAction, String> {
+    let Some((plan, scope)) = active_control(ctx)? else {
+        return Err(
+            "internal.svm.control_plan: owner-slot lowering requires a checker-sealed action"
+                .into(),
+        );
+    };
+    let action = plan
+        .slot_action(scope, expression)
+        .map_err(control_plan_error)?;
+    if action.scope() != scope || action.span() != expression.span {
+        return Err(
+            "internal.svm.control_plan: retained owner-slot action moved outside its exact scope or span"
+                .into(),
+        );
+    }
+    validate_slot_payload(action.payload(), "retained owner-slot action")?;
+    let sites = plan
+        .slot_action_trap_sites(action)
+        .map_err(control_plan_error)?;
+    if sites.iter().any(|site| site.scope() != scope) {
+        return Err(
+            "internal.svm.control_plan: retained owner-slot trap moved outside its active scope"
+                .into(),
+        );
+    }
+    consume_trap_sites(plan, &sites)?;
+    Ok(action)
+}
+
+fn validate_local_slot_container(
+    ctx: &LowerCtx<'_>,
+    argument: &Expr,
+    action: &SlotAction,
+    operation: &str,
+) -> Result<String, String> {
+    let borrowed = BorrowedPlace::from_expr(argument).ok_or_else(|| {
+        format!(
+            "svm.slot_container: `{operation}` requires an explicit mutable local owner-slot borrow"
+        )
+    })?;
+    if borrowed.mutability() != Mutability::Mut {
+        return Err(format!(
+            "svm.slot_container: `{operation}` requires a unique owner-slot borrow"
+        ));
+    }
+    let Some(retained) = action.container() else {
+        return Err(
+            "internal.svm.control_plan: retained non-allocation slot action has no container"
+                .into(),
+        );
+    };
+    if borrowed.place() != retained || !retained.is_root() {
+        return Err(format!(
+            "svm.slot_container: `{operation}` is local-only; retained place `{}` does not match its direct local borrow",
+            retained.render()
+        ));
+    }
+    let expected = Ty::borrow(Mutability::Mut, Ty::slots(action.payload().clone()));
+    if argument.ty.as_ref() != Some(&expected) {
+        return Err(format!(
+            "svm.slot_container: `{operation}` borrow annotation is `{}`, expected `{}`",
+            argument
+                .ty
+                .as_ref()
+                .map_or_else(|| "<missing>".into(), Ty::name),
+            expected.name()
+        ));
+    }
+    let binding = ctx.initialized_local(retained.root(), operation)?;
+    if binding.ty != Ty::slots(action.payload().clone()) || !binding.mutable {
+        return Err(format!(
+            "svm.slot_container: `{operation}` local `{}` is not writable `{}` storage",
+            retained.root(),
+            Ty::slots(action.payload().clone()).name()
+        ));
+    }
+    Ok(retained.root().to_string())
+}
+
+fn validate_slot_operation(ctx: &LowerCtx<'_>, expression: &Expr) -> Result<(), String> {
+    let ExprKind::SlotOp { op, args, .. } = &expression.kind else {
+        return Err("internal.svm.slot_operation: expected a checked slot operation".into());
+    };
+    let action = checked_slot_action(ctx, expression)?;
+    match (op, action.kind()) {
+        (SlotOp::Alloc { elem }, SlotActionKind::Alloc { .. }) => {
+            if args.len() != 1 || elem != action.payload() {
+                return Err(
+                    "internal.svm.control_plan: retained slot allocation lost its exact payload or arity"
+                        .into(),
+                );
+            }
+            require_expr_annotation(
+                expression,
+                Ty::slots(action.payload().clone()),
+                "svm.slot_result_type",
+                "alloc_slots result",
+            )?;
+            validate_sink_type(ctx, Ty::Int(IntTy::U64), &args[0], "alloc_slots length")?;
+            validate_expr_payloads(ctx, &args[0])
+        }
+        (SlotOp::Take, SlotActionKind::Take { .. }) => {
+            if args.len() != 2 {
+                return Err("internal.svm.control_plan: retained slot take lost its arity".into());
+            }
+            validate_local_slot_container(ctx, &args[0], action, "slot_take")?;
+            require_expr_annotation(
+                expression,
+                action.payload().clone(),
+                "svm.slot_result_type",
+                "slot_take result",
+            )?;
+            validate_sink_type(ctx, Ty::Int(IntTy::U64), &args[1], "slot_take index")?;
+            validate_expr_payloads(ctx, &args[1])
+        }
+        (SlotOp::Put, SlotActionKind::Put { staging, .. }) => {
+            if args.len() != 3 || !staging.is_root() {
+                return Err(
+                    "internal.svm.control_plan: retained slot put lost its arity or compiler staging local"
+                        .into(),
+                );
+            }
+            validate_local_slot_container(ctx, &args[0], action, "slot_put")?;
+            require_expr_annotation(
+                expression,
+                Ty::Unit,
+                "svm.slot_result_type",
+                "slot_put result",
+            )?;
+            validate_sink_type(ctx, Ty::Int(IntTy::U64), &args[1], "slot_put index")?;
+            validate_expr_payloads(ctx, &args[1])?;
+            validate_sink_type(ctx, action.payload().clone(), &args[2], "slot_put value")?;
+            validate_expr_payloads(ctx, &args[2])
+        }
+        _ => Err(
+            "internal.svm.control_plan: retained owner-slot action kind no longer matches syntax"
+                .into(),
+        ),
+    }
+}
+
 /// Keep the aggregate representation boundary explicit. Arrays admit concrete
 /// integers and, in the narrowly checked owned-local position, `bool`;
 /// ordinary options admit both as well. The Lean constructors are intentionally
@@ -584,9 +733,7 @@ pub(crate) fn validate_ty_payload(ty: Ty, context: &str) -> Result<(), String> {
 /// shape that reaches the machine without any gate seeing it.
 fn validate_container_payloads(ty: Ty, context: &str) -> Result<(), String> {
     match ty {
-        Ty::Slots(_) => Err(format!(
-            "svm.slots_unsupported: {context} uses owner slots, which have no profile-machine representation yet"
-        )),
+        Ty::Slots(payload) => validate_slot_payload(&payload, context),
         Ty::Array(payload) => validate_array_payload(&payload, context),
         Ty::Option(payload) => validate_option_payload(&payload, context),
         Ty::Param(_) | Ty::Int(IntTy::TParam(_)) | Ty::Raw(IntTy::TParam(_)) => Err(format!(
@@ -605,6 +752,21 @@ fn validate_container_payloads(ty: Ty, context: &str) -> Result<(), String> {
     }
 }
 
+/// Phase-one owner-slot payload admission.  The formal rules are generic,
+/// including a direct Lean owned-array witness, but the source bridge stays
+/// deliberately smaller until class values and their destructor protocol
+/// exist in the SVM: only local `slots<bool>` crosses this boundary.
+fn validate_slot_payload(payload: &Ty, context: &str) -> Result<(), String> {
+    if *payload == Ty::Bool {
+        Ok(())
+    } else {
+        Err(format!(
+            "svm.slots_unsupported: {context} has owner-slot payload `{}`; the phase-one SVM bridge admits only local `slots<bool>` and does not claim class or Vec coverage",
+            payload.name()
+        ))
+    }
+}
+
 /// May a parameter carry this type into the formal machine.
 ///
 /// A position gate on top of the payload traversal: what a type may contain
@@ -612,6 +774,11 @@ fn validate_container_payloads(ty: Ty, context: &str) -> Result<(), String> {
 /// machine answers them separately for the same type.
 pub(crate) fn validate_parameter_ty(ty: &Ty, context: &str) -> Result<(), String> {
     validate_ty_payload(ty.clone(), context)?;
+    if matches!(ty.referent(), Ty::Slots(_)) {
+        return Err(format!(
+            "svm.slots_call_abi_unsupported: {context} transports owner slots; the phase-one SVM admits slots only as local storage"
+        ));
+    }
     // An owner crosses as a value and a borrow as a loan; both are ordinary
     // argument forms (ADR 0069, ADR 0085), and neither depends on the
     // payload.
@@ -635,6 +802,11 @@ pub(crate) fn validate_return_ty(ty: &Ty, context: &str) -> Result<(), String> {
     if ty.as_borrow().is_some() {
         return Err(format!(
             "svm.borrow_return_unsupported: {context} is a borrow; a loan returns to its owner at the pop rather than leaving as a value"
+        ));
+    }
+    if matches!(ty, Ty::Slots(_)) {
+        return Err(format!(
+            "svm.slots_call_abi_unsupported: {context} returns owner slots; the phase-one SVM admits slots only as local storage"
         ));
     }
     Ok(())
@@ -769,7 +941,15 @@ fn validate_array_index(
 }
 
 fn validate_array_len(ctx: &LowerCtx<'_>, expr: &Expr, array: &str) -> Result<(), String> {
-    resolve_array(ctx, array, "array length")?;
+    let binding = ctx.initialized_local(array, "array or owner-slot length")?;
+    match binding.ty {
+        Ty::Slots(payload) => {
+            validate_slot_payload(&payload, &format!("owner-slot length of `{array}`"))?;
+        }
+        _ => {
+            resolve_array(ctx, array, "array length")?;
+        }
+    }
     require_expr_annotation(
         expr,
         Ty::Int(IntTy::U64),
@@ -1058,6 +1238,11 @@ fn semantic_expr_ty(
     let semantic = match &expr.kind {
         ExprKind::Var(name) => {
             let ty = ctx.initialized_local(name, context)?.ty;
+            if matches!(ty, Ty::Slots(_)) {
+                return Err(format!(
+                    "svm.slots_owner_value_position: {context} moves owner-slot local `{name}`; the phase-one bridge supports operations and `.len`, not whole-owner transport"
+                ));
+            }
             if ty.is_owned_bool_array() {
                 return Err(format!(
                     "svm.bool_array_transport_unsupported: {context} moves Boolean array local `{name}`; an owner is accessed by index or length and lent by borrow"
@@ -1228,7 +1413,7 @@ fn semantic_expr_ty(
             payload
         }
         ExprKind::Len { array } => {
-            resolve_array(ctx, array, "array length")?;
+            validate_array_len(ctx, expr, array)?;
             Ty::Int(IntTy::U64)
         }
         ExprKind::RecordField { obj, field, .. } => {
@@ -1313,6 +1498,11 @@ fn validate_local_var(
     operation: &str,
 ) -> Result<LocalBinding, String> {
     let binding = ctx.initialized_local(name, operation)?;
+    if matches!(binding.ty, Ty::Slots(_)) {
+        return Err(format!(
+            "svm.slots_owner_value_position: {operation} moves owner-slot local `{name}`; slots are observed by `.len` and changed only by slot operations"
+        ));
+    }
     if binding.ty.is_owned_bool_array() {
         return Err(format!(
             "svm.bool_array_transport_unsupported: {operation} moves Boolean array local `{name}`; an owner is accessed by index or length and lent by borrow"
@@ -1796,6 +1986,12 @@ fn validate_program_option_positions(program: &Program) -> Result<(), String> {
     }
     for class in program.classes.iter().chain(&program.class_templates) {
         for field in &class.fields {
+            if matches!(field.ty, Ty::Slots(_)) {
+                return Err(format!(
+                    "svm.slots_class_unsupported: class `{}.{}` stores owner slots; class members and Vec<Class> are outside the phase-one formal SVM",
+                    class.name, field.name
+                ));
+            }
             if field.ty.is_affine_option() {
                 return Err(affine_option_unsupported(
                     field.ty.clone(),
@@ -1845,6 +2041,12 @@ fn validate_program_option_positions(program: &Program) -> Result<(), String> {
         let mut field_names = HashSet::new();
         let mut extents: Vec<(i128, i128, &str)> = Vec::new();
         for field in &record.fields {
+            if matches!(field.ty, Ty::Slots(_)) {
+                return Err(format!(
+                    "svm.slots_record_unsupported: record `{}.{}` stores owner slots; slots are admitted only as direct locals",
+                    record.name, field.name
+                ));
+            }
             if field.ty.is_affine_option() {
                 return Err(affine_option_unsupported(
                     field.ty.clone(),
@@ -2339,11 +2541,8 @@ fn validate_call_signature(
 }
 
 fn validate_expr_payloads(ctx: &LowerCtx<'_>, expr: &Expr) -> Result<(), String> {
-    if let ExprKind::SlotOp { op, .. } = &expr.kind {
-        return Err(format!(
-            "svm.slots_unsupported: `{}` has no profile-machine semantics yet",
-            op.name()
-        ));
+    if matches!(expr.kind, ExprKind::SlotOp { .. }) {
+        return validate_slot_operation(ctx, expr);
     }
     if let Some(ty) = &expr.ty {
         validate_ty_payload(ty.clone(), "expression annotation")?;
@@ -2367,9 +2566,7 @@ fn validate_expr_payloads(ctx: &LowerCtx<'_>, expr: &Expr) -> Result<(), String>
     }
 
     match &expr.kind {
-        ExprKind::SlotOp { .. } => {
-            unreachable!("slot operations are refused before cached annotation validation")
-        }
+        ExprKind::SlotOp { .. } => unreachable!("slot operations return through their exact gate"),
         ExprKind::Index { array, index, .. } => {
             validate_array_index(ctx, expr, array, index)?;
         }
@@ -2801,8 +2998,17 @@ fn validate_checked_value_drop_action(
     fn validate_class_leaves(action: &ValueDropAction, role: &str) -> Result<(), String> {
         match action.recipe() {
             ValueDropRecipe::ReleaseArray { .. } => Ok(()),
-            ValueDropRecipe::ReleaseSlots { .. } => Err(format!(
-                "svm.slots_cleanup_unsupported: retained {role} owner-slot cleanup is outside the SVM core subset"
+            ValueDropRecipe::ReleaseSlots { payload, occupied }
+                if *payload == Ty::Bool && occupied.is_none() =>
+            {
+                // Scalar cells have no per-payload destructor event in the
+                // formal machine.  The exact retained release is represented
+                // by the lexical `scopeExit` that clears the unique owner.
+                Ok(())
+            }
+            ValueDropRecipe::ReleaseSlots { payload, .. } => Err(format!(
+                "svm.slots_cleanup_unsupported: retained {role} cleanup has payload `{}`; only destructor-free local `slots<bool>` is formalized",
+                payload.name()
             )),
             ValueDropRecipe::DropPresent(payload) => validate_class_leaves(payload, role),
             ValueDropRecipe::DropClass(class) => {
@@ -2984,7 +3190,7 @@ fn lower_block(ctx: &mut LowerCtx<'_>, stmts: &[Stmt]) -> Result<String, String>
     let Some(route) = &ctx.normal_exit else {
         return Ok(lowered);
     };
-    let close = lower_scope_exit(&route);
+    let close = lower_checked_scope_exit(ctx, route, "normal lexical exit")?;
     let inner = lowered.trim_start_matches('[').trim_end_matches(']');
     if inner.is_empty() {
         Ok(format!("[{close}]"))
@@ -3001,6 +3207,29 @@ fn lower_scope_exit(route: &ExitRoute) -> String {
         .collect::<Vec<_>>()
         .join(", ");
     format!("(.scopeExit [{names}])")
+}
+
+fn lower_checked_scope_exit(
+    ctx: &LowerCtx<'_>,
+    route: &ExitRoute,
+    role: &str,
+) -> Result<String, String> {
+    let Some((plan, _)) = active_control(ctx)? else {
+        return Ok(lower_scope_exit(route));
+    };
+    for drop in route.drops() {
+        let candidate = plan.candidate(*drop);
+        if !route.scopes().contains(&candidate.scope())
+            || !route.clears().contains(candidate.place())
+        {
+            return Err(format!(
+                "internal.svm.control_plan: retained {role} drop `{}` is not paired with its exact scope and clear",
+                candidate.place().render()
+            ));
+        }
+        validate_checked_value_drop_action(ctx, candidate.drop_action(), candidate.span(), role)?;
+    }
+    Ok(lower_scope_exit(route))
 }
 
 fn lower_block_erasing(ctx: &mut LowerCtx<'_>, stmts: &[Stmt]) -> Result<String, String> {
@@ -3314,7 +3543,7 @@ fn lower_stmt_erasing(ctx: &mut LowerCtx<'_>, s: &Stmt) -> Result<Option<String>
             }
             parts.push(format!("(.rawFree (.var \"{loan}\"))"));
             if let Some(route) = exposure_close {
-                parts.push(lower_scope_exit(&route));
+                parts.push(lower_checked_scope_exit(ctx, &route, "exposure close")?);
             }
             Some(parts.join(", "))
         }
@@ -3466,12 +3695,20 @@ fn lower_stmt_erasing(ctx: &mut LowerCtx<'_>, s: &Stmt) -> Result<Option<String>
                     .render();
                 let save = if let (true, ExprKind::Var(name)) = (returned_owner, &e.kind) {
                     format!("(.moveLocal \"{slot}\" \"{name}\")")
+                } else if matches!(
+                    e.kind,
+                    ExprKind::SlotOp {
+                        op: SlotOp::Take,
+                        ..
+                    }
+                ) {
+                    lower_slot_bind(ctx, &slot, e)?
                 } else {
                     format!("(.assign \"{slot}\" {})", lower_expr(ctx, e)?)
                 };
                 Some(format!(
                     "{save}, {}, (.ret (.var \"{slot}\"))",
-                    lower_scope_exit(routes.lexical())
+                    lower_checked_scope_exit(ctx, routes.lexical(), "explicit return")?
                 ))
             } else if let (true, ExprKind::Var(name)) = (returned_owner, &e.kind) {
                 // The legacy unsealed helper is retained for focused lowering
@@ -3493,12 +3730,21 @@ fn lower_stmt_erasing(ctx: &mut LowerCtx<'_>, s: &Stmt) -> Result<Option<String>
                 .map_err(|error| format!("internal.svm.control_plan: {}", error.message))?;
             Some(format!(
                 "{}, (.retUnit)",
-                lower_scope_exit(routes.lexical())
+                lower_checked_scope_exit(ctx, routes.lexical(), "explicit unit return")?
             ))
         }
         // A call for effect: `f(args);` — the discarded-result form of
         // the machine's A-normal call.
         Stmt::ExprStmt(e) => {
+            if matches!(
+                e.kind,
+                ExprKind::SlotOp {
+                    op: SlotOp::Put,
+                    ..
+                }
+            ) {
+                return Ok(Some(lower_slot_put(ctx, e)?));
+            }
             if matches!(e.ty.as_ref(), Some(Ty::Class(_))) {
                 validate_checked_temporary_drop_action(ctx, e)?;
             }
@@ -3603,6 +3849,11 @@ fn lower_stmt_erasing(ctx: &mut LowerCtx<'_>, s: &Stmt) -> Result<Option<String>
                 }
                 ExprKind::OptTake { option, .. } => {
                     return Err(affine_option_take_position(option));
+                }
+                ExprKind::SlotOp { .. } => {
+                    return Err(
+                        "svm.slot_position: only `slot_put` is a slot expression statement".into(),
+                    );
                 }
                 _ => {
                     return Err("expression statements are outside the SVM core subset".into());
@@ -4331,6 +4582,9 @@ fn lower_fresh_bool_array_bind(
 /// `x = e;` — an assign, or (A-normalized, ADR 0005) a call when `e`
 /// is exactly a call; calls nested deeper stay outside the subset.
 fn lower_bind(ctx: &LowerCtx<'_>, name: &str, e: &Expr) -> Result<String, String> {
+    if matches!(e.kind, ExprKind::SlotOp { .. }) {
+        return lower_slot_bind(ctx, name, e);
+    }
     consume_expression_trap_sites(ctx, e)?;
     match &e.kind {
         ExprKind::OptTake { option, .. } => Err(affine_option_take_position(option)),
@@ -4466,6 +4720,98 @@ fn lower_bind(ctx: &LowerCtx<'_>, name: &str, e: &Expr) -> Result<String, String
         }
         _ => Ok(format!("(.assign \"{name}\" {})", lower_expr(ctx, e)?)),
     }
+}
+
+fn lean_slot_tag(payload: &Ty) -> Result<&'static str, String> {
+    validate_slot_payload(payload, "owner-slot machine tag")?;
+    match payload {
+        Ty::Bool => Ok(".bool"),
+        _ => unreachable!("the phase-one slot payload gate admits only bool"),
+    }
+}
+
+fn lower_slot_bind(ctx: &LowerCtx<'_>, destination: &str, e: &Expr) -> Result<String, String> {
+    validate_slot_operation(ctx, e)?;
+    let action = checked_slot_action(ctx, e)?;
+    let tag = lean_slot_tag(action.payload())?;
+    let ExprKind::SlotOp { op, args, .. } = &e.kind else {
+        unreachable!("slot binding lowering follows slot validation")
+    };
+    match (op, action.kind()) {
+        (SlotOp::Alloc { .. }, SlotActionKind::Alloc { .. }) => Ok(format!(
+            "(.slotAlloc \"{destination}\" {tag} {})",
+            lower_expr(ctx, &args[0])?
+        )),
+        (SlotOp::Take, SlotActionKind::Take { .. }) => {
+            let container = validate_local_slot_container(ctx, &args[0], action, "slot_take")?;
+            if destination == container {
+                return Err(format!(
+                    "svm.slot_take_alias: destination `{destination}` aliases its owner-slot container"
+                ));
+            }
+            Ok(format!(
+                "(.slotTake \"{destination}\" \"{container}\" {tag} {})",
+                lower_expr(ctx, &args[1])?
+            ))
+        }
+        (SlotOp::Put, _) => {
+            Err("svm.slot_position: `slot_put` is a statement and cannot initialize a local".into())
+        }
+        _ => Err(
+            "internal.svm.control_plan: retained slot binding kind no longer matches syntax".into(),
+        ),
+    }
+}
+
+fn lower_slot_put(ctx: &LowerCtx<'_>, e: &Expr) -> Result<String, String> {
+    validate_slot_operation(ctx, e)?;
+    let action = checked_slot_action(ctx, e)?;
+    let tag = lean_slot_tag(action.payload())?;
+    let ExprKind::SlotOp {
+        op: SlotOp::Put,
+        args,
+        ..
+    } = &e.kind
+    else {
+        return Err("svm.slot_position: only `slot_put` is a slot expression statement".into());
+    };
+    let SlotActionKind::Put { staging, .. } = action.kind() else {
+        return Err(
+            "internal.svm.control_plan: retained slot-put expression lost its put action".into(),
+        );
+    };
+    if !staging.is_root() {
+        return Err(
+            "internal.svm.control_plan: retained slot-put staging is not a compiler local".into(),
+        );
+    }
+    let container = validate_local_slot_container(ctx, &args[0], action, "slot_put")?;
+    let staging = staging.root();
+    if staging == container || ctx.declared.contains(staging) {
+        return Err(
+            "internal.svm.control_plan: retained slot-put staging collides with live source storage"
+                .into(),
+        );
+    }
+
+    // The source order is container, index, incoming value.  The container is
+    // a checked place with no executable evaluation; an SVM-only scalar index
+    // temporary therefore records the index outcome before the retained value
+    // staging action runs.  The final slotPut reads only those two temporaries,
+    // then performs the bounds/occupancy guards atomically.
+    let index_temp = format!("$sable$svm$slot_put_index${}${}", e.span.start, e.span.end);
+    if ctx.declared.contains(&index_temp) || index_temp == staging || index_temp == container {
+        return Err(
+            "internal.svm.control_plan: SVM slot-put index temporary collides with checked storage"
+                .into(),
+        );
+    }
+    let index = lower_expr(ctx, &args[1])?;
+    let value = lower_expr(ctx, &args[2])?;
+    Ok(format!(
+        "(.assign \"{index_temp}\" {index}), (.assign \"{staging}\" {value}), \
+         (.slotPut \"{container}\" {tag} (.var \"{index_temp}\") \"{staging}\")"
+    ))
 }
 
 fn lower_call(ctx: &LowerCtx<'_>, dst: &Option<String>, call: &Expr) -> Result<String, String> {
@@ -4901,6 +5247,9 @@ fn classify_trap(msg: &str) -> String {
     if let Some(len) = msg.strip_prefix("OOM trap: alloc_array of length ") {
         return format!("trap oom {len}");
     }
+    if let Some(len) = msg.strip_prefix("OOM trap: alloc_slots of length ") {
+        return format!("trap oom {len}");
+    }
     if let Some(rest) = msg.strip_prefix("narrow out of range: ") {
         if let Some((v, tail)) = rest.split_once(" does not fit in `") {
             if let Some(ty) = tail.strip_suffix('`') {
@@ -4915,6 +5264,28 @@ fn classify_trap(msg: &str) -> String {
         if let Some((i, len)) = rest.split_once(", length ") {
             return format!("trap indexOOB {i} {len}");
         }
+    }
+    for prefix in [
+        "slot_take index out of bounds: index ",
+        "slot_put index out of bounds: index ",
+    ] {
+        if let Some(rest) = msg.strip_prefix(prefix) {
+            if let Some((i, len)) = rest.split_once(", length ") {
+                return format!("trap indexOOB {i} {len}");
+            }
+        }
+    }
+    if let Some(index) = msg
+        .strip_prefix("slot_take: cell ")
+        .and_then(|rest| rest.strip_suffix(" is empty"))
+    {
+        return format!("trap slotEmpty {index}");
+    }
+    if let Some(index) = msg
+        .strip_prefix("slot_put: cell ")
+        .and_then(|rest| rest.strip_suffix(" is already occupied"))
+    {
+        return format!("trap slotOccupied {index}");
     }
     // "overflow: `{src}` = {val} does not fit in `{ty}` ({op})"
     if msg.starts_with("overflow: ") {
@@ -4934,10 +5305,53 @@ mod tests {
     use crate::span::Span;
 
     #[test]
-    fn owner_slots_have_neither_an_svm_type_nor_operation_semantics() {
+    fn owner_slots_admit_only_local_bool_storage_and_keep_the_call_abi_closed() {
         let error = validate_ty_payload(Ty::slots(Ty::Int(IntTy::U64)), "forged slot local")
-            .expect_err("owner slots have no profile-machine representation yet");
+            .expect_err("the phase-one bridge admits only Boolean payloads");
         assert!(error.starts_with("svm.slots_unsupported:"), "{error}");
+        let error = validate_ty_payload(Ty::slots(Ty::Class(0)), "Vec backing storage")
+            .expect_err("class payload cleanup is outside the phase-one bridge");
+        assert!(error.starts_with("svm.slots_unsupported:"), "{error}");
+        assert!(
+            error.contains("does not claim class or Vec coverage"),
+            "{error}"
+        );
+        validate_ty_payload(Ty::slots(Ty::Bool), "Boolean slot local")
+            .expect("local slots<bool> has a formal representation");
+        let error = validate_parameter_ty(&Ty::slots(Ty::Bool), "slot parameter")
+            .expect_err("owner slots have no formal call ABI");
+        assert!(
+            error.starts_with("svm.slots_call_abi_unsupported:"),
+            "{error}"
+        );
+        let error = validate_return_ty(&Ty::slots(Ty::Bool), "slot result")
+            .expect_err("owner slots cannot cross a formal return");
+        assert!(
+            error.starts_with("svm.slots_call_abi_unsupported:"),
+            "{error}"
+        );
+        let error = validate_parameter_ty(
+            &Ty::borrow(Mutability::Mut, Ty::slots(Ty::Bool)),
+            "borrowed slot parameter",
+        )
+        .expect_err("direct slot borrows have no formal call ABI either");
+        assert!(
+            error.starts_with("svm.slots_call_abi_unsupported:"),
+            "{error}"
+        );
+
+        let mut field_program = empty_program();
+        let mut holder = cleanup_test_class("Holder", 70);
+        holder.fields.push(Field {
+            name: "cells".into(),
+            ty: Ty::slots(Ty::Bool),
+            span: Span::new(71, 72),
+            must_consume: false,
+        });
+        field_program.classes.push(holder);
+        let error = validate_program_option_positions(&field_program)
+            .expect_err("owner slots remain outside class and Vec member storage");
+        assert!(error.starts_with("svm.slots_class_unsupported:"), "{error}");
 
         let program = empty_program();
         let ctx = LowerCtx::bare(&program);
@@ -4950,11 +5364,11 @@ mod tests {
                     Ty::Param(TypeParamId::from_legacy(0)),
                 )],
             },
-            Ty::Param(TypeParamId::from_legacy(0)),
+            Ty::Bool,
         );
         let error = validate_expr_payloads(&ctx, &operation)
-            .expect_err("the slot refusal wins over hostile cached types and operands");
-        assert!(error.starts_with("svm.slots_unsupported:"), "{error}");
+            .expect_err("slot operations require their exact checked control action");
+        assert!(error.starts_with("internal.svm.control_plan:"), "{error}");
     }
 
     /// The wire format is compared against the machine's `Config.render`
@@ -5048,6 +5462,106 @@ mod tests {
         sealed_checked_program_with_classes(function, Vec::new())
     }
 
+    fn bool_slot_alloc(start: usize, length: i128) -> Expr {
+        Expr {
+            kind: ExprKind::SlotOp {
+                op: SlotOp::Alloc { elem: Ty::Bool },
+                op_span: Span::new(start, start + 1),
+                args: vec![expr_at(
+                    ExprKind::IntLit(length),
+                    Ty::Int(IntTy::U64),
+                    start + 1,
+                )],
+            },
+            span: Span::new(start, start + 3),
+            ty: Some(Ty::slots(Ty::Bool)),
+        }
+    }
+
+    fn bool_slot_borrow(name: &str, start: usize) -> Expr {
+        expr_at(
+            ExprKind::Borrow {
+                array: name.into(),
+                field: None,
+                mutable: true,
+            },
+            Ty::borrow(Mutability::Mut, Ty::slots(Ty::Bool)),
+            start,
+        )
+    }
+
+    fn checked_bool_slot_fixture() -> crate::CheckedProgram {
+        let index = Expr {
+            kind: ExprKind::Binary {
+                op: BinOp::Add,
+                op_span: Span::new(32, 33),
+                lhs: Box::new(expr_at(ExprKind::IntLit(0), Ty::Int(IntTy::U64), 320)),
+                rhs: Box::new(expr_at(ExprKind::IntLit(0), Ty::Int(IntTy::U64), 321)),
+            },
+            span: Span::new(32, 33),
+            ty: Some(Ty::Int(IntTy::U64)),
+        };
+        let put = Expr {
+            kind: ExprKind::SlotOp {
+                op: SlotOp::Put,
+                op_span: Span::new(30, 31),
+                args: vec![
+                    bool_slot_borrow("left", 31),
+                    index,
+                    expr_at(ExprKind::BoolLit(true), Ty::Bool, 33),
+                ],
+            },
+            span: Span::new(30, 34),
+            ty: Some(Ty::Unit),
+        };
+        let take = Expr {
+            kind: ExprKind::SlotOp {
+                op: SlotOp::Take,
+                op_span: Span::new(40, 41),
+                args: vec![
+                    bool_slot_borrow("left", 41),
+                    expr_at(ExprKind::IntLit(0), Ty::Int(IntTy::U64), 42),
+                ],
+            },
+            span: Span::new(40, 43),
+            ty: Some(Ty::Bool),
+        };
+        sealed_checked_program(checked_fn(
+            Ty::Unit,
+            vec![
+                Stmt::Decl {
+                    ty: Ty::slots(Ty::Bool),
+                    name: "left".into(),
+                    name_span: Span::new(1, 2),
+                    init: Some(bool_slot_alloc(10, 2)),
+                    mutable: true,
+                },
+                Stmt::Decl {
+                    ty: Ty::slots(Ty::Bool),
+                    name: "right".into(),
+                    name_span: Span::new(2, 3),
+                    init: Some(bool_slot_alloc(20, 2)),
+                    mutable: true,
+                },
+                Stmt::ExprStmt(put),
+                Stmt::Decl {
+                    ty: Ty::Bool,
+                    name: "answer".into(),
+                    name_span: Span::new(3, 4),
+                    init: Some(take),
+                    mutable: false,
+                },
+            ],
+        ))
+    }
+
+    fn fixture_slot_put(checked: &mut crate::CheckedProgram) -> &mut Expr {
+        let Stmt::ExprStmt(expression) = &mut checked.program.fns[0].body[2] else {
+            panic!("Boolean slot fixture has one put statement")
+        };
+        expression
+    }
+
     fn sealed_checked_program_with_classes(
         function: Fn,
         classes: Vec<ClassDecl>,
@@ -5062,6 +5576,74 @@ mod tests {
             control,
             ownership: crate::ownership::CheckedOwnershipPlan::default(),
         }
+    }
+
+    #[test]
+    fn checked_bool_slots_consume_exact_actions_traps_and_source_order_staging() {
+        let checked = checked_bool_slot_fixture();
+        let lowered = lower_checked_fn(&checked, "subject")
+            .expect("the exact local Boolean slot plan lowers to formal SVM statements");
+        assert!(
+            lowered.contains("(.slotAlloc \"left\" .bool (.intLit .u64 2))"),
+            "{lowered}"
+        );
+        assert!(
+            lowered.contains("(.slotTake \"answer\" \"left\" .bool (.intLit .u64 0))"),
+            "{lowered}"
+        );
+        let index = lowered
+            .find("(.assign \"$sable$svm$slot_put_index$30$34\"")
+            .expect("slot_put evaluates its index into an SVM-only local");
+        let value = lowered
+            .find("(.assign \"$sable$slot_put_value$30$34")
+            .expect("slot_put uses the checker-retained value staging local");
+        let install = lowered
+            .find("(.slotPut \"left\" .bool")
+            .expect("slot_put ends in one atomic formal operation");
+        assert!(index < value && value < install, "{lowered}");
+
+        let mut moved_action = checked_bool_slot_fixture();
+        fixture_slot_put(&mut moved_action).span = Span::new(35, 39);
+        let error = lower_checked_fn(&moved_action, "subject")
+            .expect_err("a slot action cannot move after its plan is sealed");
+        assert!(error.starts_with("internal.svm.control_plan:"), "{error}");
+        assert!(error.contains("slot"), "{error}");
+
+        let mut retargeted = checked_bool_slot_fixture();
+        let ExprKind::SlotOp { args, .. } = &mut fixture_slot_put(&mut retargeted).kind else {
+            unreachable!()
+        };
+        let ExprKind::Borrow { array, .. } = &mut args[0].kind else {
+            unreachable!()
+        };
+        *array = "right".into();
+        let error = lower_checked_fn(&retargeted, "subject")
+            .expect_err("a retained put cannot be retargeted to another local");
+        assert!(error.starts_with("internal.svm.control_plan:"), "{error}");
+        assert!(error.contains("slot action"), "{error}");
+
+        let mut moved_transfer = checked_bool_slot_fixture();
+        let ExprKind::SlotOp { args, .. } = &mut fixture_slot_put(&mut moved_transfer).kind else {
+            unreachable!()
+        };
+        args[2].span = Span::new(34, 35);
+        let error = lower_checked_fn(&moved_transfer, "subject")
+            .expect_err("the incoming value transfer span is part of the retained put action");
+        assert!(error.starts_with("internal.svm.control_plan:"), "{error}");
+        assert!(error.contains("transfer"), "{error}");
+
+        let mut changed_trap = checked_bool_slot_fixture();
+        let ExprKind::SlotOp { args, .. } = &mut fixture_slot_put(&mut changed_trap).kind else {
+            unreachable!()
+        };
+        let ExprKind::Binary { op, .. } = &mut args[1].kind else {
+            unreachable!()
+        };
+        *op = BinOp::Sub;
+        let error = lower_checked_fn(&changed_trap, "subject")
+            .expect_err("a nested slot operand cannot change its retained trap identity");
+        assert!(error.starts_with("internal.svm.control_plan:"), "{error}");
+        assert!(error.contains("SubOverflow"), "{error}");
     }
 
     fn cleanup_test_class(name: &str, start: usize) -> ClassDecl {

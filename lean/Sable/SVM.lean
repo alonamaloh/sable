@@ -119,6 +119,17 @@ inductive ValTag where
   | record (tag : Int)
   deriving DecidableEq, Repr
 
+/-- The payload domains retained by affine owner-slot storage.  Slots use a
+separate tag family because, unlike ordinary arrays, an occupied cell may
+itself own an array.  Keeping the tag beside the cells also preserves the
+payload type when every cell is empty. -/
+inductive SlotTag where
+  | int
+  | bool
+  | record (tag : Int)
+  | array (elem : ValTag)
+  deriving DecidableEq, Repr
+
 /-- Machine values. Integers are exact (`Int`); their widths live in the
 typed syntax, and per-operation rules enforce representability — the
 value plane never wraps.
@@ -140,6 +151,10 @@ inductive Val where
   | int  (n : Int)
   | bool (b : Bool)
   | arr  (elem : ValTag) (a : Seq Val)
+  /-- Affine, occupancy-bearing storage.  `none` is an empty cell and
+  `some v` is the unique owner of `v`; this constructor is intentionally
+  distinct from both arrays and arrays of options. -/
+  | slots (elem : SlotTag) (cells : Seq (Option Val))
   | opt  (o : Option Val)
   /-- A raw pointer: provenance plus a byte offset, never a machine
   address. Two live pointers may name the same address only if they name
@@ -158,6 +173,16 @@ def Val.tag? : Val → Option ValTag
   | .int _ => some .int
   | .bool _ => some .bool
   | .record tag _ => some (.record tag)
+  | _ => none
+
+/-- The slot payload domain inhabited by a value.  Arrays are admitted here
+without making arrays valid elements of ordinary arrays: ownership-bearing
+slot payloads and copyable array elements have deliberately different gates. -/
+def Val.slotTag? : Val → Option SlotTag
+  | .int _ => some .int
+  | .bool _ => some .bool
+  | .record tag _ => some (.record tag)
+  | .arr elem _ => some (.array elem)
   | _ => none
 
 /-- Type-preserving update of a `Val.arr`'s fields, one implementation for
@@ -409,6 +434,8 @@ inductive Trap where
   | indexOOB  (i len : Int)
   | narrowOOB (t : IntTy) (n : Int)
   | oom       (len : Int)
+  | slotEmpty (i : Int)
+  | slotOccupied (i : Int)
   | deferViolation (name : String)
   deriving Repr
 
@@ -543,6 +570,12 @@ inductive Stmt where
   The source disappears before the destination is installed, so an affine
   owner is never represented by two live machine bindings. -/
   | moveLocal (dst src : String)
+  /-- Allocate `len` empty affine cells, retaining the checked payload tag. -/
+  | slotAlloc (dst : String) (elem : SlotTag) (len : Expr)
+  /-- Atomically remove one occupied cell into `dst`. -/
+  | slotTake (dst container : String) (elem : SlotTag) (idx : Expr)
+  /-- Atomically consume a compiler staging local into one empty cell. -/
+  | slotPut (container : String) (elem : SlotTag) (idx : Expr) (staged : String)
   /-- `dst = src.take()` for an affine option. Unlike `optValue`, this is
   a statement-level, direct-local operation: a successful step installs
   `none` in `src` and the former payload in `dst` in one transition. The
@@ -906,8 +939,13 @@ inductive Eval (cap : Int) : Env → Expr → EOut → Prop where
   | len {ρ : Env} {x : String} {t : ValTag} {a : Seq Val}
       (h : ρ x = some (.arr t a)) :
       Eval cap ρ (.len x) (.ok (.int a.len))
+  | len_slots {ρ : Env} {x : String} {t : SlotTag} {cells : Seq (Option Val)}
+      (h : ρ x = some (.slots t cells)) :
+      Eval cap ρ (.len x) (.ok (.int cells.len))
   | len_undef {ρ : Env} {x : String}
-      (h : ∀ (t : ValTag) (a : Seq Val), ρ x ≠ some (.arr t a)) :
+      (ha : ∀ (t : ValTag) (a : Seq Val), ρ x ≠ some (.arr t a))
+      (hs : ∀ (t : SlotTag) (cells : Seq (Option Val)),
+        ρ x ≠ some (.slots t cells)) :
       Eval cap ρ (.len x) (.abort .undef)
   | index_ok {ρ : Env} {x : String} {e : Expr} {t : ValTag} {a : Seq Val} {n : Int}
       (hi : Eval cap ρ e (.ok (.int n))) (ha : ρ x = some (.arr t a))
@@ -1154,6 +1192,132 @@ inductive Step (P : Prog) (cap : Int) : Config → Config → Prop where
       {k : List Stmt} {σ : List Frame} {μ : RawHeap}
       (hne : dst ≠ src) (hd : ρ dst = none) (hs : ρ src = none) :
       Step P cap (.run (.moveLocal dst src :: k) ρ σ μ) .undef
+  -- Owner-slot operations are statement-level so every ownership transfer is
+  -- one atomic transition.  In particular, put consumes a compiler staging
+  -- local only on success; every terminal trap halts directly, with no unwind.
+  | slotAlloc_ok {ρ : Env} {dst : String} {elem : SlotTag} {e : Expr} {n : Int}
+      {k : List Stmt} {σ : List Frame} {μ : RawHeap}
+      (h : Eval cap ρ e (.ok (.int n))) (h₀ : 0 ≤ n) (hc : n ≤ cap) :
+      Step P cap (.run (.slotAlloc dst elem e :: k) ρ σ μ)
+        (.run k (ρ.update dst (.slots elem (Seq.replicate n none))) σ μ)
+  | slotAlloc_oom {ρ : Env} {dst : String} {elem : SlotTag} {e : Expr} {n : Int}
+      {k : List Stmt} {σ : List Frame} {μ : RawHeap}
+      (h : Eval cap ρ e (.ok (.int n))) (h₀ : 0 ≤ n) (hc : cap < n) :
+      Step P cap (.run (.slotAlloc dst elem e :: k) ρ σ μ) (.trapped (.oom n))
+  | slotAlloc_neg {ρ : Env} {dst : String} {elem : SlotTag} {e : Expr} {n : Int}
+      {k : List Stmt} {σ : List Frame} {μ : RawHeap}
+      (h : Eval cap ρ e (.ok (.int n))) (h₀ : n < 0) :
+      Step P cap (.run (.slotAlloc dst elem e :: k) ρ σ μ) .undef
+  | slotAlloc_undef_len {ρ : Env} {dst : String} {elem : SlotTag} {e : Expr}
+      {v : Val} {k : List Stmt} {σ : List Frame} {μ : RawHeap}
+      (h : Eval cap ρ e (.ok v)) (hv : ∀ n, v ≠ .int n) :
+      Step P cap (.run (.slotAlloc dst elem e :: k) ρ σ μ) .undef
+  | slotAlloc_abort {ρ : Env} {dst : String} {elem : SlotTag} {e : Expr}
+      {ab : Abort} {k : List Stmt} {σ : List Frame} {μ : RawHeap}
+      (h : Eval cap ρ e (.abort ab)) :
+      Step P cap (.run (.slotAlloc dst elem e :: k) ρ σ μ) ab.toConfig
+  | slotTake_ok {ρ : Env} {dst container : String} {elem : SlotTag} {e : Expr}
+      {n : Int} {cells : Seq (Option Val)} {value : Val}
+      {k : List Stmt} {σ : List Frame} {μ : RawHeap}
+      (hne : dst ≠ container) (hi : Eval cap ρ e (.ok (.int n)))
+      (hc : ρ container = some (.slots elem cells))
+      (h₀ : 0 ≤ n) (h₁ : n < cells.len) (hv : cells.get n = some value) :
+      Step P cap (.run (.slotTake dst container elem e :: k) ρ σ μ)
+        (.run k ((ρ.update container (.slots elem (cells.set n none))).update dst value) σ μ)
+  | slotTake_empty {ρ : Env} {dst container : String} {elem : SlotTag} {e : Expr}
+      {n : Int} {cells : Seq (Option Val)} {k : List Stmt} {σ : List Frame}
+      {μ : RawHeap}
+      (hne : dst ≠ container) (hi : Eval cap ρ e (.ok (.int n)))
+      (hc : ρ container = some (.slots elem cells))
+      (h₀ : 0 ≤ n) (h₁ : n < cells.len) (hv : cells.get n = none) :
+      Step P cap (.run (.slotTake dst container elem e :: k) ρ σ μ)
+        (.trapped (.slotEmpty n))
+  | slotTake_oob {ρ : Env} {dst container : String} {elem : SlotTag} {e : Expr}
+      {n : Int} {cells : Seq (Option Val)} {k : List Stmt} {σ : List Frame}
+      {μ : RawHeap}
+      (hne : dst ≠ container) (hi : Eval cap ρ e (.ok (.int n)))
+      (hc : ρ container = some (.slots elem cells))
+      (hoob : n < 0 ∨ cells.len ≤ n) :
+      Step P cap (.run (.slotTake dst container elem e :: k) ρ σ μ)
+        (.trapped (.indexOOB n cells.len))
+  | slotTake_undef_alias {ρ : Env} {dst container : String} {elem : SlotTag}
+      {e : Expr} {k : List Stmt} {σ : List Frame} {μ : RawHeap}
+      (heq : dst = container) :
+      Step P cap (.run (.slotTake dst container elem e :: k) ρ σ μ) .undef
+  | slotTake_undef_idx {ρ : Env} {dst container : String} {elem : SlotTag}
+      {e : Expr} {v : Val} {k : List Stmt} {σ : List Frame} {μ : RawHeap}
+      (hne : dst ≠ container) (hi : Eval cap ρ e (.ok v))
+      (hv : ∀ n, v ≠ .int n) :
+      Step P cap (.run (.slotTake dst container elem e :: k) ρ σ μ) .undef
+  | slotTake_abort {ρ : Env} {dst container : String} {elem : SlotTag}
+      {e : Expr} {ab : Abort} {k : List Stmt} {σ : List Frame} {μ : RawHeap}
+      (hne : dst ≠ container) (hi : Eval cap ρ e (.abort ab)) :
+      Step P cap (.run (.slotTake dst container elem e :: k) ρ σ μ) ab.toConfig
+  | slotTake_undef_container {ρ : Env} {dst container : String} {elem : SlotTag}
+      {e : Expr} {n : Int} {k : List Stmt} {σ : List Frame} {μ : RawHeap}
+      (hne : dst ≠ container) (hi : Eval cap ρ e (.ok (.int n)))
+      (hc : ∀ cells, ρ container ≠ some (.slots elem cells)) :
+      Step P cap (.run (.slotTake dst container elem e :: k) ρ σ μ) .undef
+  | slotPut_ok {ρ : Env} {container staged : String} {elem : SlotTag} {e : Expr}
+      {n : Int} {cells : Seq (Option Val)} {value : Val}
+      {k : List Stmt} {σ : List Frame} {μ : RawHeap}
+      (hne : container ≠ staged) (hs : ρ staged = some value)
+      (ht : value.slotTag? = some elem) (hi : Eval cap ρ e (.ok (.int n)))
+      (hc : ρ container = some (.slots elem cells))
+      (h₀ : 0 ≤ n) (h₁ : n < cells.len) (he : cells.get n = none) :
+      Step P cap (.run (.slotPut container elem e staged :: k) ρ σ μ)
+        (.run k ((ρ.clear staged).update container
+          (.slots elem (cells.set n (some value)))) σ μ)
+  | slotPut_occupied {ρ : Env} {container staged : String} {elem : SlotTag}
+      {e : Expr} {n : Int} {cells : Seq (Option Val)} {value existing : Val}
+      {k : List Stmt} {σ : List Frame} {μ : RawHeap}
+      (hne : container ≠ staged) (hs : ρ staged = some value)
+      (ht : value.slotTag? = some elem) (hi : Eval cap ρ e (.ok (.int n)))
+      (hc : ρ container = some (.slots elem cells))
+      (h₀ : 0 ≤ n) (h₁ : n < cells.len) (he : cells.get n = some existing) :
+      Step P cap (.run (.slotPut container elem e staged :: k) ρ σ μ)
+        (.trapped (.slotOccupied n))
+  | slotPut_oob {ρ : Env} {container staged : String} {elem : SlotTag}
+      {e : Expr} {n : Int} {cells : Seq (Option Val)} {value : Val}
+      {k : List Stmt} {σ : List Frame} {μ : RawHeap}
+      (hne : container ≠ staged) (hs : ρ staged = some value)
+      (ht : value.slotTag? = some elem) (hi : Eval cap ρ e (.ok (.int n)))
+      (hc : ρ container = some (.slots elem cells))
+      (hoob : n < 0 ∨ cells.len ≤ n) :
+      Step P cap (.run (.slotPut container elem e staged :: k) ρ σ μ)
+        (.trapped (.indexOOB n cells.len))
+  | slotPut_undef_alias {ρ : Env} {container staged : String} {elem : SlotTag}
+      {e : Expr} {k : List Stmt} {σ : List Frame} {μ : RawHeap}
+      (heq : container = staged) :
+      Step P cap (.run (.slotPut container elem e staged :: k) ρ σ μ) .undef
+  | slotPut_undef_staged {ρ : Env} {container staged : String} {elem : SlotTag}
+      {e : Expr} {k : List Stmt} {σ : List Frame} {μ : RawHeap}
+      (hne : container ≠ staged) (hs : ρ staged = none) :
+      Step P cap (.run (.slotPut container elem e staged :: k) ρ σ μ) .undef
+  | slotPut_undef_tag {ρ : Env} {container staged : String} {elem : SlotTag}
+      {e : Expr} {value : Val} {k : List Stmt} {σ : List Frame} {μ : RawHeap}
+      (hne : container ≠ staged) (hs : ρ staged = some value)
+      (ht : value.slotTag? ≠ some elem) :
+      Step P cap (.run (.slotPut container elem e staged :: k) ρ σ μ) .undef
+  | slotPut_undef_idx {ρ : Env} {container staged : String} {elem : SlotTag}
+      {e : Expr} {value v : Val} {k : List Stmt} {σ : List Frame} {μ : RawHeap}
+      (hne : container ≠ staged) (hs : ρ staged = some value)
+      (ht : value.slotTag? = some elem) (hi : Eval cap ρ e (.ok v))
+      (hv : ∀ n, v ≠ .int n) :
+      Step P cap (.run (.slotPut container elem e staged :: k) ρ σ μ) .undef
+  | slotPut_abort {ρ : Env} {container staged : String} {elem : SlotTag}
+      {e : Expr} {value : Val} {ab : Abort} {k : List Stmt} {σ : List Frame}
+      {μ : RawHeap}
+      (hne : container ≠ staged) (hs : ρ staged = some value)
+      (ht : value.slotTag? = some elem) (hi : Eval cap ρ e (.abort ab)) :
+      Step P cap (.run (.slotPut container elem e staged :: k) ρ σ μ) ab.toConfig
+  | slotPut_undef_container {ρ : Env} {container staged : String} {elem : SlotTag}
+      {e : Expr} {value : Val} {n : Int} {k : List Stmt} {σ : List Frame}
+      {μ : RawHeap}
+      (hne : container ≠ staged) (hs : ρ staged = some value)
+      (ht : value.slotTag? = some elem) (hi : Eval cap ρ e (.ok (.int n)))
+      (hc : ∀ cells, ρ container ≠ some (.slots elem cells)) :
+      Step P cap (.run (.slotPut container elem e staged :: k) ρ σ μ) .undef
   -- Affine option extraction is atomic. The source is cleared before the
   -- destination is installed, and distinct names ensure the latter update
   -- cannot recreate the option owner. Destination freshness is deliberately
