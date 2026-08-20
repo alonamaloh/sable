@@ -1305,6 +1305,44 @@ foreign, or cross-module array ABI.
   cleanup, and every slots call-ABI shape remain explicitly outside this
   certificate slice.
 
+  ADR 0094 adds a separate closed argument-schedule certificate for every
+  user call and compiler-sealed raw/resource/device or owner-slot
+  boundary in every checked non-extern body, including dynamic tests,
+  proof-reusing instances, `alloc_slots`, `slot_take`, and `slot_put`. The Lean
+  decision receives a structural `Place`, a receiver-first reservation, and
+  one-based arguments whose completed nested writes/moves precede their direct
+  loan/move/inert effect. It rejects a pending loan followed by an overlapping
+  mutation or move, moved storage used by any later write/move/loan, a direct
+  move paired with an overlapping callee loan, and overlapping loans when
+  either is unique. A completed earlier mutation and transient nested shared
+  read remain legal. The closed theorem is `safe schedule = true := by decide`:
+  it has no binders, hypotheses, or generator-authored premises, and the
+  ordinary obligation skip set cannot suppress it.
+
+  The post-check extractor is an independent typed-AST walk rather than a call
+  to the checker's pending-loan/mutation collectors, and it does not use
+  `BodyPlan` as an expression CFG. It exact-consumes calls, sealed operations,
+  slots, option takes, `OptionPayload` moves, and linked `SlotPut` transfers;
+  embedded and table keys, schedule-relevant typed facts, spans, and operation
+  flavors must agree. Free-call and constructor targets come from source. The
+  MethodCall AST does not retain its resolved receiver class, so that target
+  remains checker-record-derived and Rust-trusted even though its exact class
+  referent and signature are checked. A final global key comparison catches
+  records retargeted to an owner no real body visits. Length-framed
+  owner/boundary/body-relative identities
+  share the mandatory collision-checked artifact channel. The initial
+  mutation tests weaken the historical VF-03, VF-08, VF-09, and AI-08 checker
+  guards one at a time and require Lean to reject each retained schedule.
+
+  This checks only the alias rule for the recorded closed schedule. Rust
+  remains trusted for typed-AST and ownership-plan extraction, including
+  effect discovery and coordinated method table+record target selection. It is
+  not evidence against a coordinated forged
+  AST+record+schedule, does not validate callee contracts, and establishes no
+  source-to-VC, interpreter, SVM, LLVM, cleanup, trap, ABI, or runtime theorem.
+  The 64-argument and 64-total-nested-effect ceilings are explicit certificate
+  bounds, not an unbounded claim.
+
   The same typed callable identity keys the checker's recursion graph. An
   initializer and method may share a source spelling without overwriting each
   other's edges; duplicates within either member flavor are rejected as

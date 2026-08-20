@@ -169,6 +169,20 @@ Affine ownership with lexically scoped borrowing — the Rust discipline, simpli
 
 > **Implementation deviation (ADR 0072).** Rules 2 and 3 speak of a borrow *living* and the owner being frozen or inaccessible *meanwhile*, which presumes a borrow-liveness discipline. The compiler has no loan map that survives a statement; `Place::contains`/`overlaps` instead relates borrows to owners within one call. So a borrow is admitted only where that rule is enough to enforce exclusivity — **written at a call, bound to a parameter for the length of that call**. Arguments evaluate left-to-right: a borrow argument records a pending callee reservation and captures its place and entry state at its position (an implicit method receiver comes first). Later overlapping mutation is `borrow.conflict`, while a transient nested shared read or direct scalar read may finish before the outer callee begins; a mutation completed before a later reservation is also sound. Direct overlapping loan arguments are still refused because both would enter the same callee. A borrow is not a local binding: `var view = &mut a;` is refused by `type.borrow_local_unsupported`, for every referent, because a second name for one storage is precisely what nothing beyond that call tracks. `swap(&mut x, &mut x)` is a type error exactly as the example above says; `var v = &mut x; swap(&mut x, &mut v);` is refused at the binding instead. Rules 2 and 3 as written are what a statement-spanning loan-liveness discipline would license, and they stay the target.
 
+> **Implementation assurance boundary (ADR 0094).** Each user call
+> and compiler-sealed raw/resource/device or owner-slot operation in a checked
+> non-extern body—including dynamic tests and proof-reusing instances—now
+> emits a mandatory closed Lean decision over its receiver-first, one-based argument
+> schedule. Structural places and ordered nested write/move plus direct
+> loan/move effects make the kernel recheck the conflict rule above, including
+> historical loan/move and later-mutation failures. A separate post-check AST
+> walk exact-consumes the checker ownership records and globally rejects
+> unvisited identities; it does not reuse the admission collectors or pretend
+> that the retained statement/control plan is an expression CFG. The theorem
+> proves only that the *recorded* bounded schedule is alias-safe. Rust remains
+> trusted to extract that schedule, and there is no source-to-runtime, LLVM,
+> callee-contract, or coordinated-forgery theorem here.
+
 Why ownership rather than a flat heap with separation logic: with a flat heap, every function needs footprint annotations and the proof layer stops being optional reading. Under ownership, framing, definite initialization, absence of use-after-free, and single-destruction are theorems of the *metatheory*, proved once — the per-program verifier sees an essentially functional program with mutation localized to uniquely-owned values. Empirically this is why ownership-based verifiers (Verus, Creusot) discharge obligations orders of magnitude faster than heap-logic tools. The machine-model heap is a partial map `Addr ⇀ Val ∪ {⊥}`; the metatheory's target theorem is that the ownership discipline implies the separation-logic frame rule for all safe code. Mechanizing that theorem is part of the staged metatheory pillar (§10.1) — the nearest precedent, RustBelt, was a multi-year team effort for a fragment of Rust, and Sable's deliberately smaller surface (lexical borrows, no closures, no lifetimes) is what keeps it tractable.
 
 ```sable

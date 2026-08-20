@@ -260,6 +260,12 @@ impl CheckedOwnershipPlan {
         self.option_takes.get(key)
     }
 
+    pub(crate) fn option_takes(
+        &self,
+    ) -> impl Iterator<Item = (&EffectSiteKey, &CheckedOptionTake)> {
+        self.option_takes.iter()
+    }
+
     pub(crate) fn option_takes_for_owner(
         &self,
         owner: &CallOwner,
@@ -282,6 +288,12 @@ impl CheckedOwnershipPlan {
 
     pub(crate) fn slot_transition(&self, key: &EffectSiteKey) -> Option<&CheckedSlotTransition> {
         self.slot_transitions.get(key)
+    }
+
+    pub(crate) fn slot_transitions(
+        &self,
+    ) -> impl Iterator<Item = (&EffectSiteKey, &CheckedSlotTransition)> {
+        self.slot_transitions.iter()
     }
 
     pub(crate) fn slot_transitions_for_owner(
@@ -323,6 +335,12 @@ impl CheckedOwnershipPlan {
 
     pub(crate) fn sealed_operation(&self, key: &EffectSiteKey) -> Option<&CheckedSealedOperation> {
         self.sealed_operations.get(key)
+    }
+
+    pub(crate) fn sealed_operations(
+        &self,
+    ) -> impl Iterator<Item = (&EffectSiteKey, &CheckedSealedOperation)> {
+        self.sealed_operations.iter()
     }
 
     pub(crate) fn sealed_operations_for_owner(
@@ -367,6 +385,12 @@ impl CheckedOwnershipPlan {
 
     pub(crate) fn value_transfer(&self, key: &ValueTransferKey) -> Option<&ValueTransfer> {
         self.value_transfers.get(key)
+    }
+
+    pub(crate) fn value_transfers(
+        &self,
+    ) -> impl Iterator<Item = (&ValueTransferKey, &ValueTransfer)> {
+        self.value_transfers.iter()
     }
 
     pub(crate) fn value_transfers_for_owner(

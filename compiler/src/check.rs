@@ -26,6 +26,46 @@ use crate::transition::{
 };
 use std::collections::{HashMap, HashSet};
 
+#[cfg(test)]
+pub(crate) const WEAKEN_ARGUMENT_UNIQUE_CONFLICT: u8 = 1;
+#[cfg(test)]
+pub(crate) const WEAKEN_ARGUMENT_MOVE_CONFLICT: u8 = 2;
+#[cfg(test)]
+pub(crate) const WEAKEN_ARGUMENT_PENDING_MUTATION: u8 = 4;
+
+#[cfg(test)]
+thread_local! {
+    static ARGUMENT_SCHEDULE_TEST_WEAKENING: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn with_argument_schedule_test_weakening<R>(
+    weakening: u8,
+    body: impl FnOnce() -> R,
+) -> R {
+    ARGUMENT_SCHEDULE_TEST_WEAKENING.with(|slot| {
+        let prior = slot.replace(weakening);
+        struct Restore<'a> {
+            slot: &'a std::cell::Cell<u8>,
+            prior: u8,
+        }
+        impl Drop for Restore<'_> {
+            fn drop(&mut self) {
+                self.slot.set(self.prior);
+            }
+        }
+        let restore = Restore { slot, prior };
+        let result = body();
+        drop(restore);
+        result
+    })
+}
+
+#[cfg(test)]
+fn argument_schedule_test_weakened(flag: u8) -> bool {
+    ARGUMENT_SCHEDULE_TEST_WEAKENING.with(|slot| slot.get() & flag != 0)
+}
+
 pub struct FnSig {
     pub params: Vec<Param>,
     pub ret: Ty,
@@ -8438,6 +8478,10 @@ fn check_pending_loan_argument_mutations(
     argument_loans: &[Option<CallTransition>],
     span: Span,
 ) -> CResult<()> {
+    #[cfg(test)]
+    if argument_schedule_test_weakened(WEAKEN_ARGUMENT_PENDING_MUTATION) {
+        return Ok(());
+    }
     if arguments.len() != argument_loans.len() {
         return Err(Diagnostic {
             name: "internal.check.call_evaluation_arity".into(),
@@ -8490,6 +8534,7 @@ fn check_pending_loan_argument_mutations(
     Ok(())
 }
 
+#[allow(unused_labels)] // labels are targets only for the cfg(test) mutation harness
 fn check_recorded_argument_conflicts(
     ctx: &Ctx,
     moved_before: &HashSet<Place>,
@@ -8507,83 +8552,95 @@ fn check_recorded_argument_conflicts(
             CallArgumentEffect::Value(_) => None,
         })
         .collect();
-    for i in 0..loans.len() {
-        for j in (i + 1)..loans.len() {
-            let (left, left_mut, _) = loans[i];
-            let (right, right_mut, right_span) = loans[j];
-            if (left_mut || right_mut) && left.overlaps(right) {
+    'unique_conflicts: {
+        #[cfg(test)]
+        if argument_schedule_test_weakened(WEAKEN_ARGUMENT_UNIQUE_CONFLICT) {
+            break 'unique_conflicts;
+        }
+        for i in 0..loans.len() {
+            for j in (i + 1)..loans.len() {
+                let (left, left_mut, _) = loans[i];
+                let (right, right_mut, right_span) = loans[j];
+                if (left_mut || right_mut) && left.overlaps(right) {
+                    return Err(Diagnostic {
+                        name: "borrow.conflict".into(),
+                        title: format!(
+                            "conflicting borrows of `{}` in `{operation}`",
+                            left.render()
+                        ),
+                        span: right_span,
+                        label: format!("this overlaps the borrow of `{}`", left.render()),
+                        notes: vec![(
+                            "note".into(),
+                            "a mutable borrow must not overlap another borrow in the same \
+                         operation: its symbolic effects frame them as distinct storage"
+                                .into(),
+                        )],
+                    });
+                }
+            }
+        }
+    }
+    'move_conflicts: {
+        #[cfg(test)]
+        if argument_schedule_test_weakened(WEAKEN_ARGUMENT_MOVE_CONFLICT) {
+            break 'move_conflicts;
+        }
+        for argument in arguments {
+            let CallArgumentEffect::Value(value) = &argument.effect else {
+                continue;
+            };
+            if value.kind != ValueTransferKind::Move {
+                continue;
+            }
+            let Some(moved) = value.source.as_ref() else {
+                continue;
+            };
+            if let Some((loaned, _, loan_span)) = loans
+                .iter()
+                .copied()
+                .find(|(loaned, _, _)| loaned.overlaps(moved))
+            {
                 return Err(Diagnostic {
-                    name: "borrow.conflict".into(),
+                    name: "borrow.moved_in_call".into(),
                     title: format!(
-                        "conflicting borrows of `{}` in `{operation}`",
-                        left.render()
+                        "`{}` is both lent and handed over in `{operation}`",
+                        loaned.render()
                     ),
-                    span: right_span,
-                    label: format!("this overlaps the borrow of `{}`", left.render()),
+                    span: loan_span,
+                    label: format!(
+                        "this borrow promises the caller keeps `{}`, which the same operation moves",
+                        loaned.render()
+                    ),
+                    notes: vec![],
+                });
+            }
+        }
+        for (loaned, _, loan_span) in loans {
+            if ctx
+                .moved
+                .difference(moved_before)
+                .any(|moved| loaned.overlaps(moved))
+            {
+                return Err(Diagnostic {
+                    name: "borrow.moved_in_call".into(),
+                    title: format!(
+                        "`{}` is lent and moved while evaluating `{operation}`",
+                        loaned.render()
+                    ),
+                    span: loan_span,
+                    label: format!(
+                        "this borrow promises the caller keeps `{}`, which argument evaluation moves",
+                        loaned.render()
+                    ),
                     notes: vec![(
                         "note".into(),
-                        "a mutable borrow must not overlap another borrow in the same \
-                         operation: its symbolic effects frame them as distinct storage"
+                        "a nested argument may return a fresh value while moving caller storage; \
+                     the move still invalidates an earlier pending sealed-operation loan"
                             .into(),
                     )],
                 });
             }
-        }
-    }
-    for argument in arguments {
-        let CallArgumentEffect::Value(value) = &argument.effect else {
-            continue;
-        };
-        if value.kind != ValueTransferKind::Move {
-            continue;
-        }
-        let Some(moved) = value.source.as_ref() else {
-            continue;
-        };
-        if let Some((loaned, _, loan_span)) = loans
-            .iter()
-            .copied()
-            .find(|(loaned, _, _)| loaned.overlaps(moved))
-        {
-            return Err(Diagnostic {
-                name: "borrow.moved_in_call".into(),
-                title: format!(
-                    "`{}` is both lent and handed over in `{operation}`",
-                    loaned.render()
-                ),
-                span: loan_span,
-                label: format!(
-                    "this borrow promises the caller keeps `{}`, which the same operation moves",
-                    loaned.render()
-                ),
-                notes: vec![],
-            });
-        }
-    }
-    for (loaned, _, loan_span) in loans {
-        if ctx
-            .moved
-            .difference(moved_before)
-            .any(|moved| loaned.overlaps(moved))
-        {
-            return Err(Diagnostic {
-                name: "borrow.moved_in_call".into(),
-                title: format!(
-                    "`{}` is lent and moved while evaluating `{operation}`",
-                    loaned.render()
-                ),
-                span: loan_span,
-                label: format!(
-                    "this borrow promises the caller keeps `{}`, which argument evaluation moves",
-                    loaned.render()
-                ),
-                notes: vec![(
-                    "note".into(),
-                    "a nested argument may return a fresh value while moving caller storage; \
-                     the move still invalidates an earlier pending sealed-operation loan"
-                        .into(),
-                )],
-            });
         }
     }
     Ok(())
@@ -8593,6 +8650,7 @@ fn check_recorded_argument_conflicts(
 /// receives. The flow delta is checker state, not a second source walk: it
 /// retains moves performed by nested argument evaluation whose outer argument
 /// transfer is necessarily `Fresh`.
+#[allow(unused_labels)] // labels are targets only for the cfg(test) mutation harness
 fn check_recorded_call_conflicts(
     ctx: &Ctx,
     moved_before: &HashSet<Place>,
@@ -8615,85 +8673,97 @@ fn check_recorded_call_conflicts(
             ));
         }
     }
-    for i in 0..loans.len() {
-        for j in (i + 1)..loans.len() {
-            let (left, left_mut, _) = loans[i];
-            let (right, right_mut, right_span) = loans[j];
-            if (left_mut || right_mut) && left.overlaps(right) {
+    'unique_conflicts: {
+        #[cfg(test)]
+        if argument_schedule_test_weakened(WEAKEN_ARGUMENT_UNIQUE_CONFLICT) {
+            break 'unique_conflicts;
+        }
+        for i in 0..loans.len() {
+            for j in (i + 1)..loans.len() {
+                let (left, left_mut, _) = loans[i];
+                let (right, right_mut, right_span) = loans[j];
+                if (left_mut || right_mut) && left.overlaps(right) {
+                    return Err(Diagnostic {
+                        name: "borrow.conflict".into(),
+                        title: format!("conflicting borrows of `{}` in one call", left.render()),
+                        span: right_span,
+                        label: format!("this overlaps the borrow of `{}`", left.render()),
+                        notes: vec![(
+                            "note".into(),
+                            "a mutable borrow must not overlap another borrow in the same call: \
+                         the callee's contract frames them as distinct storage"
+                                .into(),
+                        )],
+                    });
+                }
+            }
+        }
+    }
+    'move_conflicts: {
+        #[cfg(test)]
+        if argument_schedule_test_weakened(WEAKEN_ARGUMENT_MOVE_CONFLICT) {
+            break 'move_conflicts;
+        }
+        for argument in &call.arguments {
+            let CallArgumentEffect::Value(value) = &argument.effect else {
+                continue;
+            };
+            if value.kind != ValueTransferKind::Move {
+                continue;
+            }
+            let Some(moved) = value.source.as_ref() else {
+                continue;
+            };
+            if let Some((loaned, _, loan_span)) = loans
+                .iter()
+                .copied()
+                .find(|(loaned, _, _)| loaned.overlaps(moved))
+            {
                 return Err(Diagnostic {
-                    name: "borrow.conflict".into(),
-                    title: format!("conflicting borrows of `{}` in one call", left.render()),
-                    span: right_span,
-                    label: format!("this overlaps the borrow of `{}`", left.render()),
+                    name: "borrow.moved_in_call".into(),
+                    title: format!(
+                        "`{}` is both lent and handed over in one call",
+                        loaned.render()
+                    ),
+                    span: loan_span,
+                    label: format!(
+                        "this borrow promises the caller keeps `{}`, which the same call moves",
+                        loaned.render()
+                    ),
                     notes: vec![(
                         "note".into(),
-                        "a mutable borrow must not overlap another borrow in the same call: \
-                         the callee's contract frames them as distinct storage"
+                        "a borrow and a move of one storage reach the callee as two values its \
+                     contract frames separately, so a write through one is invisible to the other"
                             .into(),
                     )],
                 });
             }
         }
-    }
-    for argument in &call.arguments {
-        let CallArgumentEffect::Value(value) = &argument.effect else {
-            continue;
-        };
-        if value.kind != ValueTransferKind::Move {
-            continue;
-        }
-        let Some(moved) = value.source.as_ref() else {
-            continue;
-        };
-        if let Some((loaned, _, loan_span)) = loans
-            .iter()
-            .copied()
-            .find(|(loaned, _, _)| loaned.overlaps(moved))
-        {
-            return Err(Diagnostic {
-                name: "borrow.moved_in_call".into(),
-                title: format!(
-                    "`{}` is both lent and handed over in one call",
-                    loaned.render()
-                ),
-                span: loan_span,
-                label: format!(
-                    "this borrow promises the caller keeps `{}`, which the same call moves",
-                    loaned.render()
-                ),
-                notes: vec![(
-                    "note".into(),
-                    "a borrow and a move of one storage reach the callee as two values its \
-                     contract frames separately, so a write through one is invisible to the other"
-                        .into(),
-                )],
-            });
-        }
-    }
-    for (loaned, _, loan_span) in loans {
-        if ctx
-            .moved
-            .difference(moved_before)
-            .any(|moved| loaned.overlaps(moved))
-        {
-            return Err(Diagnostic {
-                name: "borrow.moved_in_call".into(),
-                title: format!(
-                    "`{}` is both lent and handed over in one call",
-                    loaned.render()
-                ),
-                span: loan_span,
-                label: format!(
-                    "this borrow promises the caller keeps `{}`, which argument evaluation moves",
-                    loaned.render()
-                ),
-                notes: vec![(
-                    "note".into(),
-                    "a nested argument may return a fresh value while moving caller storage; \
+        for (loaned, _, loan_span) in loans {
+            if ctx
+                .moved
+                .difference(moved_before)
+                .any(|moved| loaned.overlaps(moved))
+            {
+                return Err(Diagnostic {
+                    name: "borrow.moved_in_call".into(),
+                    title: format!(
+                        "`{}` is both lent and handed over in one call",
+                        loaned.render()
+                    ),
+                    span: loan_span,
+                    label: format!(
+                        "this borrow promises the caller keeps `{}`, which argument evaluation moves",
+                        loaned.render()
+                    ),
+                    notes: vec![(
+                        "note".into(),
+                        "a nested argument may return a fresh value while moving caller storage; \
                      the move still conflicts with another argument's loan"
-                        .into(),
-                )],
-            });
+                            .into(),
+                    )],
+                });
+            }
         }
     }
     Ok(())

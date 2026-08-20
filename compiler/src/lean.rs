@@ -25,6 +25,9 @@ enum MapTarget {
     },
     /// Fixed-proof compiler certificate for a selected symbolic transition.
     Certificate(usize),
+    /// Closed argument-evaluation schedule selected from the typed AST and
+    /// checker ownership records.
+    ArgumentScheduleCertificate(usize),
     Obligation(usize),
     /// Theorem proved by a user discharge script; errors point at the
     /// discharge block.
@@ -54,7 +57,7 @@ pub struct EmittedNames {
     pub wfs: std::collections::HashSet<String>,
     /// Obligation theorem names.
     pub thms: std::collections::HashSet<String>,
-    /// Non-skippable symbolic-transition certificate theorem names.
+    /// Non-skippable certificate theorem names.
     pub certificates: std::collections::HashSet<String>,
     /// Obligation names (escape-hatch ownership checks).
     pub obligations: std::collections::HashSet<String>,
@@ -380,6 +383,32 @@ pub fn emit(
             first_line: first,
             last_line: e.line,
             target: MapTarget::Certificate(i),
+        });
+    }
+
+    for (i, certificate) in vc.argument_schedule_certificates.iter().enumerate() {
+        if exclude.certificates.contains(&certificate.thm_name) {
+            continue;
+        }
+        names.certificates.insert(certificate.thm_name.clone());
+        let first = e.line + 1;
+        e.push(&format!(
+            "/-- `{}` — kernel-checked {} for {} -/",
+            certificate.name,
+            certificate.description(),
+            doc_safe(&certificate.boundary())
+        ));
+        e.push(&format!(
+            "theorem {} : ({}) := {}",
+            certificate.thm_name,
+            certificate.lean_goal(),
+            certificate.lean_proof()
+        ));
+        e.push("");
+        map.push(MapEntry {
+            first_line: first,
+            last_line: e.line,
+            target: MapTarget::ArgumentScheduleCertificate(i),
         });
     }
 
@@ -1207,6 +1236,30 @@ pub fn diagnose(
                             format!(
                                 "goal: {}\nthis fixed-proof theorem cannot be deferred, \
                                  assumed, or replaced by a user discharge",
+                                certificate.lean_goal()
+                            ),
+                        ),
+                        ("lean".into(), msg.data.clone()),
+                    ],
+                });
+            }
+            Some(MapTarget::ArgumentScheduleCertificate(i)) => {
+                let certificate = &vc.argument_schedule_certificates[*i];
+                diags.push(Diagnostic {
+                    name: certificate.rejection_diagnostic_name().into(),
+                    title: format!(
+                        "Lean rejected {} certificate `{}`",
+                        certificate.description(),
+                        certificate.name
+                    ),
+                    span: certificate.span,
+                    label: certificate.rejection_label(),
+                    notes: vec![
+                        (
+                            "certificate".into(),
+                            format!(
+                                "goal: {}\nthis closed theorem cannot be deferred, assumed, \
+                                 or replaced by a user discharge",
                                 certificate.lean_goal()
                             ),
                         ),

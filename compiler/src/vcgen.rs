@@ -21,6 +21,7 @@
 
 #![deny(clippy::wildcard_enum_match_arm)]
 
+use crate::argument_schedule::ArgumentScheduleCertificate;
 use crate::ast::*;
 use crate::check::{CheckResult, FnSig};
 use crate::control::{
@@ -80,6 +81,9 @@ pub struct VcResult {
     /// Fixed-proof Lean certificates for selected symbolic transitions.
     /// They are not user obligations and cannot be skipped or discharged.
     pub(crate) transition_certificates: Vec<TransitionCertificate>,
+    /// Closed, bounded argument-evaluation certificates. Like transition
+    /// certificates, these cannot be skipped, assumed, or discharged.
+    pub(crate) argument_schedule_certificates: Vec<ArgumentScheduleCertificate>,
     /// What this module trusts (ADR 0027). Emitted into the generated
     /// Lean as a comment header so it lands inside the artifact hash: an
     /// artifact must not survive a change to what it trusted, and the
@@ -2589,6 +2593,7 @@ pub(crate) fn generate(
         clause_wfs: Vec::new(),
         obligations: Vec::new(),
         transition_certificates: Vec::new(),
+        argument_schedule_certificates: Vec::new(),
         trust: TrustManifest {
             externs: {
                 // Sorted, so the artifact hash is stable across the
@@ -3051,6 +3056,12 @@ pub(crate) fn generate(
     if let Some(refusal) = take_vc_type_refusal() {
         return Err(refusal);
     }
+    // This is intentionally a post-check, post-generation pass over the typed
+    // AST and the sealed ownership records.  Running it here preserves each
+    // existing VC consumer's own fail-closed diagnostics while still making a
+    // complete schedule certificate mandatory before any result can escape.
+    result.argument_schedule_certificates =
+        crate::argument_schedule::extract(program, &checked.ownership)?;
     Ok(result)
 }
 
@@ -12486,7 +12497,9 @@ fn slot_roundtrip(u64 value) -> u64 {
         );
         assert!(emitted.lean_source.contains("Sable.SlotPutWriteback"));
         assert!(emitted.lean_source.contains("Sable.SlotTakeWriteback"));
-        assert_eq!(emitted.names.certificates.len(), 2);
+        assert_eq!(generated.argument_schedule_certificates.len(), 3);
+        assert!(emitted.lean_source.contains("Sable.ArgumentSchedule.safe"));
+        assert_eq!(emitted.names.certificates.len(), 5);
     }
 
     #[test]
@@ -14676,6 +14689,7 @@ fn bool_array_loop(u64 n, bool seed) {
             clause_wfs: Vec::new(),
             obligations: Vec::new(),
             transition_certificates: Vec::new(),
+            argument_schedule_certificates: Vec::new(),
             trust: TrustManifest::default(),
             machine: MachineManifest::default(),
         }
@@ -15816,7 +15830,8 @@ pub fn branch_join(u64 n, bool choose) {
             &[],
             &crate::lean::EmittedNames::default(),
         );
-        assert_eq!(emitted.names.certificates.len(), 2);
+        assert_eq!(result.argument_schedule_certificates.len(), 1);
+        assert_eq!(emitted.names.certificates.len(), 3);
         assert!(
             certificates
                 .iter()
@@ -16203,7 +16218,13 @@ pub fn same_member_subject() {
         );
         assert!(emitted.lean_source.contains("Sable.ArrayCallHavoc"));
         assert!(emitted.lean_source.contains("by exact ⟨rfl,"));
-        assert_eq!(emitted.names.certificates.len(), 1);
+        assert_eq!(result.argument_schedule_certificates.len(), 1);
+        assert!(
+            emitted
+                .lean_source
+                .contains(&result.argument_schedule_certificates[0].thm_name)
+        );
+        assert_eq!(emitted.names.certificates.len(), 2);
         assert!(!emitted.names.thms.contains(&certificate.thm_name));
     }
 

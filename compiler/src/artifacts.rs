@@ -450,6 +450,15 @@ fn prepare_with_environment(
         let root_emitted = source_belongs_to_root(span) || !exclude.certificates.contains(&name);
         collision = register_declaration(name, "transition certificate", span, root_emitted);
     }
+    for certificate in &vc.argument_schedule_certificates {
+        if collision.is_some() {
+            break;
+        }
+        let name = certificate.thm_name.clone();
+        let span = certificate.span;
+        let root_emitted = source_belongs_to_root(span) || !exclude.certificates.contains(&name);
+        collision = register_declaration(name, "argument-schedule certificate", span, root_emitted);
+    }
     for obligation in &vc.obligations {
         if collision.is_some() {
             break;

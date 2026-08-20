@@ -54,6 +54,16 @@ impl Place {
         &self.root
     }
 
+    /// Structural field-path components, in projection order.
+    ///
+    /// Certificate encoders consume this slice directly. Re-parsing
+    /// [`Place::render`] would collapse the shared storage identity back into
+    /// punctuation-sensitive text at exactly the boundary the certificate is
+    /// meant to audit.
+    pub(crate) fn fields(&self) -> &[String] {
+        &self.fields
+    }
+
     pub(crate) fn is_root(&self) -> bool {
         self.fields.is_empty()
     }

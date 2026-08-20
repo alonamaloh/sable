@@ -171,6 +171,10 @@ impl CheckedCallTransitions {
         self.by_site.get(key)
     }
 
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (&CallSiteKey, &CheckedCallTransition)> {
+        self.by_site.iter()
+    }
+
     pub(crate) fn for_owner(
         &self,
         owner: &CallOwner,

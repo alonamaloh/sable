@@ -1,6 +1,7 @@
 //! The Sable compiler library. `check_file` runs the full pipeline:
 //! scan → parse → typecheck → vcgen → emit Lean → check → map diagnostics.
 
+mod argument_schedule;
 pub mod artifacts;
 pub mod ast;
 pub mod check;
