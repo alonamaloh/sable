@@ -195,10 +195,7 @@ fn terminal_sentinel_name(module_name: &str, pre_sentinel_source: &str) -> Strin
     append_framed(&mut framed, TERMINAL_SENTINEL_DOMAIN);
     append_framed(&mut framed, module_name.as_bytes());
     append_framed(&mut framed, pre_sentinel_source.as_bytes());
-    format!(
-        "SableGenerated.complete_{}",
-        crate::sha256::hex(&framed)
-    )
+    format!("SableGenerated.complete_{}", crate::sha256::hex(&framed))
 }
 
 fn append_framed(output: &mut Vec<u8>, value: &[u8]) {
@@ -380,29 +377,17 @@ pub fn emit(
         }
         e.push("");
         e.push(&format!("namespace {lean_name}"));
-        declaration_envelope.push_proof_definition(
-            format!("{lean_name}.layout"),
-            false,
-            false,
-        );
+        declaration_envelope.push_proof_definition(format!("{lean_name}.layout"), false, false);
         e.push(&format!(
             "noncomputable def layout : Sable.Layout := ⟨{}, {}⟩",
             r.layout.size, r.layout.align
         ));
-        declaration_envelope.push_theorem(
-            format!("{lean_name}.layout_size"),
-            true,
-            false,
-        );
+        declaration_envelope.push_theorem(format!("{lean_name}.layout_size"), true, false);
         e.push(&format!(
             "@[simp] theorem layout_size : layout.size = {} := rfl",
             r.layout.size
         ));
-        declaration_envelope.push_theorem(
-            format!("{lean_name}.layout_align"),
-            true,
-            false,
-        );
+        declaration_envelope.push_theorem(format!("{lean_name}.layout_align"), true, false);
         e.push(&format!(
             "@[simp] theorem layout_align : layout.align = {} := rfl",
             r.layout.align
@@ -424,11 +409,7 @@ pub fn emit(
             align /= 2;
             exponent += 1;
         }
-        declaration_envelope.push_theorem(
-            format!("{lean_name}.layout_wf"),
-            false,
-            false,
-        );
+        declaration_envelope.push_theorem(format!("{lean_name}.layout_wf"), false, false);
         e.push("theorem layout_wf : layout.wf := by");
         e.push(&format!(
             "  refine ⟨by decide, by decide, ⟨{exponent}, rfl⟩⟩"
@@ -449,10 +430,7 @@ pub fn emit(
                 let lfield = &r.fields[left];
                 let rfield = &r.fields[right];
                 declaration_envelope.push_theorem(
-                    format!(
-                        "{lean_name}.{}_{}_disjoint",
-                        lfield.name, rfield.name
-                    ),
+                    format!("{lean_name}.{}_{}_disjoint", lfield.name, rfield.name),
                     false,
                     false,
                 );
@@ -477,11 +455,7 @@ pub fn emit(
         } else {
             value_wf.join(" ∧ ")
         };
-        declaration_envelope.push_proof_definition(
-            format!("{lean_name}.wf"),
-            false,
-            false,
-        );
+        declaration_envelope.push_proof_definition(format!("{lean_name}.wf"), false, false);
         e.push(&format!(
             "noncomputable def wf (value : {lean_name}) : Prop :="
         ));
@@ -489,29 +463,17 @@ pub fn emit(
         // A plain `def` is invisible to `simp`; the explicit unfolding
         // lemma is what lets automation read the field facts out of a
         // `wf` hypothesis (an elementwise array fact included).
-        declaration_envelope.push_theorem(
-            format!("{lean_name}.wf_iff"),
-            true,
-            false,
-        );
+        declaration_envelope.push_theorem(format!("{lean_name}.wf_iff"), true, false);
         e.push(&format!(
             "@[simp] theorem wf_iff (value : {lean_name}) : wf value ↔ ({wf_body}) := Iff.rfl"
         ));
-        declaration_envelope.push_proof_definition(
-            format!("{lean_name}.cellWf"),
-            false,
-            false,
-        );
+        declaration_envelope.push_proof_definition(format!("{lean_name}.cellWf"), false, false);
         e.push(&format!(
             "noncomputable def cellWf (cell : Sable.PointsToView {lean_name}) : Prop :="
         ));
         e.push("  cell.layout = layout ∧ 0 ≤ cell.off ∧ cell.off % cell.layout.align = 0 ∧");
         e.push("    match cell.state with | .uninit => True | .init value => wf value");
-        declaration_envelope.push_proof_definition(
-            format!("{lean_name}.fromSpan"),
-            false,
-            false,
-        );
+        declaration_envelope.push_proof_definition(format!("{lean_name}.fromSpan"), false, false);
         e.push(&format!(
             "noncomputable def fromSpan (span : Sable.SpanView) : Sable.PointsToView {lean_name} :="
         ));
@@ -522,32 +484,20 @@ pub fn emit(
             "fromSpan_layout",
             "fromSpan_state",
         ] {
-            declaration_envelope.push_theorem(
-                format!("{lean_name}.{theorem}"),
-                true,
-                false,
-            );
+            declaration_envelope.push_theorem(format!("{lean_name}.{theorem}"), true, false);
         }
         e.push("@[simp] theorem fromSpan_alloc (span : Sable.SpanView) : (fromSpan span).alloc = span.alloc := rfl");
         e.push("@[simp] theorem fromSpan_off (span : Sable.SpanView) : (fromSpan span).off = span.off := rfl");
         e.push("@[simp] theorem fromSpan_layout (span : Sable.SpanView) : (fromSpan span).layout = layout := rfl");
         e.push("@[simp] theorem fromSpan_state (span : Sable.SpanView) : (fromSpan span).state = .uninit := rfl");
-        declaration_envelope.push_proof_definition(
-            format!("{lean_name}.toSpan"),
-            false,
-            false,
-        );
+        declaration_envelope.push_proof_definition(format!("{lean_name}.toSpan"), false, false);
         e.push(&format!(
             "noncomputable def toSpan (cell : Sable.PointsToView {lean_name}) : Sable.SpanView :="
         ));
         e.push("  { alloc := cell.alloc, off := cell.off, len := cell.layout.size,");
         e.push("    bytes := ⟨cell.layout.size, fun _ => .init 0⟩ }");
         for theorem in ["toSpan_alloc", "toSpan_off", "toSpan_len"] {
-            declaration_envelope.push_theorem(
-                format!("{lean_name}.{theorem}"),
-                true,
-                false,
-            );
+            declaration_envelope.push_theorem(format!("{lean_name}.{theorem}"), true, false);
         }
         e.push(&format!("@[simp] theorem toSpan_alloc (cell : Sable.PointsToView {lean_name}) : (toSpan cell).alloc = cell.alloc := rfl"));
         e.push(&format!("@[simp] theorem toSpan_off (cell : Sable.PointsToView {lean_name}) : (toSpan cell).off = cell.off := rfl"));
@@ -2132,6 +2082,29 @@ fn ingress_audit_request(emitted: &Emitted) -> Result<Vec<u8>, serde_json::Error
     }))
 }
 
+fn require_terminal_sentinel(emitted: &Emitted) -> Result<(), IngressAuditFailure> {
+    let Some(root) = emitted.declaration_envelope.roots.last() else {
+        return Err(ingress_transport_failure(
+            emitted,
+            "generated Lean declaration envelope lacks its terminal sentinel",
+        ));
+    };
+    if !matches!(&root.kind, ExpectedDeclarationKind::TerminalSentinel) {
+        return Err(ingress_transport_failure(
+            emitted,
+            "generated Lean declaration envelope does not end in its terminal sentinel",
+        ));
+    }
+    let command = format!("theorem {} : True := True.intro\n", root.name);
+    if !emitted.lean_source.ends_with(&command) {
+        return Err(ingress_transport_failure(
+            emitted,
+            "generated Lean source does not end in its recorded terminal sentinel",
+        ));
+    }
+    Ok(())
+}
+
 /// Authenticate every compiler-recorded user-derived parser boundary using
 /// the content-hashed trusted auditor. Candidate generated modules are not
 /// imported by this mode; the auditor loads extensions only from `Sable`.
@@ -2140,6 +2113,7 @@ pub(crate) fn audit_ingress(
     environment: &ProofEnvironment,
     emitted: &Emitted,
 ) -> Result<(), IngressAuditFailure> {
+    require_terminal_sentinel(emitted)?;
     let request = ingress_audit_request(emitted).map_err(|error| {
         ingress_transport_failure(
             emitted,
@@ -2269,9 +2243,7 @@ fn parse_ingress_audit_output(
     let object = value.as_object().ok_or_else(|| {
         ingress_transport_failure(emitted, "proof auditor result must be a JSON object")
     })?;
-    if object.get("schema").and_then(serde_json::Value::as_str)
-        != Some(INGRESS_RESULT_SCHEMA)
-    {
+    if object.get("schema").and_then(serde_json::Value::as_str) != Some(INGRESS_RESULT_SCHEMA) {
         return Err(ingress_transport_failure(
             emitted,
             "proof auditor result has the wrong or missing schema",
@@ -3111,9 +3083,11 @@ mod proof_build_tests {
         );
 
         let emitted = draft_with_source(pre_sentinel).finish(module);
-        assert!(emitted.lean_source.ends_with(&format!(
-            "theorem {expected_name} : True := True.intro\n"
-        )));
+        assert!(
+            emitted
+                .lean_source
+                .ends_with(&format!("theorem {expected_name} : True := True.intro\n"))
+        );
         assert_eq!(
             emitted.declaration_envelope.roots.last(),
             Some(&ExpectedDeclarationRoot {
@@ -3121,6 +3095,13 @@ mod proof_build_tests {
                 kind: ExpectedDeclarationKind::TerminalSentinel,
             })
         );
+
+        let mut missing = draft_with_source(pre_sentinel).finish(module);
+        missing.declaration_envelope.roots.pop();
+        assert!(require_terminal_sentinel(&missing).is_err());
+        let mut nonterminal = draft_with_source(pre_sentinel).finish(module);
+        nonterminal.lean_source.push_str("-- forged suffix\n");
+        assert!(require_terminal_sentinel(&nonterminal).is_err());
     }
 
     #[test]
@@ -3295,11 +3276,13 @@ mod proof_build_tests {
                 );
             }
         }
-        assert!(emitted
-            .declaration_envelope
-            .roots
-            .iter()
-            .any(|root| root.name == "clause_wf"));
+        assert!(
+            emitted
+                .declaration_envelope
+                .roots
+                .iter()
+                .any(|root| root.name == "clause_wf")
+        );
     }
 
     #[test]

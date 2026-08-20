@@ -46,7 +46,7 @@ private def parseRequest (input : String) : Except String (Array Fragment) := do
 
 private def rejectExecutableElaborationSyntax (stx : Syntax) : Except String Unit := do
   for child in stx.topDown do
-    if child.isOfKind ``Parser.Term.byElab then
+    if child.isOfKind ``Lean.byElab then
       throw "`by_elab` is not permitted in generated proof fragments"
     if child.isOfKind ``Parser.Tactic.runTac then
       throw "`run_tac` is not permitted in generated proof fragments"
