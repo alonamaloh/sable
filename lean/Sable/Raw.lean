@@ -174,12 +174,14 @@ def wfWith
     (pred : V → Prop) (m : ResourceMapView K V) : Prop :=
   ∀ key value, m.entries key = some value → pred value
 
+omit [DecidableEq K] in
 theorem wfWith_entry
     {pred : V → Prop} {m : ResourceMapView K V}
     (hwf : m.wfWith pred) {key : K} {value : V}
     (hentry : m.entries key = some value) : pred value :=
   hwf key value hentry
 
+omit [DecidableEq K] in
 @[simp] theorem wfWith_empty (pred : V → Prop) :
     (empty : ResourceMapView K V).wfWith pred := by
   intro key value hentry
@@ -3255,7 +3257,7 @@ theorem SpanView.toSeq_ofSeq (a : Int) (s : Seq Int) (k : Int) :
 
 theorem SpanView.ofSeq_allInit (a : Int) (s : Seq Int) :
     (SpanView.ofSeq a s).allInit := by
-  intro k _ _; simp [SpanView.allInit]
+  intro k _ _; simp
 
 /-- The bytes an exposed array starts with are its elements, so their
 `byte` values are the elements themselves. This is what carries the

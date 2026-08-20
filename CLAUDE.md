@@ -13,8 +13,10 @@ test ! -e .sable-out/daemon.sock && test ! -L .sable-out/daemon.sock
 (cd lean && LEAN_NUM_THREADS=0 LEAN_IMPORT_WORKERS=1 lake --quiet build Sable)
 LEAN_NUM_THREADS=0 LEAN_IMPORT_WORKERS=1 compiler/target/debug/sable check corpus/verifies/div_round_up.sable
 compiler/target/debug/sable test -M corpus/verifies corpus/tests/test_sorting.sable   # dynamic checks, no Lean; -M resolves `use` imports
-LEAN_NUM_THREADS=0 LEAN_IMPORT_WORKERS=1 compiler/target/debug/sable daemon &   # optional: warm checker (~10x faster sable check)
 ```
+
+Warm-daemon verification is parked during priority zero: `sable daemon` has no
+verification caller and currently gives `sable check` no speedup.
 
 Lean is pinned by `lean/lean-toolchain`; elan fetches it automatically. Never upgrade the pin casually — it gets its own commit, tested against the corpus.
 

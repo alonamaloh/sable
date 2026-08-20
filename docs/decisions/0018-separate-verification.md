@@ -51,6 +51,19 @@ verified once; importers `import` it through Lean's own module system.
   started before this slice reports unknown modules; the client detects
   that and falls back to the batch path.
 
+## Amendment — policy-bound proof evidence (2026-08-20)
+
+Priority-zero proof-ingress hardening supersedes three operational details
+above while preserving separate verification itself:
+
+- Root generated files are immutable and content-addressed under
+  `.sable-out/roots/`; root verification still runs every time.
+- Content addresses include the verification policy, and reusable `.ok` files
+  must contain its exact policy stamp. Existence alone is no longer evidence.
+- Authoritative checks use strict batch Lean. Warm-daemon verification is
+  parked with no caller until its complete stderr/protocol transcript can be
+  authenticated, so `sable daemon` currently provides no check speedup.
+
 ## Flat-namespace guards
 
 Separate verification makes silent cross-module shadowing possible

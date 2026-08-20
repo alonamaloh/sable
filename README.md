@@ -38,10 +38,12 @@ verifies today. Fold the `///` lines and it reads as plain C with a contract.
 
 ## What “verified” means
 
-> **Known release block (2026-08-20):** user-controlled proof text can currently
-> introduce `sorryAx` or an unreported axiom. The immediate fail-safe now prints
-> `status: Lean accepted; proof dependencies unaudited` instead of `fully
-> verified`, but it does not yet close the ingress. Until
+> **Known release block (2026-08-20):** Sable now rejects ordinary `sorry`,
+> `admit`, default-warning direct `sorryAx`, and every other unrecognized Lean
+> warning before publishing proof evidence. User-controlled proof text can still suppress
+> `warn.sorry` around `sorryAx` or inject an unreported axiom, so accepted work
+> continues to print `status: Lean accepted; proof dependencies unaudited`
+> instead of `fully verified`. Until
 > [plan priority zero](docs/PLAN.md#priority-zero-seal-proof-ingress) completes
 > the transitive audit, no release should claim axiom-clean verification.
 
@@ -95,12 +97,14 @@ compiler/target/release/sable doctor
 compiler/target/release/sable check corpus/verifies/div_round_up.sable
 compiler/target/release/sable test -M corpus/verifies corpus/tests/test_arith.sable
 compiler/target/release/sable explain-type 'option<[bool]>'
-compiler/target/release/sable daemon   # optional warm checker, ~10x faster checks
 ```
 
 The exported Lean settings disable the hardware-sized task pool and keep import
 work to one worker. Supported test commands additionally use one Cargo job, one
 Rust test thread, and at most two explicit outer verification workers.
+Proof acceptance currently uses the strict batch Lean transport. Warm-daemon
+verification is temporarily disabled: `sable daemon` has no verification
+caller and currently provides no `sable check` speedup.
 
 `sable doctor` checks the checkout, Cargo, Lake, the exact version named by
 `lean/lean-toolchain`, the built prelude, hosted runtime, and Clang. Missing or

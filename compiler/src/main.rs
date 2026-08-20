@@ -15,8 +15,8 @@ Usage:
   sable explain-type '<type>'        show parser positions and stage-gate coverage
   sable ... -M <dir>                 add a directory to the `use` module search path
   sable lsp                          run the language server on stdio
-  sable daemon                       keep a warm Lean server for fast checks
-                                     (socket: .sable-out/daemon.sock)
+  sable daemon                       run the parked warm Lean server
+                                     (non-authoritative; no verification caller)
   sable doctor                       check the local Sable toolchain and checkout
 ";
 

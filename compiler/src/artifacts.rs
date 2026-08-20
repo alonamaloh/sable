@@ -4,13 +4,15 @@
 //! module system instead of re-proving the whole DAG.
 //!
 //! An artifact is `.sable-out/modules/<stem>_<hash>.{lean,olean,ok}`,
-//! where the hash covers the generated content and the prelude. Import
+//! where the hash covers the generated content, prelude, and verification
+//! policy. Import
 //! lines name dep artifacts by that hash, so a module's artifact name
 //! transitively pins everything its verification depended on: a changed
 //! dep changes the importer's generated header, which also makes the
-//! warm daemon reload imports exactly when needed. Cache validity is
-//! just artifact existence — `.ok` is written only after a successful,
-//! kernel-checked run; failures leave nothing behind.
+//! warm daemon reload imports exactly when needed. Cache validity requires an
+//! exact policy-bound `.ok` stamp, written only after a successful,
+//! kernel-checked run with no unrecognized Lean warning; failures leave no
+//! reusable stamp behind.
 //!
 //! Each generated file declares only what no imported artifact already
 //! declares (name subtraction), so template instances demanded by an
@@ -46,6 +48,10 @@ pub struct ModuleArtifact {
     pub source: Arc<str>,
     /// Exact proof environment used to verify this dependency.
     proof_fingerprint: String,
+    /// Exact verification policy used to admit warnings and publish stamps.
+    /// This remains separate from the compact fingerprint so a collision
+    /// cannot join an in-flight build or substitute a cached result.
+    proof_policy: String,
     /// Exact transitive module graph used to prove this artifact. A parent
     /// requires equality with the dependency subgraph from its already-loaded
     /// closure, including resolved edges and order.
@@ -271,6 +277,7 @@ fn prepare_with_environment(
                     || a.source.as_ref() != module_source
                     || !a.inputs.exact_eq(&expected_dependency)
                     || a.proof_fingerprint.as_str() != proof_fingerprint
+                    || a.proof_policy.as_str() != proof_environment.policy()
                 {
                     return (
                         mods,
@@ -525,7 +532,12 @@ fn prepare_with_environment(
 
     let imports: Vec<String> = dep_arts.iter().map(|a| a.lean_name.clone()).collect();
     let emitted = lean::emit(&vc, &program.discharges, &skip, &imports, &exclude);
-    let lean_name = artifact_name(path, &emitted.lean_source, &proof_fingerprint);
+    let lean_name = artifact_name(
+        path,
+        &emitted.lean_source,
+        &proof_fingerprint,
+        proof_environment.policy(),
+    );
     let root_path = mods.modules[0].path.clone();
 
     (
@@ -700,6 +712,7 @@ type ArtifactResult = Result<Arc<ModuleArtifact>, Arc<Vec<PortableDiag>>>;
 struct ArtifactBuildKey {
     path: PathBuf,
     inputs: u64,
+    proof_policy: String,
 }
 
 struct ArtifactFlight {
@@ -826,6 +839,7 @@ fn ensure_artifact_snapshot(
     let key = ArtifactBuildKey {
         path: canonical.clone(),
         inputs,
+        proof_policy: proof_environment.policy().to_owned(),
     };
     let (flight, leader) = {
         let mut map = cache().lock().unwrap_or_else(|poison| poison.into_inner());
@@ -894,7 +908,13 @@ fn artifact_input_fingerprint(
         Ok((_, modules)) => (None, modules),
         Err((diagnostic, modules)) => (Some(diagnostic), modules),
     };
-    let mut hash = module_set_fingerprint(&modules, opts, repo_root, proof_environment.id());
+    let mut hash = module_set_fingerprint(
+        &modules,
+        opts,
+        repo_root,
+        proof_environment.id(),
+        proof_environment.policy(),
+    );
     if let Some(diagnostic) = load_error {
         hash = fnv64(hash, b"load-error\0");
         hash = fnv64(hash, diagnostic.name.as_bytes());
@@ -912,8 +932,10 @@ fn module_set_fingerprint(
     opts: &Options,
     repo_root: &Path,
     proof_fingerprint: &str,
+    proof_policy: &str,
 ) -> u64 {
-    let mut hash = fnv64(0, proof_fingerprint.as_bytes());
+    let mut hash = bind_proof_policy(0, proof_policy);
+    hash = fnv64(hash, proof_fingerprint.as_bytes());
     hash = fnv64(hash, &[u8::from(opts.emit_lean_only)]);
     if let Ok(heartbeats) = std::env::var("SABLE_GRIND_HEARTBEATS") {
         hash = fnv64(hash, heartbeats.as_bytes());
@@ -937,6 +959,12 @@ fn module_set_fingerprint(
         hash = fnv64(hash, &dependency.to_le_bytes());
     }
     hash
+}
+
+fn bind_proof_policy(seed: u64, proof_policy: &str) -> u64 {
+    let mut hash = fnv64(seed, b"sable-verification-policy\0");
+    hash = fnv64(hash, &(proof_policy.len() as u64).to_le_bytes());
+    fnv64(hash, proof_policy.as_bytes())
 }
 
 fn hash_relative_path(seed: u64, repo_root: &Path, path: &Path) -> u64 {
@@ -988,11 +1016,14 @@ fn build_artifact(
                 .into(),
         ));
     }
-    if prep.proof_fingerprint != proof_environment.id() {
+    if prep.proof_fingerprint != proof_environment.id()
+        || prep.proof_environment.policy() != proof_environment.policy()
+    {
         return Err(io_portable(
             path,
             "internal.proof_fingerprint",
-            "dependency preparation substituted a different immutable proof environment".into(),
+            "dependency preparation substituted a different immutable proof environment or verification policy"
+                .into(),
         ));
     }
     let display = mods.modules[0].display.clone();
@@ -1009,10 +1040,12 @@ fn build_artifact(
     let olean_path = dir.join(format!("{}.olean", prep.lean_name));
     let ok_path = dir.join(format!("{}.ok", prep.lean_name));
 
-    // Content-addressed: existence is validity. `.ok` is only written
-    // after a successful kernel-checked run that also produced the
-    // importable olean.
+    // Both the content address and the stamp bind the verification policy.
+    // The exact stamp is checked before an existing olean may be reused.
     if ok_path.is_file() && olean_path.is_file() {
+        if let Err(message) = require_artifact_policy_stamp(&ok_path, proof_environment.policy()) {
+            return Err(io_portable(path, "internal.artifact_policy", message));
+        }
         if let Some(expected) = expected_snapshot {
             match load_snapshot(path, opts) {
                 Ok(current) if current.exact_eq(expected) => {}
@@ -1050,6 +1083,7 @@ fn build_artifact(
             path: path.to_path_buf(),
             source,
             proof_fingerprint: prep.proof_fingerprint.clone(),
+            proof_policy: prep.proof_environment.policy().to_owned(),
             inputs: prep.input_snapshot.clone(),
             warnings: Vec::new(),
         }));
@@ -1081,11 +1115,20 @@ fn build_artifact(
             return Err(io_portable(path, "internal.lean_invocation", msg));
         }
     };
-    let errors = lean::dedup_by_name(lean::diagnose(&prep.emitted, &prep.vc, &messages, &mods));
-    if !errors.is_empty() {
+    let mut diagnostics = lean::diagnose(&prep.emitted, &prep.vc, &messages, &mods);
+    diagnostics.extend(lean::diagnose_unexpected_warnings(
+        &prep.emitted,
+        &prep.vc,
+        &messages,
+    ));
+    let diagnostics = lean::dedup_by_name(diagnostics);
+    if !diagnostics.is_empty() {
         let _ = std::fs::remove_file(&tmp_olean);
         return Err(Arc::new(
-            errors.iter().map(|d| to_portable(&mods, d)).collect(),
+            diagnostics
+                .iter()
+                .map(|diagnostic| to_portable(&mods, diagnostic))
+                .collect(),
         ));
     }
     if artifact_input_fingerprint(path, opts, repo_root, proof_environment).as_ref()
@@ -1132,7 +1175,7 @@ fn build_artifact(
             format!("cannot move {}: {err}", tmp_olean.display()),
         ));
     }
-    if let Err(err) = write_atomic(&ok_path, "ok\n") {
+    if let Err(err) = write_atomic(&ok_path, &artifact_policy_stamp(proof_environment.policy())) {
         let _ = std::fs::remove_file(&olean_path);
         return Err(io_portable(path, "io.write", err));
     }
@@ -1174,6 +1217,7 @@ fn build_artifact(
         path: path.to_path_buf(),
         source,
         proof_fingerprint: prep.proof_fingerprint.clone(),
+        proof_policy: prep.proof_environment.policy().to_owned(),
         inputs: prep.input_snapshot.clone(),
         warnings,
     }))
@@ -1243,7 +1287,10 @@ pub(crate) fn stamp_verified(
         &prep.emitted.lean_source,
     )?;
     let ok_path = dir.join(format!("{}.ok", prep.lean_name));
-    write_atomic(&ok_path, "ok\n")?;
+    write_atomic(
+        &ok_path,
+        &artifact_policy_stamp(prep.proof_environment.policy()),
+    )?;
     if let Err(error) = require_prepared_inputs(
         &prep.root_path,
         opts,
@@ -1262,6 +1309,38 @@ fn write_atomic(path: &Path, content: &str) -> Result<(), String> {
     let tmp = path.with_extension(format!("tmp{}.{}", std::process::id(), temp_nonce()));
     std::fs::write(&tmp, content).map_err(|e| format!("cannot write {}: {e}", tmp.display()))?;
     std::fs::rename(&tmp, path).map_err(|e| format!("cannot move {}: {e}", tmp.display()))
+}
+
+const ARTIFACT_POLICY_STAMP_PREFIX: &str = "sable-verification-policy:";
+
+fn artifact_policy_stamp(proof_policy: &str) -> String {
+    format!("{ARTIFACT_POLICY_STAMP_PREFIX}{proof_policy}\n")
+}
+
+fn artifact_policy_stamp_matches(actual: &[u8], proof_policy: &str) -> bool {
+    actual == artifact_policy_stamp(proof_policy).as_bytes()
+}
+
+fn require_artifact_policy_stamp(path: &Path, proof_policy: &str) -> Result<(), String> {
+    let metadata = std::fs::symlink_metadata(path)
+        .map_err(|error| format!("cannot inspect artifact stamp {}: {error}", path.display()))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(format!(
+            "artifact stamp {} is not a regular file",
+            path.display()
+        ));
+    }
+    let actual = std::fs::read(path)
+        .map_err(|error| format!("cannot read artifact stamp {}: {error}", path.display()))?;
+    if artifact_policy_stamp_matches(&actual, proof_policy) {
+        Ok(())
+    } else {
+        Err(format!(
+            "artifact stamp {} does not match verification policy `{}`",
+            path.display(),
+            proof_policy
+        ))
+    }
 }
 
 /// Publish a content-addressed file without ever replacing an existing path.
@@ -1314,7 +1393,12 @@ fn temp_nonce() -> u64 {
 /// seeds with the prelude (sources, toolchain pin, lakefile), so a
 /// prelude change invalidates every artifact; dep artifacts are pinned
 /// transitively through the `import` lines inside `content`.
-fn artifact_name(path: &Path, content: &str, proof_fingerprint: &str) -> String {
+fn artifact_name(
+    path: &Path,
+    content: &str,
+    proof_fingerprint: &str,
+    proof_policy: &str,
+) -> String {
     let stem: String = path
         .file_stem()
         .map(|s| s.to_string_lossy().to_string())
@@ -1327,7 +1411,13 @@ fn artifact_name(path: &Path, content: &str, proof_fingerprint: &str) -> String 
     } else {
         stem
     };
-    let h = fnv64(fnv64(0, proof_fingerprint.as_bytes()), content.as_bytes());
+    let h = fnv64(
+        fnv64(
+            bind_proof_policy(0, proof_policy),
+            proof_fingerprint.as_bytes(),
+        ),
+        content.as_bytes(),
+    );
     format!("{stem}_{h:016x}")
 }
 
@@ -1342,17 +1432,22 @@ fn fnv64(seed: u64, bytes: &[u8]) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{SourceSnapshot, artifact_name, prepare, root_generated_path};
+    use super::{
+        ArtifactBuildKey, SourceSnapshot, artifact_name, artifact_policy_stamp,
+        artifact_policy_stamp_matches, module_set_fingerprint, prepare, root_generated_path,
+    };
     use crate::Options;
+    use crate::lean::PROOF_POLICY_VERSION;
+    use crate::modules::ModuleSet;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
 
     #[test]
     fn root_generated_paths_bind_content_and_proof_environment() {
         let source = Path::new("left/main.sable");
-        let first = artifact_name(source, "import Sable\n-- first\n", "proof-a");
-        let edited = artifact_name(source, "import Sable\n-- edited\n", "proof-a");
-        let new_proof = artifact_name(source, "import Sable\n-- first\n", "proof-b");
+        let first = artifact_name(source, "import Sable\n-- first\n", "proof-a", "policy");
+        let edited = artifact_name(source, "import Sable\n-- edited\n", "proof-a", "policy");
+        let new_proof = artifact_name(source, "import Sable\n-- first\n", "proof-b", "policy");
 
         assert_ne!(first, edited);
         assert_ne!(first, new_proof);
@@ -1364,6 +1459,72 @@ mod tests {
             root_generated_path(Path::new("/repo"), &first),
             root_generated_path(Path::new("/repo"), &first)
         );
+    }
+
+    #[test]
+    fn verification_policy_binds_flights_names_and_exact_stamps() {
+        let source_path = Path::new("left/main.sable");
+        let content = "import Sable\n-- proof\n";
+        let proof_environment = "proof-environment";
+        let legacy_policy = "accept-lean-warnings-legacy";
+        let current_name = artifact_name(
+            source_path,
+            content,
+            proof_environment,
+            PROOF_POLICY_VERSION,
+        );
+        assert_ne!(
+            current_name,
+            artifact_name(source_path, content, proof_environment, legacy_policy)
+        );
+
+        let mut modules = ModuleSet::single("left/main.sable".into(), "fn main() {}\n".into());
+        modules.modules[0].path = source_path.to_path_buf();
+        let options = Options::default();
+        let repo_root = Path::new("/repo");
+        let current_inputs = module_set_fingerprint(
+            &modules,
+            &options,
+            repo_root,
+            proof_environment,
+            PROOF_POLICY_VERSION,
+        );
+        assert_ne!(
+            current_inputs,
+            module_set_fingerprint(
+                &modules,
+                &options,
+                repo_root,
+                proof_environment,
+                legacy_policy,
+            )
+        );
+        assert!(
+            ArtifactBuildKey {
+                path: source_path.to_path_buf(),
+                inputs: current_inputs,
+                proof_policy: PROOF_POLICY_VERSION.into(),
+            } != ArtifactBuildKey {
+                path: source_path.to_path_buf(),
+                inputs: current_inputs,
+                proof_policy: legacy_policy.into(),
+            },
+            "the exact policy, not only its compact hash contribution, keys in-flight builds"
+        );
+
+        let current_stamp = artifact_policy_stamp(PROOF_POLICY_VERSION);
+        assert!(artifact_policy_stamp_matches(
+            current_stamp.as_bytes(),
+            PROOF_POLICY_VERSION
+        ));
+        assert!(!artifact_policy_stamp_matches(
+            b"ok\n",
+            PROOF_POLICY_VERSION
+        ));
+        assert!(!artifact_policy_stamp_matches(
+            artifact_policy_stamp(legacy_policy).as_bytes(),
+            PROOF_POLICY_VERSION
+        ));
     }
 
     #[test]

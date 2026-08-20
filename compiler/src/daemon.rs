@@ -1,5 +1,9 @@
-//! Warm-check daemon: keeps a Lean language server (`lake env lean --server`)
-//! alive so repeated `sable check` runs skip the ~1.5–2s Lean cold start.
+//! Experimental warm-check daemon: keeps a Lean language server (`lake env
+//! lean --server`) alive. During proof-ingress priority zero its messages are
+//! disabled: no verification path calls this module, so `sable daemon`
+//! currently provides no check speedup. Verification and artifact stamping
+//! always use the strict batch transport until the daemon can authenticate the
+//! complete server stderr/protocol transcript.
 //!
 //! Protocol (deliberately trivial — newline-delimited JSON over a unix socket
 //! at `.sable-out/daemon.sock`):
@@ -26,8 +30,9 @@
 //! worker process, so we cap them with an LRU.
 //!
 //! The client side (`try_check`) treats *any* problem — no socket, stale
-//! socket, daemon error — as "no daemon": the caller falls back to the batch
-//! path, so `sable check` never gets worse because a daemon misbehaved.
+//! socket, malformed reply, daemon error — as "no daemon." Its exact parser is
+//! retained for a possible future authenticated caller; no current path
+//! consumes the result.
 //!
 //! Cancel-on-disconnect: while a check is in flight the daemon watches the
 //! client socket; if the client dies (killed `sable check`), the daemon
@@ -36,7 +41,7 @@
 //! canceled document leaves the warm set (the next check of that file pays
 //! one cold didOpen), a fair trade against minutes of wasted CPU.
 
-use crate::lean::LeanMessage;
+use crate::lean::{self, LeanMessage};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -49,14 +54,14 @@ pub fn socket_path(repo_root: &Path) -> PathBuf {
 }
 
 // ---------------------------------------------------------------------------
-// Client side (used by `sable check`)
+// Client side (non-authoritative while priority zero remains open)
 // ---------------------------------------------------------------------------
 
 /// Check a generated document against the exact proof environment captured
 /// while it was prepared. The caller must not substitute a fresh fingerprint:
 /// doing so could pair old generated text with newly edited profile/prelude
-/// semantics. Returns `None` when no usable daemon answers, so the caller can
-/// use the batch path with the same expected fingerprint.
+/// semantics. Returns `None` when no usable daemon answers. Current
+/// verification-capability paths deliberately do not consume this result.
 pub fn try_check(
     repo_root: &Path,
     lean_file: &Path,
@@ -78,23 +83,82 @@ pub fn try_check(
     writeln!(stream, "{request}").ok()?;
     stream.flush().ok()?;
 
-    let mut reader = BufReader::new(stream);
-    let mut line = String::new();
-    reader.read_line(&mut line).ok()?;
-    let reply: serde_json::Value = serde_json::from_str(line.trim()).ok()?;
-    if reply["ok"].as_bool() != Some(true) {
-        return None;
+    let mut reply = Vec::new();
+    BufReader::new(stream).read_to_end(&mut reply).ok()?;
+    parse_check_reply(&reply).ok()
+}
+
+/// Authenticate the daemon's complete one-line success reply. This mirrors
+/// the strict batch transport: every message has a known severity, an exact
+/// unsigned in-range line, and string data. Unknown or extra fields fail the
+/// daemon path so a future caller can fall back to batch Lean.
+fn parse_check_reply(wire: &[u8]) -> Result<Vec<LeanMessage>, String> {
+    let wire = std::str::from_utf8(wire)
+        .map_err(|error| format!("daemon reply is not valid UTF-8: {error}"))?;
+    let Some(json) = wire.strip_suffix('\n') else {
+        return Err("daemon reply is not terminated by one newline".into());
+    };
+    if json.is_empty() || json.contains('\n') || json.contains('\r') {
+        return Err("daemon reply must contain exactly one JSON line".into());
     }
-    let messages = reply["messages"]
-        .as_array()?
+    let value = serde_json::from_str::<serde_json::Value>(json)
+        .map_err(|error| format!("daemon reply is not valid JSON: {error}"))?;
+    let object = value
+        .as_object()
+        .ok_or("daemon reply must be a JSON object")?;
+    if object.len() != 2 || !object.contains_key("ok") || !object.contains_key("messages") {
+        return Err("daemon success reply must contain exactly `ok` and `messages`".into());
+    }
+    if object.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
+        return Err("daemon reply is not an exact success response".into());
+    }
+    let messages = object
+        .get("messages")
+        .and_then(serde_json::Value::as_array)
+        .ok_or("daemon success reply `messages` must be an array")?;
+    messages
         .iter()
-        .map(|m| LeanMessage {
-            severity: m["severity"].as_str().unwrap_or("error").to_string(),
-            line: m["line"].as_u64().unwrap_or(0) as usize,
-            data: m["data"].as_str().unwrap_or("").to_string(),
+        .enumerate()
+        .map(|(index, value)| {
+            let object = value
+                .as_object()
+                .ok_or_else(|| format!("daemon message {index} must be an object"))?;
+            if object.len() != 3
+                || !object.contains_key("severity")
+                || !object.contains_key("line")
+                || !object.contains_key("data")
+            {
+                return Err(format!(
+                    "daemon message {index} must contain exactly `severity`, `line`, and `data`"
+                ));
+            }
+            let severity = object
+                .get("severity")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| format!("daemon message {index} lacks string `severity`"))?;
+            if !lean::supported_diagnostic_severity(severity) {
+                return Err(format!(
+                    "daemon message {index} has unsupported severity `{severity}`"
+                ));
+            }
+            let line = object
+                .get("line")
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|line| usize::try_from(line).ok())
+                .ok_or_else(|| {
+                    format!("daemon message {index} lacks an unsigned, in-range `line`")
+                })?;
+            let data = object
+                .get("data")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| format!("daemon message {index} lacks string `data`"))?;
+            Ok(LeanMessage {
+                severity: severity.to_owned(),
+                line,
+                data: data.to_owned(),
+            })
         })
-        .collect();
-    Some(messages)
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -720,4 +784,67 @@ fn file_uri(path: &Path) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod reply_policy_tests {
+    use super::parse_check_reply;
+    use crate::lean;
+
+    fn daemon_reply(severity: &str) -> String {
+        format!(
+            "{{\"ok\":true,\"messages\":[{{\"severity\":\"{severity}\",\"line\":3,\"data\":\"message\"}}]}}\n"
+        )
+    }
+
+    fn batch_reply(severity: &str) -> String {
+        format!("{{\"severity\":\"{severity}\",\"pos\":{{\"line\":3}},\"data\":\"message\"}}\n")
+    }
+
+    #[test]
+    fn daemon_reply_accepts_the_same_diagnostic_severities_as_batch() {
+        for severity in ["error", "warning", "information", "hint", "", "fatal"] {
+            let daemon = daemon_reply(severity);
+            let batch = batch_reply(severity);
+            assert_eq!(
+                parse_check_reply(daemon.as_bytes()).is_ok(),
+                lean::parse_lean_output(batch.as_bytes(), b"").is_ok(),
+                "daemon and batch severity policy diverged for `{severity}`"
+            );
+        }
+        let messages = parse_check_reply(daemon_reply("warning").as_bytes())
+            .expect("the exact daemon success schema is accepted");
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].severity, "warning");
+        assert_eq!(messages[0].line, 3);
+        assert_eq!(messages[0].data, "message");
+    }
+
+    #[test]
+    fn daemon_reply_rejects_malformed_or_incomplete_success() {
+        let malformed = [
+            b"".as_slice(),
+            b"{}\n".as_slice(),
+            b"{not-json}\n".as_slice(),
+            b"{\"ok\":true,\"messages\":[]}".as_slice(),
+            b"{\"ok\":true,\"messages\":[]}\nextra\n".as_slice(),
+            b"{\"ok\":false,\"messages\":[]}\n".as_slice(),
+            b"{\"ok\":true,\"messages\":[],\"extra\":0}\n".as_slice(),
+            b"{\"ok\":true,\"messages\":{}}\n".as_slice(),
+            b"{\"ok\":true,\"messages\":[{}]}\n".as_slice(),
+            b"{\"ok\":true,\"messages\":[{\"severity\":\"warning\",\"line\":3,\"data\":\"x\",\"extra\":0}]}\n".as_slice(),
+            b"{\"ok\":true,\"messages\":[{\"severity\":7,\"line\":3,\"data\":\"x\"}]}\n".as_slice(),
+            b"{\"ok\":true,\"messages\":[{\"severity\":\"hint\",\"line\":3,\"data\":\"x\"}]}\n".as_slice(),
+            b"{\"ok\":true,\"messages\":[{\"severity\":\"warning\",\"line\":-1,\"data\":\"x\"}]}\n".as_slice(),
+            b"{\"ok\":true,\"messages\":[{\"severity\":\"warning\",\"line\":3,\"data\":{}}]}\n".as_slice(),
+            &[0xff],
+        ];
+        for wire in malformed {
+            assert!(
+                parse_check_reply(wire).is_err(),
+                "malformed daemon success unexpectedly passed: {:?}",
+                String::from_utf8_lossy(wire)
+            );
+        }
+    }
 }

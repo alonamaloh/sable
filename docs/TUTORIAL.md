@@ -19,6 +19,9 @@ LEAN_NUM_THREADS=0 LEAN_IMPORT_WORKERS=1 \
   compiler/target/debug/sable check hello.sable
 ```
 
+Warm-daemon verification is temporarily disabled during priority zero;
+running `sable daemon` currently gives `sable check` no speedup.
+
 ## 1. A function and its contract
 
 `pre` is what a caller must establish; `post` is what the function promises.

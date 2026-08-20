@@ -101,7 +101,7 @@ def Config.isUartProfileHead : Config → Bool
 private def Config.withCore (c : Config) (core : SVM.Config) : Config :=
   { c with core }
 
-private def Config.withState (c : Config) (core : SVM.Config) (state : State) : Config :=
+private def Config.withState (_c : Config) (core : SVM.Config) (state : State) : Config :=
   { core, state := some state }
 
 /-- Functional meaning of a profile-owned head. It is total because the
@@ -110,7 +110,7 @@ a defensive `undef` for direct, out-of-contract calls.
 
 `uartStatus` stores the raw `u8` status value in its destination. Surface
 `ready` operations may compare that value with zero when lowering. -/
-def profileStepF (P : SVM.Prog) (cap : Int) : Config → Config
+def profileStepF (_P : SVM.Prog) (cap : Int) : Config → Config
   | c@⟨.run (.testUartProfile script :: k) ρ σ μ, selected⟩ =>
       match selected with
       | some _ => c.withCore .undef

@@ -2,11 +2,14 @@
 
 One sentence: **the Rust compiler owns the program language; Lean owns the proof language; verification is Lean-file generation.**
 
-> **Known proof-ingress release block:** user-controlled Lean can currently
-> introduce `sorryAx` or an unreported axiom. The immediate fail-safe reports
-> Lean acceptance with unaudited proof dependencies rather than `fully
-> verified`. The architecture below describes the intended sealed pipeline,
-> but Lean acceptance alone is not yet an authenticated axiom-clean result.
+> **Known proof-ingress release block:** ordinary `sorry`, `admit`,
+> default-warning direct `sorryAx`, and all other unrecognized Lean warnings
+> now fail verification.
+> User-controlled Lean can still suppress `warn.sorry` around `sorryAx` or
+> introduce an unreported axiom. Accepted work therefore reports Lean
+> acceptance with unaudited proof dependencies rather than `fully verified`.
+> The architecture below describes the intended sealed pipeline, but Lean
+> acceptance alone is not yet an authenticated axiom-clean result.
 > [Plan priority zero](PLAN.md#priority-zero-seal-proof-ingress) defines the
 > fail-closed exit criteria.
 
@@ -146,21 +149,22 @@ check                                 capture one immutable ProofEnvironment bef
   │                                   Lake target owns at most one compiler child;
   │                                   PATH/elan resolution remains trusted, while an exact
   │                                   Lake/Lean version preflight rejects accidental drift;
-  │                                   READY is written last and is never rebuilt;
-  │                                   batch Lean checks the exact generated text
-  │                                   against that build + .sable-out/modules;
-  │                                   the daemon receives the same text and id,
-  │                                   switches servers when the id changes, and
-  │                                   falls back to the same batch environment;
-  │                                   client disconnect still closes its worker
+  │                                   exact source/build policy markers and a
+  │                                   policy-bound READY are written last;
+  │                                   strict batch Lean authenticates UTF-8,
+  │                                   JSON fields/severities, silent stderr, and
+  │                                   every warning before a stamp can publish;
+  │                                   daemon reply parsing is hardened for later,
+  │                                   but warm verification is disabled and has
+  │                                   no caller until server stderr is authenticated
 diagnose (compiler/src/diag.rs)       lean JSON messages → source map lookup →
                                       rendered error: obligation name, goal,
                                       .sable span, context, lean excerpt
 ```
 
-Generated Lean goes to `.sable-out/` (gitignored): immutable content-addressed roots under `.sable-out/roots/`, one artifact per imported module under `.sable-out/modules/` (`<stem>_<hash>.{lean,olean,ok}`, ADR 0018), and immutable proof environments under `.sable-out/proof-envs/`. Reuse is fail-closed rather than an existence test: generated `.lean` bytes must match exactly, and the artifact must carry the same proof-environment id and the same canonical Sable paths, source bytes, resolved import edges, and order. Those source-graph facts are checked after dependency preparation, around Lean checking, and before publication or root stamping. The in-process cache coalesces only identical builds currently in flight; completed results are not retained. Immutable publication also compares the winner's bytes, so an FNV collision is an error rather than evidence reuse.
+Generated Lean goes to `.sable-out/` (gitignored): immutable content-addressed roots under `.sable-out/roots/`, one artifact per imported module under `.sable-out/modules/` (`<stem>_<hash>.{lean,olean,ok}`, ADR 0018), and immutable proof environments under `.sable-out/proof-envs/`. Reuse is fail-closed rather than an existence test: generated `.lean` bytes must match exactly; `.ok` must contain the exact verification-policy stamp; and the artifact must carry the same proof-environment id, exact policy, canonical Sable paths, source bytes, resolved import edges, and order. Those facts are checked after dependency preparation, around Lean checking, and before publication or root stamping. The in-process cache coalesces only identical builds currently in flight and keys the exact policy separately from compact hashes; completed results are not retained. Immutable publication also compares the winner's bytes, so an FNV collision is an error rather than evidence reuse.
 
-The versioned `proof-env-v2-fnv64:<hash>` tag covers `lean-toolchain`, `lakefile.toml`, `lake-manifest.json`, and every repository-local `.lean` file under `lean/`; exact byte maps, not the compact FNV tag alone, authorize reuse. Generated content separately records machine-profile ids and hashes, used machine intrinsics, and audited extern ids. `uart-poll-v1`'s displayed profile hash is computed from the immutable snapshot over the recursive local import closure rooted at `Sable/MMIO.lean` and `Sable/SVMUart.lean`, plus `lean-toolchain` and `lakefile.toml`. Thus profile identity states the device-semantics dependency, while the broader proof-environment identity pins everything Lean actually reads.
+The versioned `proof-env-v4-fnv64:<hash>` tag covers the exact warning policy, `lean-toolchain`, `lakefile.toml`, `lake-manifest.json`, and every repository-local `.lean` file under `lean/`. Exact byte maps and exact policy markers in the published source, built workspace, and READY stamp—not the compact FNV tag alone—authorize reuse. Generated content separately records machine-profile ids and hashes, used machine intrinsics, and audited extern ids. `uart-poll-v1`'s displayed profile hash is computed from the immutable snapshot over the recursive local Lean import closure rooted at `Sable/MMIO.lean` and `Sable/SVMUart.lean`, plus `lean-toolchain` and `lakefile.toml`. Thus profile identity states the device-semantics dependency, while the broader proof-environment identity pins everything Lean actually reads.
 
 ## Native lowering boundary (through the closed N5 `Integer` closure)
 

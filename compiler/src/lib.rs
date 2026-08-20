@@ -468,38 +468,37 @@ pub fn check_file_structured(
 /// the successful artifact, even when `opts.emit_lean_only` is set. It also
 /// never prints generated Lean. Production backends should use this entry
 /// point so they cannot accidentally compile an AST reloaded after Lean
-/// acceptance. Backend release policy must still inspect `proof_assurance`.
+/// acceptance. During priority zero, acceptance always uses the strict batch
+/// transport; daemon messages cannot mint this capability. Backend release
+/// policy must still inspect `proof_assurance`.
 pub fn verify_file_structured(
     path: &Path,
     opts: &Options,
 ) -> (modules::ModuleSet, Result<VerifiedProgram, Vec<Diagnostic>>) {
-    verify_file_structured_inner(path, opts, true)
+    verify_file_structured_inner(path, opts)
 }
 
-/// Verify a file with a fresh batch Lean process, never through the optional
-/// long-lived daemon.
-///
-/// This is primarily useful for reproducible instrumentation whose cache and
-/// process model must not depend on ambient daemon state. Production backends
-/// should normally use [`verify_file_structured`].
+/// Explicit batch-verification entry point for reproducible instrumentation.
+/// This currently has the same transport as [`verify_file_structured`]; the
+/// separate API preserves the instrumentation contract if an authenticated
+/// warm path returns later.
 pub fn verify_file_batch_structured(
     path: &Path,
     opts: &Options,
 ) -> (modules::ModuleSet, Result<VerifiedProgram, Vec<Diagnostic>>) {
-    verify_file_structured_inner(path, opts, false)
+    verify_file_structured_inner(path, opts)
 }
 
 fn verify_file_structured_inner(
     path: &Path,
     opts: &Options,
-    allow_daemon: bool,
 ) -> (modules::ModuleSet, Result<VerifiedProgram, Vec<Diagnostic>>) {
     let (mods, prepared) = prepare_file_structured(path, opts);
     let (repo_root, prep) = match prepared {
         Ok(prepared) => prepared,
         Err(diags) => return (mods, Err(diags)),
     };
-    let result = verify_prepared(&repo_root, opts, &mods, prep, allow_daemon);
+    let result = verify_prepared(&repo_root, opts, &mods, prep);
     (mods, result)
 }
 
@@ -632,7 +631,6 @@ fn verify_prepared(
     opts: &Options,
     mods: &modules::ModuleSet,
     mut prep: artifacts::Prepared,
-    allow_daemon: bool,
 ) -> Result<VerifiedProgram, Vec<Diagnostic>> {
     // Root documents are immutable and content-addressed. Concurrent checks
     // of the same basename or different source versions cannot overwrite the
@@ -642,37 +640,28 @@ fn verify_prepared(
         Err(message) => return Err(vec![io_diag("io.write", message)]),
     };
 
-    // When allowed, a running `sable daemon` keeps a Lean server alive and
-    // skips the per-check cold start. Any daemon problem falls back to the
-    // batch invocation, unchanged — including a daemon started before the
-    // generated-artifact directory was on its search path (its messages then
-    // report unknown modules). Instrumentation can disable this path exactly.
-    let daemon_messages = if allow_daemon {
-        daemon::try_check(
-            repo_root,
-            &lean_file,
-            &prep.proof_environment,
-            &prep.emitted.lean_source,
-        )
-        .filter(|ms| !ms.iter().any(|m| m.data.contains("unknown module")))
-    } else {
-        None
-    };
-    let messages = match daemon_messages {
-        Some(m) => m,
-        None => match lean::run_lean(
-            repo_root,
-            &prep.proof_environment,
-            &lean_file,
-            None,
-            &prep.emitted.lean_source,
-        ) {
-            Ok(m) => m,
-            Err(msg) => return Err(vec![io_diag("internal.lean_invocation", msg)]),
-        },
+    // Verification remains on the strict batch transport while the optional
+    // warm daemon cannot authenticate its complete server stderr/protocol
+    // transcript. The parked daemon currently has no verification caller and
+    // cannot mint a stamp or `VerifiedProgram` in this policy version.
+    let messages = match lean::run_lean(
+        repo_root,
+        &prep.proof_environment,
+        &lean_file,
+        None,
+        &prep.emitted.lean_source,
+    ) {
+        Ok(messages) => messages,
+        Err(message) => return Err(vec![io_diag("internal.lean_invocation", message)]),
     };
 
-    let diags = lean::dedup_by_name(lean::diagnose(&prep.emitted, &prep.vc, &messages, mods));
+    let mut diags = lean::diagnose(&prep.emitted, &prep.vc, &messages, mods);
+    diags.extend(lean::diagnose_unexpected_warnings(
+        &prep.emitted,
+        &prep.vc,
+        &messages,
+    ));
+    let diags = lean::dedup_by_name(diags);
     if diags.is_empty() {
         // Record the verification so importers reuse it (ADR 0013
         // slice 2): same content, same artifact, proven once.

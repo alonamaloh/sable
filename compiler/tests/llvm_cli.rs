@@ -76,7 +76,7 @@ fn verified_scalar_ir_is_pipe_clean_and_runs_when_clang_exists() {
     let report = String::from_utf8(output.stderr).expect("verification report is UTF-8");
     assert!(ir.starts_with("; Sable textual LLVM IR v0\n"));
     assert!(ir.contains("; Sable artifact: scalar_calls_"));
-    assert!(ir.contains("; Sable proof environment: proof-env-v2-fnv64:"));
+    assert!(ir.contains("; Sable proof environment: proof-env-v4-fnv64:"));
     assert!(ir.contains("define i32 @main()"));
     assert!(!ir.contains("verified:"), "stdout must remain pipe-clean");
     assert!(report.contains("verified:"));

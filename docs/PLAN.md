@@ -27,12 +27,12 @@ soundness history in the [incident ledger](SOUNDNESS-INCIDENTS.md).
 
 ## Priority zero: seal proof ingress
 
-**Release is blocked.** Sable accepts both `sorry` in a user discharge and an
-extra `axiom` injected as a continuation of a user theorem. In a minimized
-witness, Lean accepted the resulting theorem and the checked runtime monitor
-rejected the proved postcondition (`result = 1` with an actual result of zero).
-Before the immediate fail-safe, Sable reported `status: fully verified` for
-both witnesses.
+**Release is blocked.** Before the fail-safe work, Sable accepted both `sorry`
+in a user discharge and an extra `axiom` injected as a continuation of a user
+theorem. In a minimized witness, Lean accepted the resulting theorem and the
+checked runtime monitor rejected the proved postcondition (`result = 1` with an
+actual result of zero). Sable reported `status: fully verified` for both
+witnesses.
 
 The Lean kernel did what it promises: it checked a term relative to the
 constants in its environment. The broken Sable claim is that every trust
@@ -40,9 +40,15 @@ dependency in that environment had been accounted for. Until this boundary is
 sealed, existing Stage 1 results remain useful compiler/proof evidence but do
 not qualify for the `fully verified` label or support a release claim.
 
-The repair is an outcome gate, not a token blacklist. The first fail-safe step
-is active: generated-only and Lean-accepted-but-unaudited results carry distinct
-assurance states, and no current path can emit `fully verified`. The remaining
+The repair is an outcome gate, not a token blacklist. Two fail-safe tranches
+are active: generated-only and Lean-accepted-but-unaudited results carry
+distinct assurance states, and every unrecognized Lean warning now fails root,
+imported-module, and proof-environment verification before an artifact can be
+published. Proof-policy identity is exact in published environments, READY,
+in-flight builds, artifact names, and `.ok` stamps; authoritative acceptance
+uses strict batch transport. This rejects ordinary `sorry`, `admit`, and
+default-warning direct `sorryAx`, but warning suppression and injected axioms
+remain live witnesses. No current path can emit `fully verified`. The remaining
 gate is the complete audit below:
 
 1. Inventory every route by which `.sable` text reaches Lean: clauses,
@@ -59,11 +65,12 @@ gate is the complete audit below:
    `admit` are therefore always fatal. An unavailable or incomplete audit must
    fail verification or produce a clearly lesser status, never `fully
    verified`.
-4. Make unexpected Lean warnings fail verification. Any non-fatal diagnostic
-   must be a structured, compiler-owned exception rather than an arbitrary
+4. Maintain the active fail-closed warning gate. Any non-fatal diagnostic must
+   remain a structured, compiler-owned exception rather than an arbitrary
    warning substring.
-5. Bind the proof-trust manifest into root and module artifacts so an old or
-   poisoned cache entry cannot bypass the new audit.
+5. Extend the active policy-bound cache identities and stamps with the final
+   proof-trust manifest so an old or poisoned entry cannot bypass the complete
+   audit.
 6. Add root, imported-module, fact, discharge, environment-delta, warning, and
    cache-reuse adversarial regressions for `sorry`, `admit`, direct and
    continuation-line `axiom`, extra declarations, `set_option`, and indirect
