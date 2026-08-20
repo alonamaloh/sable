@@ -2,8 +2,8 @@
 
 [![CI](https://github.com/alonamaloh/sable/actions/workflows/ci.yml/badge.svg)](https://github.com/alonamaloh/sable/actions/workflows/ci.yml)
 
-Sable is an imperative, C-flavored language in which **every function carries a
-machine-checked proof of its contract**. One file interleaves two languages: a
+Sable is an imperative, C-flavored language designed so **every function carries
+a machine-checked proof of its contract**. One file interleaves two languages: a
 C-like program language with no undefined behavior and an ownership-based
 memory model, and a Lean 4 proof language living entirely on `///` lines.
 The syntax is C-shaped; the semantics are intentionally not C's: evaluation is
@@ -38,14 +38,22 @@ verifies today. Fold the `///` lines and it reads as plain C with a contract.
 
 ## What “verified” means
 
-For a file reported as `status: fully verified`, every generated proof
-obligation was accepted by the pinned Lean kernel, with no deferred obligation,
-assumed theorem, or audited foreign contract. That is a precise Stage 1 claim,
-not yet an end-to-end proof of the Rust compiler or native backend:
+> **Known release block (2026-08-20):** user-controlled proof text can currently
+> introduce `sorryAx` or an unreported axiom while Sable still prints
+> `status: fully verified`. Until [plan priority zero](docs/PLAN.md#priority-zero-seal-proof-ingress)
+> closes, that status establishes Lean acceptance and zero *declared*
+> defers/assumptions—not an audited axiom-free dependency closure. No release
+> should rely on the stronger claim.
+
+The intended Stage 1 meaning of `status: fully verified` is that every generated
+proof obligation was accepted by the pinned Lean kernel with no deferred
+obligation, assumed theorem, audited foreign contract, or hidden proof axiom.
+Even after the release block is fixed, this is not an end-to-end proof of the
+Rust compiler or native backend:
 
 | Claim | Present assurance |
 |---|---|
-| The generated Lean theorems are valid | Checked by the Lean kernel |
+| The generated Lean declarations are accepted | Lean elaborates them, and the kernel checks the resulting declarations and proof terms relative to their environment. Plan priority zero must account for the complete axiom dependency closure before Sable can claim the resulting theorems are valid relative only to the approved base |
 | The obligations faithfully model the Sable program | The Rust checker/VC generator remain trusted engineering. The checker authors one exact ownership/mutation plan for admitted moves, calls, loans, receivers, sealed operations, exposures, and loop havoc, and VC generation consumes it fail-closed. One structural control/action model begins as a checker-consumed outline and is then retained for VC, SVM, interpreter, and LLVM paths, including exact traps, replacements, discarded class temporaries, and concrete class-drop links. Explicit unique-borrow write-back, successful local/direct-`self` slot take/put write-back, and checker-recorded argument-schedule alias safety additionally have narrow Lean-checked certificates; their Rust discovery and source provenance remain trusted. Neither plan is a mechanized proof of source translation |
 | The interpreter matches the formal SVM subset | The Lean rules and functional evaluator agree by theorem; Rust and Lean outcomes are compared differentially |
 | Native execution matches Sable semantics | Lowering is fail-closed from the exact `VerifiedProgram`; curated subjects, range-checked bit-distinguishable scalar/control batches, and individually traced ownership cases across the current admitted native boundary are compared with the interpreter under Clang `-O0` and `-O2`. The generator is test-only typed case IR rendered to source—not the compiler's retained production control/action plan—and the handwritten LLVM emitter is not kernel-verified |
@@ -62,8 +70,10 @@ admitted subsets.
 **A program that does not verify does not build.** Integers are exact — every
 overflow, division, and index is an obligation rather than undefined behavior
 or a silent wrap. There is no SMT solver: obligations are discharged by an
-automation portfolio inside Lean, and every proof is checked by the Lean
-kernel.
+automation portfolio inside Lean. Lean elaborates every emitted declaration,
+and the kernel checks the resulting declaration and proof term relative to its
+environment. Priority zero additionally requires Sable to audit the transitive
+axiom dependencies of everything the kernel accepts.
 
 ## Try it
 
@@ -158,7 +168,8 @@ foreign assumption.
 Not there yet: mechanized source-translation soundness, broad backend coverage
 for aggregates, concurrency, floating-point types, and much of a standard
 library. See
-[`docs/PLAN.md`](docs/PLAN.md) for the milestone-by-milestone record.
+[`docs/PLAN.md`](docs/PLAN.md) for the provisional priorities and deliberately
+deferred scope.
 
 ## Reading further
 

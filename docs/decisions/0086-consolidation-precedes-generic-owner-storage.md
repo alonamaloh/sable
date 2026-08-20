@@ -104,8 +104,8 @@ untested admitted composition.
 
 ## Consequences
 
-`docs/PLAN.md` records C0 as complete. Generic owner slots are no longer blocked
-by the consolidation gate; their own feature and evidence gates still apply.
+C0 is complete. Generic owner slots are no longer blocked by the consolidation
+gate; their own feature and evidence gates still apply.
 
 The shared place and ownership representations close the admitted
 checker-to-VC effect boundary; they are not a mechanized proof that the Rust

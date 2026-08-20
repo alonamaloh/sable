@@ -1,4 +1,5 @@
-//! AST for the program language (see docs/PLAN.md for scope).
+//! AST for the program language (see docs/design/sable-language-design.md;
+//! generated docs/type-matrix.md records exact current admission).
 //! Types are filled in by the checker (`ty` fields start as None).
 
 use crate::scan::Clause;

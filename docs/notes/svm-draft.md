@@ -2,7 +2,8 @@
 
 > **Status: all eleven findings resolved 2026-08-09 — see ADR 0005 and the updated design §2.2/§2.3/§10.** This note remains as the audit trail.
 
-*2026-08-09, parallel track (docs/PLAN.md). Artifact: `lean/Sable/SVM.lean` (builds with `lake build`, core-only).*
+*2026-08-09 design-audit artifact: `lean/Sable/SVM.lean` (core-only). The
+durable differential-testing decision is ADR 0017.*
 
 ## Shape
 
@@ -28,6 +29,6 @@ Configurations are `run (continuation : List Stmt) (locals) | done v | trapped t
 
 ## Suggested next steps
 
-Determinism of `Step`/`Eval` (the rule side conditions were written to be mutually exclusive — proving it is the cheapest regression test of that claim); a functional evaluator + agreement proof, giving the differential-testing oracle against `interp.rs` that PLAN.md wants; then calls + frames, which forces §10's stack for real.
+Determinism of `Step`/`Eval` (the rule side conditions were written to be mutually exclusive — proving it is the cheapest regression test of that claim); a functional evaluator + agreement proof, giving the differential-testing oracle against `interp.rs`; then calls + frames, which forces §10's stack for real.
 
 > **Status 2026-08-10: the first two are done** — the machine gained the `undef` outcome (total, per ADR 0005 res. 1), the evaluator and both agreement directions are proven (`lean/Sable/SVMEval.lean`; determinism/totality/progress are corollaries), and the differential harness runs in `cargo test` over `corpus/svm-diff` (ADR 0017). Calls + frames remain.

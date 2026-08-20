@@ -1,6 +1,6 @@
 # Sable — agent instructions
 
-Sable is a verified programming language: C-flavored program language, Lean 4 proof language on `///` lines. Read `docs/ARCHITECTURE.md` before touching the compiler; `docs/PLAN.md` says what milestone we're in and what's deliberately out of scope. The design docs in `docs/design/` are normative — if implementation forces a deviation, flag it and record it, don't silently drift.
+Sable is a verified programming language: C-flavored program language, Lean 4 proof language on `///` lines. Read `docs/ARCHITECTURE.md` before touching the compiler; `docs/PLAN.md` records current priorities and what's deliberately out of scope. The language design in `docs/design/sable-language-design.md` is normative; `docs/design/sable-goals-and-roadmap.md` records the original research ambitions and is historical rather than a current plan. If implementation forces a design deviation, flag it and record it—don't silently drift. PLAN priority zero is an active release block: no work may claim axiom-clean `fully verified` status until user proof ingress and transitive axiom dependencies fail closed.
 
 ## Build and test
 
@@ -30,7 +30,7 @@ Lean is pinned by `lean/lean-toolchain`; elan fetches it automatically. Never up
 
 - Every new diagnostic gets a `corpus/must-fail/` program with an `// expect-error: <name>` first line; every new feature gets `corpus/verifies/` programs, and dynamic behavior gets `corpus/tests/` (must pass with zero skipped clauses; a deliberately-unmonitorable subject clause needs an `// expect-skip: <substr>` fence, and stale fences are failures) or `corpus/test-fails/` (`// expect-test-failure: <substr>`). Two spellings of one program get a `corpus/pairs/` pair (`<stem>.a.sable`/`<stem>.b.sable`, first line `// pair: same-lean` or `// pair: same-run`), compared Lean-free by `cargo test --test pairs`: diagnostic-name sets, α-normalized obligation sets, or interpreter outcomes must agree. The corpus is executable documentation.
 - Machine-semantics changes extend the rules, the functional evaluator, and the agreement proofs together (`lean/Sable/SVM.lean` + `SVMEval.lean` — the build fails otherwise) and get `corpus/svm-diff/` subjects: zero-arg functions, traps are expected outcomes, compared against `interp.rs` by `cargo test` (ADR 0017).
-- Commit early and often; push after each commit (repo is private). Substantive decisions get an ADR in `docs/decisions/`.
-- **No development-history references in code, corpus, or diagnostics.** Comments, diagnostic names, and user-facing messages describe the present design — never milestones ("M6"), slices, layers, tiers, or "found by X" stories; that history lives in git and `docs/PLAN.md`. Citing an ADR or a design-doc section is fine (those are normative documents); citing when or in what order something landed is not.
-- Keep `docs/PLAN.md` status and `docs/ARCHITECTURE.md` current when the code moves under them.
+- Commit early and often; push after each commit. Substantive decisions get an ADR in `docs/decisions/`.
+- **No development-history references in code, corpus, or diagnostics.** Comments, diagnostic names, and user-facing messages describe the present design — never milestones ("M6"), slices, layers, tiers, or "found by X" stories; that history lives in git, while settled reasoning lives in ADRs. Citing an ADR or a design-doc section is fine (those are normative documents); citing when or in what order something landed is not.
+- Keep `docs/PLAN.md` priorities and `docs/ARCHITECTURE.md` current when the code moves under them.
 - Dependencies: don't add Rust crates or Lean packages without a reason worth writing down (ADR 0003).
