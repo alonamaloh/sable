@@ -338,12 +338,12 @@ There are **no build modes**. One source file has one meaning; an undischarged o
 ```
 
 - `defer P` may target any *runtime-monitorable* obligation — quantifier-free, or quantifiers over statically bounded ranges (compiled to checking loops). Classically-quantified or ghost-typed obligations cannot be deferred; they must be proved or assumed.
-- Build output reports per package: `assumes: N (listed), defers: M (listed)`. Zero of both is **fully verified** — a property of code, not of build configuration, expected to be badged by package registries. This yields an in-source assurance ladder in the SPARK Bronze/Silver/Gold tradition.
+- Build output reports per package: `assumes: N (listed), defers: M (listed)`. Zero of both is necessary but not sufficient for **fully verified**: Sable must also authenticate the complete transitive proof-dependency closure against its approved axiom base. That strongest result is a property of code and its content-bound proof environment, not of an ad hoc build configuration, and may eventually be badged by package registries. This yields an in-source assurance ladder in the SPARK Bronze/Silver/Gold tradition.
 - Ecosystem norm: `defer` is scaffolding ratcheted toward zero (CI can forbid increases); `assume` is a permanent, reviewed trust statement about the environment.
 
 Rationale for keeping a sound trap-fallback at all: without `defer`, schedule pressure funnels into `assume` — and an unproved-but-monitored predicate ("true or halt") is strictly safer than an unproved-and-assumed one.
 
-*(Implementation status, v0.4: `defer` and `assume` are implemented as module-level clauses naming an obligation — `/// defer NAME`, `/// assume #[audit(reason := "...")] NAME` — mirroring `discharge`'s workflow; the statement-attached `kind(expr)` form shown above is not yet implemented. Tallies and the fully-verified status line work as specified.)*
+*(Implementation status, v0.4: `defer` and `assume` are implemented as module-level clauses naming an obligation — `/// defer NAME`, `/// assume #[audit(reason := "...")] NAME` — mirroring `discharge`'s workflow; the statement-attached `kind(expr)` form shown above is not yet implemented. Tallies work as specified. Priority Zero currently withholds the fully-verified status until the transitive dependency audit is implemented.)*
 
 **Testing before proving.** Specifications are code and have bugs; the cheapest way to find a wrong `post` is to run it. The `sable test` tool executes test functions with all monitorable contracts checked dynamically and all proof obligations skipped. It is a development tool in the sanitizer category: its artifacts cannot be released or depended upon, so it is not a language mode and creates no dialect. Workflow: write contracts → test them dynamically → prove them.
 
@@ -410,4 +410,4 @@ One generics decision is committed upfront rather than left to the benchmark, be
   - `pre` / `post` / class `invariant` → **interface**: undimmed, in docs, on hover.
   - everything else (loop annotations, `ghost def`, `theorem`, `discharge`, `defer`, `assume`) → **evidence**: dimmed, foldable.
 - A blank line detaches a proof block from the item below it (doc-comment rule).
-- No build modes. `defer` = sound trap, counted. `assume` = audited axiom, counted. Zero of both = fully verified, and the registry says so.
+- No build modes. `defer` = sound trap, counted. `assume` = audited axiom, counted. Zero of both plus a successful content-bound audit of the complete proof-dependency closure = fully verified; otherwise the status names the lesser assurance.

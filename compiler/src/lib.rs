@@ -45,7 +45,60 @@ pub struct Failure {
     pub rendered: String,
 }
 
+/// What Sable has established about a generated Lean document and, when Lean
+/// was invoked, the transitive proof dependencies behind its acceptance.
+///
+/// Priority zero deliberately has no "audited" variant yet. Adding one is a
+/// semantic event: it requires the content-bound dependency manifest and
+/// fail-closed axiom audit described in `docs/PLAN.md`, not merely another
+/// successful Lean invocation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProofAssurance {
+    /// Sable generated the root Lean document, but did not submit that root
+    /// document to Lean. Imported artifacts may still have been prepared.
+    GeneratedOnly,
+    /// Lean accepted the generated declarations, but Sable has not
+    /// authenticated their complete transitive axiom dependency closure.
+    LeanAcceptedDependenciesUnaudited,
+}
+
+impl ProofAssurance {
+    /// Human-readable assurance carried by non-CLI consumers and emitted
+    /// artifacts. This deliberately has no axiom-clean/full result yet.
+    pub const fn summary(self) -> &'static str {
+        match self {
+            Self::GeneratedOnly => "Lean generated only; proof not checked",
+            Self::LeanAcceptedDependenciesUnaudited => {
+                "Lean accepted; proof dependencies unaudited"
+            }
+        }
+    }
+
+    /// Exact terminal status. Escape and extern qualifiers remain visible,
+    /// but neither can upgrade an unaudited proof dependency closure.
+    pub const fn status_line(self, has_declared_escapes: bool, has_externs: bool) -> &'static str {
+        match self {
+            Self::GeneratedOnly => "status: Lean generated only; proof not checked",
+            Self::LeanAcceptedDependenciesUnaudited => match (has_declared_escapes, has_externs) {
+                (false, false) => "status: Lean accepted; proof dependencies unaudited",
+                (true, false) => {
+                    "status: Lean accepted with declared escapes; proof dependencies unaudited"
+                }
+                (false, true) => {
+                    "status: Lean accepted relative to an audited extern boundary; proof dependencies unaudited"
+                }
+                (true, true) => {
+                    "status: Lean accepted with declared escapes and an audited extern boundary; proof dependencies unaudited"
+                }
+            },
+        }
+    }
+}
+
 pub enum Outcome {
+    /// The requested pipeline completed. `proof_assurance` says whether this
+    /// means generation only or Lean acceptance relative to an unaudited
+    /// dependency environment; it does not currently mean axiom-clean proof.
     Verified {
         functions: usize,
         obligations: usize,
@@ -60,6 +113,8 @@ pub enum Outcome {
         /// Non-fatal, rendered: automation-budget warnings (an obligation
         /// verified but leaned on an expensive `grind`).
         warnings: Vec<String>,
+        /// Assurance about the Lean environment behind the accepted result.
+        proof_assurance: ProofAssurance,
     },
     /// Failing obligations; any budget warnings are withheld until the
     /// errors are fixed (they would be noise next to real failures).
@@ -98,6 +153,8 @@ pub struct VerifiedInfo {
     pub assumed: Vec<(String, String)>,
     /// Automation-budget warnings (non-fatal), as diagnostics.
     pub warnings: Vec<Diagnostic>,
+    /// Assurance about the Lean environment behind the accepted result.
+    pub proof_assurance: ProofAssurance,
 }
 
 /// A typed, monomorphized program and the checker-sealed semantic plans built
@@ -129,14 +186,16 @@ impl CheckedProgram {
     }
 }
 
-/// A typed, monomorphized program together with the exact Lean verification
-/// that authorizes a production backend to consume it.
+/// A typed, monomorphized program together with exact Lean acceptance relative
+/// to its captured proof environment.
 ///
 /// `program` is moved directly out of the [`artifacts::Prepared`] value whose
 /// generated Lean document was checked and stamped. It is never reconstructed
 /// by reloading the source after verification. The two identities let callers
 /// record which content-addressed artifact and immutable proof environment the
-/// result came from.
+/// result came from. Release and production policy must additionally consult
+/// [`VerifiedInfo::proof_assurance`]; Lean acceptance alone is not currently an
+/// authenticated axiom-clean result.
 #[derive(Debug)]
 pub struct VerifiedProgram {
     program: ast::Program,
@@ -157,7 +216,8 @@ pub struct VerifiedProgram {
 }
 
 impl VerifiedProgram {
-    /// The exact checked and monomorphized AST authorized by Lean.
+    /// The exact checked and monomorphized AST paired with Lean's acceptance.
+    /// See [`Self::info`] for the strictly weaker current assurance boundary.
     pub fn program(&self) -> &ast::Program {
         &self.program
     }
@@ -345,6 +405,7 @@ pub fn check_file(path: &Path, opts: &Options) -> Outcome {
                 .iter()
                 .map(|d| mods.render_level("warning", d))
                 .collect(),
+            proof_assurance: info.proof_assurance,
         },
         Err(diags) => Outcome::Failed(
             diags
@@ -368,11 +429,12 @@ fn io_diag(name: &str, message: String) -> Diagnostic {
     }
 }
 
-/// The full pipeline with structured (span-carrying) diagnostics — the
-/// entry point the LSP uses. Verification is per-module (ADR 0013
-/// slice 2): imported modules are verified once into content-addressed
-/// artifacts (`artifacts.rs`); this check proves only what its own
-/// generated file declares.
+/// The generation-or-verification pipeline with structured (span-carrying)
+/// diagnostics — the entry point the LSP uses. With `emit_lean_only`, this
+/// returns [`ProofAssurance::GeneratedOnly`] and proves nothing. Otherwise,
+/// verification is per-module (ADR 0013 slice 2): imported modules are checked
+/// once into content-addressed artifacts (`artifacts.rs`), and the root result
+/// carries the exact current proof-assurance boundary.
 pub fn check_file_structured(
     path: &Path,
     opts: &Options,
@@ -389,15 +451,24 @@ pub fn check_file_structured(
     };
 
     print!("{}", prep.emitted.lean_source);
-    (mods, Ok(verified_info(&prep, Vec::new())))
+    (
+        mods,
+        Ok(verified_info(
+            &prep,
+            Vec::new(),
+            ProofAssurance::GeneratedOnly,
+        )),
+    )
 }
 
-/// Verify a file with Lean and return the exact typed program that was proved.
+/// Verify a file with Lean and return the exact typed program it accepted
+/// relative to the captured proof environment.
 ///
 /// Unlike [`check_file_structured`], this function always runs Lean and stamps
 /// the successful artifact, even when `opts.emit_lean_only` is set. It also
 /// never prints generated Lean. Production backends should use this entry
-/// point so they cannot accidentally compile an AST reloaded after proof.
+/// point so they cannot accidentally compile an AST reloaded after Lean
+/// acceptance. Backend release policy must still inspect `proof_assurance`.
 pub fn verify_file_structured(
     path: &Path,
     opts: &Options,
@@ -507,7 +578,11 @@ fn emitted_certificate_category_counts<'a>(
     (transition_certificates, argument_schedule_certificates)
 }
 
-fn verified_info(prep: &artifacts::Prepared, warnings: Vec<Diagnostic>) -> VerifiedInfo {
+fn verified_info(
+    prep: &artifacts::Prepared,
+    warnings: Vec<Diagnostic>,
+    proof_assurance: ProofAssurance,
+) -> VerifiedInfo {
     let deferred: Vec<String> = prep.program.defers.iter().map(|d| d.name.clone()).collect();
     let assumed: Vec<(String, String)> = prep
         .program
@@ -548,6 +623,7 @@ fn verified_info(prep: &artifacts::Prepared, warnings: Vec<Diagnostic>) -> Verif
         deferred,
         assumed,
         warnings,
+        proof_assurance,
     }
 }
 
@@ -606,7 +682,14 @@ fn verify_prepared(
         let mut warnings =
             lean::dedup_by_name(lean::diagnose_warnings(&prep.emitted, &prep.vc, &messages));
         warnings.append(&mut prep.dep_warnings);
-        let info = verified_info(&prep, warnings);
+        let info = verified_info(
+            &prep,
+            warnings,
+            // Lean acceptance is useful development evidence, but the current
+            // artifact format does not authenticate the complete transitive
+            // axiom closure. Keep this fail-safe until Priority Zero lands.
+            ProofAssurance::LeanAcceptedDependenciesUnaudited,
+        );
         let root_span_end = mods
             .modules
             .first()

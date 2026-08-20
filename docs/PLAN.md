@@ -27,21 +27,23 @@ soundness history in the [incident ledger](SOUNDNESS-INCIDENTS.md).
 
 ## Priority zero: seal proof ingress
 
-**Release is blocked.** Sable currently accepts both `sorry` in a user
-discharge and an extra `axiom` injected as a continuation of a user theorem.
-In a minimized witness, Lean accepted the resulting theorem, Sable reported
-`status: fully verified`, and the checked runtime monitor rejected the proved
-postcondition (`result = 1` with an actual result of zero).
+**Release is blocked.** Sable accepts both `sorry` in a user discharge and an
+extra `axiom` injected as a continuation of a user theorem. In a minimized
+witness, Lean accepted the resulting theorem and the checked runtime monitor
+rejected the proved postcondition (`result = 1` with an actual result of zero).
+Before the immediate fail-safe, Sable reported `status: fully verified` for
+both witnesses.
 
 The Lean kernel did what it promises: it checked a term relative to the
 constants in its environment. The broken Sable claim is that every trust
 dependency in that environment had been accounted for. Until this boundary is
-sealed, existing Stage 1 results remain useful compiler/proof evidence but the
-`fully verified` label is provisional and must not support a release claim.
+sealed, existing Stage 1 results remain useful compiler/proof evidence but do
+not qualify for the `fully verified` label or support a release claim.
 
 The repair is an outcome gate, not a token blacklist. The first fail-safe step
-is to suppress or downgrade `fully verified` for source-proved artifacts until
-the complete audit below exists:
+is active: generated-only and Lean-accepted-but-unaudited results carry distinct
+assurance states, and no current path can emit `fully verified`. The remaining
+gate is the complete audit below:
 
 1. Inventory every route by which `.sable` text reaches Lean: clauses,
    discharges, ghost definitions, theorems, facts, imported artifacts, and

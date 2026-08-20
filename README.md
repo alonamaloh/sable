@@ -39,11 +39,11 @@ verifies today. Fold the `///` lines and it reads as plain C with a contract.
 ## What “verified” means
 
 > **Known release block (2026-08-20):** user-controlled proof text can currently
-> introduce `sorryAx` or an unreported axiom while Sable still prints
-> `status: fully verified`. Until [plan priority zero](docs/PLAN.md#priority-zero-seal-proof-ingress)
-> closes, that status establishes Lean acceptance and zero *declared*
-> defers/assumptions—not an audited axiom-free dependency closure. No release
-> should rely on the stronger claim.
+> introduce `sorryAx` or an unreported axiom. The immediate fail-safe now prints
+> `status: Lean accepted; proof dependencies unaudited` instead of `fully
+> verified`, but it does not yet close the ingress. Until
+> [plan priority zero](docs/PLAN.md#priority-zero-seal-proof-ingress) completes
+> the transitive audit, no release should claim axiom-clean verification.
 
 The intended Stage 1 meaning of `status: fully verified` is that every generated
 proof obligation was accepted by the pinned Lean kernel with no deferred

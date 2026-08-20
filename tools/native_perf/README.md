@@ -55,6 +55,12 @@ explicit Lean settings in the example make the supported invocation visible;
 inherited values are overwritten fail closed, and the enforced preparation
 concurrency is recorded in the report's protocol provenance.
 
+> **Priority Zero pause:** the current compiler deliberately reports
+> Lean-accepted artifacts as having unaudited proof dependencies. The runner's
+> exact `fully verified` gate therefore rejects new admitted comparisons until
+> the proof-dependency audit lands. Existing baseline JSON remains historical
+> evidence for its recorded revision; do not weaken the gate to refresh it.
+
 The runner:
 
 1. refuses a dirty worktree by default and builds its release compiler from

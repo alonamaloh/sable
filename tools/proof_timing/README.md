@@ -1,9 +1,16 @@
 # Proof-timing protocol v2
 
 This protocol records reproducible **end-to-end verification wall time** for
-Sable's closed positive corpus. It is observational release instrumentation,
+Sable's closed positive corpus. It is observational engineering instrumentation,
 not a correctness gate, a service-level objective, or an isolated measurement
 of Lean kernel time.
+
+> **Priority Zero assurance boundary:** new reports record each subject as
+> `Lean accepted; proof dependencies unaudited`. Timing a successful Lean run
+> does not authenticate its transitive axiom closure. The committed pre-finding
+> baselines remain valid timing evidence for their exact revisions, but neither
+> they nor a new timing report establish axiom-clean verification or release
+> readiness.
 
 The ignored runner is
 `compiler/tests/proof_timing.rs`. A report may say `evidence.tier = baseline`
@@ -268,7 +275,8 @@ The v2 document records:
 - the test process arguments and current directory;
 - metadata-only start/end cache manifests and cold-parent lineage;
 - per-root-subject wall time, root-emitted theorem-category counts and Lean
-  bytes, and root audit-boundary counts; and
+  bytes, root audit-boundary counts, and the explicit proof-assurance state;
+  and
 - aggregate median, nearest-rank p95, maximum, sums, and failure totals.
 
 A preflight violation, or a fatal postflight inspection error, aborts and may

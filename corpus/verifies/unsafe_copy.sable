@@ -85,8 +85,10 @@ pub fn split_write_join(&mut [u8] a) {
 //
 // An `extern "C"` declaration's contract is *audited*, not proved: there
 // is no body to check it against, so it owes no obligations and the build
-// status has to say so — `verified relative to audited boundary`, never
-// `fully verified` (ADR 0027).
+// status has to say so. During Priority Zero it reports `Lean accepted relative
+// to an audited extern boundary; proof dependencies unaudited`; after the
+// transitive proof audit lands, the extern still prevents an unqualified
+// strongest status (ADR 0027).
 //
 // Effects are stated *structurally*, through the resource parameters.
 // Only a passed mutable resource may change; everything else is framed by

@@ -265,6 +265,7 @@ fn main() -> ExitCode {
             deferred,
             assumed,
             warnings,
+            proof_assurance,
         } => {
             if !opts.emit_lean_only {
                 for w in &warnings {
@@ -306,17 +307,13 @@ fn main() -> ExitCode {
                 if !machine_intrinsics.is_empty() {
                     println!("  machine intrinsics: {}", machine_intrinsics.join(", "));
                 }
-                if !deferred.is_empty() || !assumed.is_empty() {
-                    println!(
-                        "status: verified with escapes (defers: {}, assumes: {})",
-                        deferred.len(),
-                        assumed.len()
-                    );
-                } else if !externs.is_empty() {
-                    println!("status: verified relative to audited boundary");
-                } else {
-                    println!("status: fully verified");
-                }
+                println!(
+                    "{}",
+                    proof_assurance.status_line(
+                        !deferred.is_empty() || !assumed.is_empty(),
+                        !externs.is_empty(),
+                    )
+                );
             }
             ExitCode::SUCCESS
         }
@@ -433,17 +430,13 @@ fn report_verified(file: &Path, info: &VerifiedInfo, mods: &sable::modules::Modu
             info.machine_intrinsics.join(", ")
         );
     }
-    if !info.deferred.is_empty() || !info.assumed.is_empty() {
-        eprintln!(
-            "status: verified with escapes (defers: {}, assumes: {})",
-            info.deferred.len(),
-            info.assumed.len()
-        );
-    } else if !info.externs.is_empty() {
-        eprintln!("status: verified relative to audited boundary");
-    } else {
-        eprintln!("status: fully verified");
-    }
+    eprintln!(
+        "{}",
+        info.proof_assurance.status_line(
+            !info.deferred.is_empty() || !info.assumed.is_empty(),
+            !info.externs.is_empty(),
+        )
+    );
 }
 
 fn write_atomic(destination: &Path, bytes: &[u8]) -> io::Result<()> {
@@ -492,4 +485,47 @@ fn write_atomic(destination: &Path, bytes: &[u8]) -> io::Result<()> {
         return Err(error);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod status_tests {
+    use sable::ProofAssurance;
+
+    #[test]
+    fn unaudited_dependencies_never_render_a_fully_verified_status() {
+        assert_eq!(
+            ProofAssurance::GeneratedOnly.status_line(false, false),
+            "status: Lean generated only; proof not checked"
+        );
+
+        let cases = [
+            (
+                false,
+                false,
+                "status: Lean accepted; proof dependencies unaudited",
+            ),
+            (
+                true,
+                false,
+                "status: Lean accepted with declared escapes; proof dependencies unaudited",
+            ),
+            (
+                false,
+                true,
+                "status: Lean accepted relative to an audited extern boundary; proof dependencies unaudited",
+            ),
+            (
+                true,
+                true,
+                "status: Lean accepted with declared escapes and an audited extern boundary; proof dependencies unaudited",
+            ),
+        ];
+
+        for (has_declared_escapes, has_externs, expected) in cases {
+            let actual = ProofAssurance::LeanAcceptedDependenciesUnaudited
+                .status_line(has_declared_escapes, has_externs);
+            assert_eq!(actual, expected);
+            assert!(!actual.contains("fully verified"));
+        }
+    }
 }

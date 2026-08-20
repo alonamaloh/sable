@@ -39,8 +39,9 @@ pub struct EmitOptions {
     pub entry: Option<String>,
 }
 
-/// Lower the exact program authorized by Lean.  The opaque capability keeps a
-/// production caller from substituting a freshly loaded or mutated AST.
+/// Lower the exact program accepted by Lean under the assurance carried by the
+/// `VerifiedProgram`. The opaque capability keeps a production caller from
+/// substituting a freshly loaded or mutated AST.
 pub fn emit_verified(
     verified: &VerifiedProgram,
     options: &EmitOptions,
@@ -67,6 +68,7 @@ pub fn emit_verified(
         verified.ownership(),
         verified.root_span_end(),
         options,
+        verified.info().proof_assurance.summary(),
     )?;
     let insert_at = ir.find('\n').map_or(ir.len(), |index| index + 1);
     ir.insert_str(
@@ -86,7 +88,14 @@ fn emit_program(
     root_span_end: usize,
     options: &EmitOptions,
 ) -> Result<String, Vec<BackendError>> {
-    emit_program_inner(program, None, None, root_span_end, options)
+    emit_program_inner(
+        program,
+        None,
+        None,
+        root_span_end,
+        options,
+        "test-only unchecked input",
+    )
 }
 
 #[cfg(test)]
@@ -96,7 +105,14 @@ fn emit_program_with_control(
     root_span_end: usize,
     options: &EmitOptions,
 ) -> Result<String, Vec<BackendError>> {
-    emit_program_inner(program, Some(control), None, root_span_end, options)
+    emit_program_inner(
+        program,
+        Some(control),
+        None,
+        root_span_end,
+        options,
+        "test-only unchecked input",
+    )
 }
 
 fn emit_program_with_plans(
@@ -105,6 +121,7 @@ fn emit_program_with_plans(
     ownership: &CheckedOwnershipPlan,
     root_span_end: usize,
     options: &EmitOptions,
+    proof_assurance: &str,
 ) -> Result<String, Vec<BackendError>> {
     emit_program_inner(
         program,
@@ -112,6 +129,7 @@ fn emit_program_with_plans(
         Some(ownership),
         root_span_end,
         options,
+        proof_assurance,
     )
 }
 
@@ -121,6 +139,7 @@ fn emit_program_inner(
     ownership: Option<&CheckedOwnershipPlan>,
     root_span_end: usize,
     options: &EmitOptions,
+    proof_assurance: &str,
 ) -> Result<String, Vec<BackendError>> {
     let selected = select_callables(program, root_span_end, options)?;
     validate_acyclic(program, &selected)?;
@@ -156,8 +175,9 @@ fn emit_program_inner(
     }
 
     let selected_set: HashSet<usize> = selected.functions.iter().copied().collect();
-    let mut out = String::from(
-        "; Sable textual LLVM IR v0\n; Generated from a Lean-verified program (ADR 0058).\n\n",
+    let mut out = format!(
+        "; Sable textual LLVM IR v0\n; Sable proof assurance: {}.\n; Exact checked-program capability retained for lowering (ADR 0058).\n\n",
+        proof_assurance,
     );
     let mut definitions = String::new();
     let mut support = ModuleSupport::default();
@@ -10584,6 +10604,7 @@ mod tests {
             &EmitOptions {
                 entry: Some("scalar_owner_entry".into()),
             },
+            "test-only checked plan",
         )
         .expect("the exact checked method plan lowers");
 
@@ -10603,6 +10624,7 @@ mod tests {
             &EmitOptions {
                 entry: Some("scalar_owner_entry".into()),
             },
+            "test-only checked plan",
         )
         .expect_err("a respanned owned argument cannot reuse the checked method plan");
         assert_eq!(error[0].name, "internal.control_plan_invalid");
@@ -10632,6 +10654,7 @@ mod tests {
             &EmitOptions {
                 entry: Some("scalar_owner_entry".into()),
             },
+            "test-only checked plan",
         )
         .expect_err("a mutated transfer cannot authorize LLVM argument lowering");
         assert_eq!(error[0].name, "internal.control_plan_invalid");
@@ -10661,6 +10684,7 @@ mod tests {
             &EmitOptions {
                 entry: Some("scalar_owner_entry".into()),
             },
+            "test-only checked plan",
         )
         .expect_err("a detached transition value key cannot authorize LLVM lowering");
         assert_eq!(error[0].name, "internal.control_plan_invalid");

@@ -8,8 +8,10 @@ so if the language moves and this page goes stale, CI says so.
 
 Sable is one file holding two languages. Ordinary lines are a C-flavored
 program language. Lines beginning with `///` are Lean 4, and they say what the
-program *means*. `sable check` compiles the program and proves the claims; a
-program that does not verify does not build.
+program *means*. `sable check` compiles the program and asks Lean to accept the
+generated claims. The current provisional status records that acceptance but
+does not yet authenticate the complete axiom dependency closure; a program
+that Lean rejects does not build.
 
 ```sh
 test ! -e .sable-out/daemon.sock && test ! -L .sable-out/daemon.sock
@@ -33,8 +35,12 @@ fn div_round_up(u32 a, u32 b) -> u32 {
 
 ```
 verified: div_round_up.sable — 4 obligation(s) across 1 function(s): 4 proved, 0 deferred, 0 assumed
-status: fully verified
+status: Lean accepted; proof dependencies unaudited
 ```
+
+That provisional status is the current Priority Zero fail-safe: Lean accepted
+the generated declarations, but Sable has not yet authenticated their complete
+transitive axiom dependency closure.
 
 A `pre` is an assumption inside the body and an obligation at every call site.
 A `post` is the reverse: an obligation at every exit, an assumption after every
@@ -393,7 +399,8 @@ test result: 1 passed, 0 failed
 `test_*` functions are the entry points and are never verified. Clauses outside
 the monitorable fragment are reported as skipped, never guessed.
 
-`sable build --emit-llvm` lowers a verified program to LLVM IR. The native
+`sable build --emit-llvm` lowers the exact Lean-accepted program to LLVM IR and
+marks that IR with its current provisional proof assurance. The native
 backend covers less of the language than the verifier does, and says so by
 name (`backend.unsupported`).
 
@@ -425,7 +432,7 @@ fn div_trusted(u32 a, u32 b) -> u32 {
 ```
 
 Neither file reports `fully verified`; the status line says what was deferred
-or assumed.
+or assumed and retains the unaudited proof-dependency qualification.
 
 ## Where to go next
 

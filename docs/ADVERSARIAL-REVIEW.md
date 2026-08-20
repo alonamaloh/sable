@@ -196,8 +196,8 @@ fixed-input partition is recorded as optimization-trivialized and deliberately
 has no ratio. These are small one-machine regression measurements, not
 performance claims about the canonical programs.
 
-Proof timing is release instrumentation, not a deterministic correctness or
-performance gate. Follow the exact
+Proof timing is engineering instrumentation, not a deterministic correctness,
+axiom-clean assurance, release, or performance gate. Follow the exact
 [proof-timing v2 protocol](../tools/proof_timing/README.md): a baseline requires
 `cargo test --release`, one exact clean revision at both ends, a prebuilt
 immutable proof environment, no daemon, `LEAN_NUM_THREADS=0`, a single import

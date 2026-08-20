@@ -3,7 +3,8 @@
 One sentence: **the Rust compiler owns the program language; Lean owns the proof language; verification is Lean-file generation.**
 
 > **Known proof-ingress release block:** user-controlled Lean can currently
-> introduce `sorryAx` or an unreported axiom while Sable reports `fully
+> introduce `sorryAx` or an unreported axiom. The immediate fail-safe reports
+> Lean acceptance with unaudited proof dependencies rather than `fully
 > verified`. The architecture below describes the intended sealed pipeline,
 > but Lean acceptance alone is not yet an authenticated axiom-clean result.
 > [Plan priority zero](PLAN.md#priority-zero-seal-proof-ingress) defines the

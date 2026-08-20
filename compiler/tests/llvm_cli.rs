@@ -3,6 +3,25 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+const UNAUDITED_PROOF_STATUS: &str = "status: Lean accepted; proof dependencies unaudited";
+const UNAUDITED_IR_ASSURANCE: &str =
+    "; Sable proof assurance: Lean accepted; proof dependencies unaudited.";
+
+fn assert_unaudited_report(report: &str) {
+    let statuses: Vec<&str> = report
+        .lines()
+        .filter(|line| line.starts_with("status:"))
+        .collect();
+    assert_eq!(statuses, [UNAUDITED_PROOF_STATUS]);
+    assert!(!report.contains("fully verified"));
+}
+
+fn assert_unaudited_ir(ir: &str) {
+    assert!(ir.contains(UNAUDITED_IR_ASSURANCE));
+    assert!(!ir.contains("Generated from a Lean-verified program"));
+    assert!(!ir.contains("fully verified"));
+}
+
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -61,7 +80,8 @@ fn verified_scalar_ir_is_pipe_clean_and_runs_when_clang_exists() {
     assert!(ir.contains("define i32 @main()"));
     assert!(!ir.contains("verified:"), "stdout must remain pipe-clean");
     assert!(report.contains("verified:"));
-    assert!(report.contains("status: fully verified"));
+    assert_unaudited_report(&report);
+    assert_unaudited_ir(&ir);
 
     assert_clang_exit("scalar", &ir, 42);
 }
@@ -160,7 +180,8 @@ fn versioned_trap_hook_observes_raw_payloads_and_cannot_suppress_failure() {
     );
     let ir = String::from_utf8(output.stdout).expect("LLVM IR is UTF-8");
     let report = String::from_utf8(output.stderr).expect("verification report is UTF-8");
-    assert!(report.contains("status: fully verified"));
+    assert_unaudited_report(&report);
+    assert_unaudited_ir(&ir);
     assert!(!ir.contains("define i32 @main("));
 
     // Whole-module mode emits these functions without a process entry.  The
@@ -309,7 +330,8 @@ fn boolean_owner_slot_traps_keep_exact_payloads_and_skip_unwinding() {
     );
     let ir = String::from_utf8(output.stdout).expect("LLVM IR is UTF-8");
     let report = String::from_utf8(output.stderr).expect("verification report is UTF-8");
-    assert!(report.contains("status: fully verified"));
+    assert_unaudited_report(&report);
+    assert_unaudited_ir(&ir);
     assert!(!ir.contains("define i32 @main("));
 
     // Each function is verified under a scalar precondition. This test-only
@@ -397,7 +419,8 @@ fn boolean_arrays_use_versioned_host_hooks_and_pin_lifetime_and_traps() {
     );
     let ir = String::from_utf8(output.stdout).expect("LLVM IR is UTF-8");
     let report = String::from_utf8(output.stderr).expect("verification report is UTF-8");
-    assert!(report.contains("status: fully verified"));
+    assert_unaudited_report(&report);
+    assert_unaudited_ir(&ir);
     assert!(!ir.contains("define i32 @main("));
     assert!(ir.contains("@__sable_rt_array_alloc_v1"));
     assert!(ir.contains("@__sable_rt_array_free_v1"));
@@ -451,7 +474,8 @@ fn affine_options_use_atomic_take_and_conditional_native_cleanup() {
     );
     let ir = String::from_utf8(output.stdout).expect("LLVM IR is UTF-8");
     let report = String::from_utf8(output.stderr).expect("verification report is UTF-8");
-    assert!(report.contains("status: fully verified"));
+    assert_unaudited_report(&report);
+    assert_unaudited_ir(&ir);
     assert!(!ir.contains("define i32 @main("));
     assert!(ir.contains("%sable.option.array.bool = type { i8, %sable.array.bool }"));
     assert!(ir.contains("@__sable_rt_array_alloc_v1"));
@@ -565,7 +589,8 @@ fn borrowed_boolean_arrays_pass_a_descriptor_and_never_own_it() {
     );
     let ir = String::from_utf8(output.stdout).expect("LLVM IR is UTF-8");
     let report = String::from_utf8(output.stderr).expect("verification report is UTF-8");
-    assert!(report.contains("status: fully verified"));
+    assert_unaudited_report(&report);
+    assert_unaudited_ir(&ir);
     assert!(!ir.contains("define i32 @main("));
     // An owner and a borrow share one descriptor; the borrow adds no type.
     assert!(ir.contains("%sable.array.bool = type { ptr, i64 }"));
@@ -649,7 +674,8 @@ fn u32_arrays_use_byte_hooks_unaligned_access_and_nonowning_internal_borrows() {
     );
     let ir = String::from_utf8(output.stdout).expect("LLVM IR is UTF-8");
     let report = String::from_utf8(output.stderr).expect("verification report is UTF-8");
-    assert!(report.contains("status: fully verified"));
+    assert_unaudited_report(&report);
+    assert_unaudited_ir(&ir);
     assert!(!ir.contains("define i32 @main("));
     assert!(ir.contains("%sable.array.u32 = type { ptr, i64 }"));
     assert!(ir.contains("@__sable_rt_array_alloc_v1"));
@@ -766,7 +792,8 @@ fn integer_native_balances_nested_array_ownership_at_o0_and_o2() {
     );
     let ir = String::from_utf8(output.stdout).expect("LLVM IR is UTF-8");
     let report = String::from_utf8(output.stderr).expect("verification report is UTF-8");
-    assert!(report.contains("status: fully verified"));
+    assert_unaudited_report(&report);
+    assert_unaudited_ir(&ir);
     assert!(ir.contains("define i32 @main()"));
     assert!(ir.contains("@__sable_rt_array_alloc_v1"));
     assert!(ir.contains("@__sable_rt_array_free_v1"));
@@ -796,7 +823,8 @@ fn scalar_owner_methods_use_exact_internal_move_and_destination_abi() {
     );
     let ir = String::from_utf8(output.stdout).expect("LLVM IR is UTF-8");
     let report = String::from_utf8(output.stderr).expect("verification report is UTF-8");
-    assert!(report.contains("status: fully verified"));
+    assert_unaudited_report(&report);
+    assert_unaudited_ir(&ir);
 
     let forward = internal_function_symbol(&ir, "forward");
     let forward_body = internal_function_body(&ir, &forward);

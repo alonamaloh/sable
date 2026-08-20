@@ -1,7 +1,8 @@
-// Native trap-ABI subject.  Each operation is fully verified under its
-// precondition.  The LLVM integration test deliberately calls the internal
-// lowered functions with contract-violating values so it can exercise guards
-// that verified Sable callers cannot reach.
+// Native trap-ABI subject. Lean accepts each operation's obligations under its
+// precondition; proof dependencies remain explicitly unaudited during Priority
+// Zero. The LLVM integration test deliberately calls the internal lowered
+// functions with contract-violating values so it can exercise guards that
+// checked Sable callers cannot reach.
 
 /// pre x = 0
 /// pre y = 0

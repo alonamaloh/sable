@@ -1,14 +1,15 @@
 //! Proof-timing protocol v2.
 //!
 //! This ignored test records end-to-end verification wall time for the closed
-//! positive corpus. It is release instrumentation, not a deterministic gate.
+//! positive corpus. It is engineering instrumentation, not a deterministic
+//! correctness or release gate.
 //! The runner validates the declared cache state, immutable proof environment,
 //! Git/source identity, batch-only checker mode, and paired cold/warm lineage
 //! before it will label a result `baseline`.
 //!
 //! See `tools/proof_timing/README.md` for the exact preparation and commands.
 
-use sable::{Options, verify_file_batch_structured};
+use sable::{Options, ProofAssurance, verify_file_batch_structured};
 use serde_json::{Map, Value, json};
 use std::collections::BTreeSet;
 use std::ffi::OsStr;
@@ -919,6 +920,10 @@ fn validate_cold_parent(
         ("/evidence/tier", evidence_tier),
         ("/protocol/cache_mode", "cold-roots"),
         ("/protocol/profile", profile),
+        (
+            "/protocol/proof_assurance",
+            ProofAssurance::LeanAcceptedDependenciesUnaudited.summary(),
+        ),
         ("/provenance/start_revision", revision),
         ("/provenance/end_revision", revision),
         (
@@ -1191,7 +1196,7 @@ fn subject_manifest_pins_the_measured_set_and_boundary_exclusion() {
 }
 
 #[test]
-#[ignore = "release instrumentation; wall time is not a deterministic PR gate"]
+#[ignore = "timing instrumentation; wall time is not a deterministic PR gate"]
 fn record_verifying_corpus_proof_times() {
     require_environment("CARGO_BUILD_JOBS", "1");
     require_environment("CARGO_INCREMENTAL", "0");
@@ -1524,6 +1529,12 @@ fn record_verifying_corpus_proof_times() {
                         proof_environment_id
                     ));
                 }
+                if info.proof_assurance != ProofAssurance::LeanAcceptedDependenciesUnaudited {
+                    failures.push(format!(
+                        "{relative}: unexpected proof assurance `{}`",
+                        info.proof_assurance.summary()
+                    ));
+                }
                 let total_emitted_theorems = info
                     .obligations
                     .checked_add(info.transition_certificates)
@@ -1545,6 +1556,7 @@ fn record_verifying_corpus_proof_times() {
                 records.push(json!({
                     "path": relative,
                     "status": "verified",
+                    "proof_assurance": info.proof_assurance.summary(),
                     "verification_wall_ns": verification_wall_ns,
                     "artifact_name": verified.artifact_name(),
                     "proof_environment_id": verified.proof_fingerprint(),
@@ -1670,9 +1682,9 @@ fn record_verifying_corpus_proof_times() {
             "claim": if !failures.is_empty() {
                 "failed run; no baseline or smoke evidence claim"
             } else if evidence_tier == "baseline" {
-                "comparable release baseline under protocol v2; wall time is observational, not a gate"
+                "comparable verification-wall baseline under protocol v2; not axiom-clean assurance or a release gate"
             } else {
-                "custom smoke only; not a comparable release baseline"
+                "custom smoke only; not a comparable verification-wall baseline"
             },
         },
         "recorded": {
@@ -1717,6 +1729,8 @@ fn record_verifying_corpus_proof_times() {
             "subject_concurrency": 1,
             "subject_serialization": "one lexicographic Rust loop; no subject worker pool",
             "external_lean_process_concurrency": 1,
+            "proof_assurance": ProofAssurance::LeanAcceptedDependenciesUnaudited.summary(),
+            "proof_assurance_limit": "Lean acceptance is timed and recorded; this protocol does not authenticate an axiom-clean dependency closure",
             "lean_task_manager": "disabled by required LEAN_NUM_THREADS=0 inherited by direct run_lean",
             "lean_import_workers": "exactly one by required LEAN_IMPORT_WORKERS=1 inherited by direct run_lean",
             "orchestration_conventions": "SABLE_TEST_JOBS=1 pins the supported outer verification pool; the serial timing loop does not consume it",
@@ -1736,6 +1750,7 @@ fn record_verifying_corpus_proof_times() {
         "summary": {
             "subjects": records.len(),
             "verified_subjects": verified_subjects,
+            "proof_assurance": ProofAssurance::LeanAcceptedDependenciesUnaudited.summary(),
             "failed_subjects": records.len() as u64 - verified_subjects,
             "failure_records": failures.len(),
             "verification_wall_total_ns": verification_wall_total_ns,
