@@ -1,0 +1,730 @@
+{
+  "errors": [],
+  "evidence_reasons": [],
+  "evidence_tier": "baseline",
+  "generated_unix_ns": 1787184412073791000,
+  "machine": {
+    "hostname": "Alvaros-M2-Air.home",
+    "label": "alvaros-m2-air-arm64",
+    "machine": "arm64",
+    "platform": "macOS-26.5-arm64-arm-64bit-Mach-O",
+    "processor": "arm",
+    "python": "3.14.6"
+  },
+  "protocol": {
+    "anti_trivialization_gate": "named optimized-LLVM structural profiles; rejects known constant collapse but does not prove semantic equivalence",
+    "clock": "time.perf_counter_ns",
+    "order": "alternating C/Sable first for admitted pairs",
+    "process_model": "one process per sample; each process performs manifest work_units",
+    "samples": 15,
+    "warmups": 3
+  },
+  "provenance": {
+    "audited_closure": {
+      "audited_base_is_ancestor": true,
+      "audited_base_revision": "2ad556d7ec49504141bed3e2a7dacb188639978d",
+      "audited_date": "2026-08-20",
+      "hosted_runtime_sha256": "daf7db88e646d997af151fe6cdf8b3fd3f4ae58be8562b8700e3168acae7fb7c",
+      "native_optimization": "-O2"
+    },
+    "closure": {
+      "default": true,
+      "path": "/private/tmp/sable-native-perf-bCmR9U/repo/tools/native_perf/closure.json",
+      "sha256": "9d40732401c206a0e15880af178590ae31efb97d90d14dacb27e8c94ea8ee65c"
+    },
+    "end_dirty": false,
+    "end_revision": "ef8b38f8485806a59814e797547eaa742c463fd3",
+    "hosted_runtime": {
+      "default": true,
+      "path": "/private/tmp/sable-native-perf-bCmR9U/repo/runtime/hosted/sable_rt_v1.c",
+      "sha256": "daf7db88e646d997af151fe6cdf8b3fd3f4ae58be8562b8700e3168acae7fb7c"
+    },
+    "input_stability": [
+      {
+        "end_sha256": "9d40732401c206a0e15880af178590ae31efb97d90d14dacb27e8c94ea8ee65c",
+        "label": "closure",
+        "path": "/private/tmp/sable-native-perf-bCmR9U/repo/tools/native_perf/closure.json",
+        "stable": true,
+        "start_sha256": "9d40732401c206a0e15880af178590ae31efb97d90d14dacb27e8c94ea8ee65c"
+      },
+      {
+        "end_sha256": "0fb31433d15281e77811c759d3cd0771416729286c4980a6277a3f0dedaffd2f",
+        "label": "compiler_binary",
+        "path": "/private/tmp/sable-native-perf-bCmR9U/repo/compiler/target/release/sable",
+        "stable": true,
+        "start_sha256": "0fb31433d15281e77811c759d3cd0771416729286c4980a6277a3f0dedaffd2f"
+      },
+      {
+        "end_sha256": "d8d5a1b38201c930132ac6f7eeaf5dbd15936cb107a83058ae2ae4aeccf5055b",
+        "label": "hashmap:c",
+        "path": "/private/tmp/sable-native-perf-bCmR9U/repo/tools/native_perf/workloads/hashmap.c",
+        "stable": true,
+        "start_sha256": "d8d5a1b38201c930132ac6f7eeaf5dbd15936cb107a83058ae2ae4aeccf5055b"
+      },
+      {
+        "end_sha256": "ec3644121fbd56b7ba9d3825efa62d43c2ee4f803100359f1613a87ca98c39fe",
+        "label": "hashmap:sable",
+        "path": "/private/tmp/sable-native-perf-bCmR9U/repo/tools/native_perf/workloads/hashmap_native.sable",
+        "stable": true,
+        "start_sha256": "ec3644121fbd56b7ba9d3825efa62d43c2ee4f803100359f1613a87ca98c39fe"
+      },
+      {
+        "end_sha256": "8e9d88b37e93ecba9f875e4facf1d89fa39a7f4e1f879595925c989041315c0e",
+        "label": "hashmap:verified_subject",
+        "path": "/private/tmp/sable-native-perf-bCmR9U/repo/corpus/verifies/hashmap.sable",
+        "stable": true,
+        "start_sha256": "8e9d88b37e93ecba9f875e4facf1d89fa39a7f4e1f879595925c989041315c0e"
+      },
+      {
+        "end_sha256": "daf7db88e646d997af151fe6cdf8b3fd3f4ae58be8562b8700e3168acae7fb7c",
+        "label": "hosted_runtime",
+        "path": "/private/tmp/sable-native-perf-bCmR9U/repo/runtime/hosted/sable_rt_v1.c",
+        "stable": true,
+        "start_sha256": "daf7db88e646d997af151fe6cdf8b3fd3f4ae58be8562b8700e3168acae7fb7c"
+      },
+      {
+        "end_sha256": "c2b0ba57989c462cbe51011a04bbf669c33569f80edc836afe0ca5e2c5890a14",
+        "label": "linear_probe_u32:c",
+        "path": "/private/tmp/sable-native-perf-bCmR9U/repo/tools/native_perf/workloads/linear_probe_u32.c",
+        "stable": true,
+        "start_sha256": "c2b0ba57989c462cbe51011a04bbf669c33569f80edc836afe0ca5e2c5890a14"
+      },
+      {
+        "end_sha256": "6e2f92372377939c27ded96d1dc69e70e6e5b8287ed532801748f25630d48841",
+        "label": "linear_probe_u32:sable",
+        "path": "/private/tmp/sable-native-perf-bCmR9U/repo/tools/native_perf/workloads/linear_probe_u32.sable",
+        "stable": true,
+        "start_sha256": "6e2f92372377939c27ded96d1dc69e70e6e5b8287ed532801748f25630d48841"
+      },
+      {
+        "end_sha256": "6e2f92372377939c27ded96d1dc69e70e6e5b8287ed532801748f25630d48841",
+        "label": "linear_probe_u32:verified_subject",
+        "path": "/private/tmp/sable-native-perf-bCmR9U/repo/tools/native_perf/workloads/linear_probe_u32.sable",
+        "stable": true,
+        "start_sha256": "6e2f92372377939c27ded96d1dc69e70e6e5b8287ed532801748f25630d48841"
+      },
+      {
+        "end_sha256": "2535d9239e114f3f417cda90061f8db10e0f8cf9f47e80563466acf4765a8973",
+        "label": "lomuto_partition_u32:c",
+        "path": "/private/tmp/sable-native-perf-bCmR9U/repo/tools/native_perf/workloads/lomuto_partition_u32.c",
+        "stable": true,
+        "start_sha256": "2535d9239e114f3f417cda90061f8db10e0f8cf9f47e80563466acf4765a8973"
+      },
+      {
+        "end_sha256": "586ccde78ffbbd5e1bb2e076c527cf433493df0f702eaebb523668815c586a7f",
+        "label": "lomuto_partition_u32:sable",
+        "path": "/private/tmp/sable-native-perf-bCmR9U/repo/tools/native_perf/workloads/lomuto_partition_u32.sable",
+        "stable": true,
+        "start_sha256": "586ccde78ffbbd5e1bb2e076c527cf433493df0f702eaebb523668815c586a7f"
+      },
+      {
+        "end_sha256": "586ccde78ffbbd5e1bb2e076c527cf433493df0f702eaebb523668815c586a7f",
+        "label": "lomuto_partition_u32:verified_subject",
+        "path": "/private/tmp/sable-native-perf-bCmR9U/repo/tools/native_perf/workloads/lomuto_partition_u32.sable",
+        "stable": true,
+        "start_sha256": "586ccde78ffbbd5e1bb2e076c527cf433493df0f702eaebb523668815c586a7f"
+      },
+      {
+        "end_sha256": "e0e8190f3c9c3e57eef7e32d4e64aa049d515a7422dae34fe6d19d08f9b1b97d",
+        "label": "manifest",
+        "path": "/private/tmp/sable-native-perf-bCmR9U/repo/tools/native_perf/workloads.json",
+        "stable": true,
+        "start_sha256": "e0e8190f3c9c3e57eef7e32d4e64aa049d515a7422dae34fe6d19d08f9b1b97d"
+      },
+      {
+        "end_sha256": "43e791966251e0ccdde4da6d5e1216a5b36f611be16449f97b308a6988742056",
+        "label": "merge:c",
+        "path": "/private/tmp/sable-native-perf-bCmR9U/repo/tools/native_perf/workloads/merge.c",
+        "stable": true,
+        "start_sha256": "43e791966251e0ccdde4da6d5e1216a5b36f611be16449f97b308a6988742056"
+      },
+      {
+        "end_sha256": "b9d91b1b72f1db670782488f532123322349ca0a93f5ce7c7ecc101145db296f",
+        "label": "merge:sable",
+        "path": "/private/tmp/sable-native-perf-bCmR9U/repo/tools/native_perf/workloads/merge.sable",
+        "stable": true,
+        "start_sha256": "b9d91b1b72f1db670782488f532123322349ca0a93f5ce7c7ecc101145db296f"
+      },
+      {
+        "end_sha256": "686670cad91e0cecb11702df44c03fc2d3e7053d4bfa37ef20dcd638e0d5120b",
+        "label": "merge:verified_subject",
+        "path": "/private/tmp/sable-native-perf-bCmR9U/repo/corpus/verifies/merge_sorted.sable",
+        "stable": true,
+        "start_sha256": "686670cad91e0cecb11702df44c03fc2d3e7053d4bfa37ef20dcd638e0d5120b"
+      },
+      {
+        "end_sha256": "3ee11726e8c68963ca156b521058fcd69e62d192affa482e38a0ede4e2bab49d",
+        "label": "merge_u32:c",
+        "path": "/private/tmp/sable-native-perf-bCmR9U/repo/tools/native_perf/workloads/merge_u32.c",
+        "stable": true,
+        "start_sha256": "3ee11726e8c68963ca156b521058fcd69e62d192affa482e38a0ede4e2bab49d"
+      },
+      {
+        "end_sha256": "4646620e752a61520b9400eb0fbb8e9da26ec9c503df723a22cd9de06e89b90d",
+        "label": "merge_u32:sable",
+        "path": "/private/tmp/sable-native-perf-bCmR9U/repo/tools/native_perf/workloads/merge_u32.sable",
+        "stable": true,
+        "start_sha256": "4646620e752a61520b9400eb0fbb8e9da26ec9c503df723a22cd9de06e89b90d"
+      },
+      {
+        "end_sha256": "4646620e752a61520b9400eb0fbb8e9da26ec9c503df723a22cd9de06e89b90d",
+        "label": "merge_u32:verified_subject",
+        "path": "/private/tmp/sable-native-perf-bCmR9U/repo/tools/native_perf/workloads/merge_u32.sable",
+        "stable": true,
+        "start_sha256": "4646620e752a61520b9400eb0fbb8e9da26ec9c503df723a22cd9de06e89b90d"
+      },
+      {
+        "end_sha256": "d613f69e8381cdd89825e8c354e8197c2526bcddd9c5bd7e4074f5d7347f6422",
+        "label": "quicksort:c",
+        "path": "/private/tmp/sable-native-perf-bCmR9U/repo/tools/native_perf/workloads/quicksort.c",
+        "stable": true,
+        "start_sha256": "d613f69e8381cdd89825e8c354e8197c2526bcddd9c5bd7e4074f5d7347f6422"
+      },
+      {
+        "end_sha256": "d03f7938bd95ceb5d6e97dae0f6b3ffc78f108373102522e55801e6d9a1326fb",
+        "label": "quicksort:sable",
+        "path": "/private/tmp/sable-native-perf-bCmR9U/repo/tools/native_perf/workloads/quicksort_native.sable",
+        "stable": true,
+        "start_sha256": "d03f7938bd95ceb5d6e97dae0f6b3ffc78f108373102522e55801e6d9a1326fb"
+      },
+      {
+        "end_sha256": "5007f021d6162e7ec21c22eee6567c38186cd0812d855b9a4048d8d8a2f1c24d",
+        "label": "quicksort:verified_subject",
+        "path": "/private/tmp/sable-native-perf-bCmR9U/repo/corpus/verifies/quicksort.sable",
+        "stable": true,
+        "start_sha256": "5007f021d6162e7ec21c22eee6567c38186cd0812d855b9a4048d8d8a2f1c24d"
+      }
+    ],
+    "manifest": {
+      "default": true,
+      "path": "/private/tmp/sable-native-perf-bCmR9U/repo/tools/native_perf/workloads.json",
+      "sha256": "e0e8190f3c9c3e57eef7e32d4e64aa049d515a7422dae34fe6d19d08f9b1b97d"
+    },
+    "start_dirty": false,
+    "start_revision": "ef8b38f8485806a59814e797547eaa742c463fd3"
+  },
+  "schema_version": 2,
+  "status": "ok",
+  "toolchain": {
+    "clang": "Apple clang version 21.0.0 (clang-2100.0.123.102)",
+    "clang_path": "/usr/bin/clang",
+    "compiler_build_elapsed_ns": 25024302334,
+    "compiler_origin": "release build from recorded clean checkout",
+    "compiler_path": "/private/tmp/sable-native-perf-bCmR9U/repo/compiler/target/release/sable",
+    "compiler_sha256": "0fb31433d15281e77811c759d3cd0771416729286c4980a6277a3f0dedaffd2f",
+    "optimization": "-O2",
+    "rustc": "rustc 1.88.0 (6b00bc388 2025-06-23) (Homebrew)"
+  },
+  "workloads": [
+    {
+      "c_source": "tools/native_perf/workloads/quicksort.c",
+      "comparison_status": "c_reference_only_native_blocked",
+      "entry": "perf_quicksort_entry",
+      "expected_exit": 42,
+      "id": "quicksort",
+      "native_admission": "blocked_expected",
+      "native_gate_elapsed_ns": 15846731625,
+      "refusal": {
+        "authentication": {
+          "checks": {
+            "detail_occurs_once": true,
+            "exactly_one_error_heading": true,
+            "no_verification_failure": true,
+            "returncode_is_one": true,
+            "terminal_summary_exact": true,
+            "title_occurs_once": true
+          },
+          "passed": true,
+          "terminal": "LLVM lowering failed: 1 error(s) in /private/tmp/sable-native-perf-bCmR9U/repo/tools/native_perf/workloads/quicksort_native.sable"
+        },
+        "closure": "The exact verified quicksort closure is recursive; the native gate rejects recursive call cycles before code generation.",
+        "detail_fragment": "`quicksort_range` participates in a recursive call cycle",
+        "title_fragment": "recursive calls are outside the first LLVM subset"
+      },
+      "sable_source": "tools/native_perf/workloads/quicksort_native.sable",
+      "scope_nonclaim": null,
+      "semantic_profile": "Lomuto quicksort of [5,3,8,1,9,2,7,3,0,6], including allocation, full-output comparison, and release per work unit",
+      "source_sha256": {
+        "c": "d613f69e8381cdd89825e8c354e8197c2526bcddd9c5bd7e4074f5d7347f6422",
+        "sable": "d03f7938bd95ceb5d6e97dae0f6b3ffc78f108373102522e55801e6d9a1326fb",
+        "verified_subject": "5007f021d6162e7ec21c22eee6567c38186cd0812d855b9a4048d8d8a2f1c24d"
+      },
+      "verified_subject": "corpus/verifies/quicksort.sable",
+      "work_units": 262144
+    },
+    {
+      "c_source": "tools/native_perf/workloads/merge.c",
+      "comparison_status": "c_reference_only_native_blocked",
+      "entry": "perf_merge_entry",
+      "expected_exit": 42,
+      "id": "merge",
+      "native_admission": "blocked_expected",
+      "native_gate_elapsed_ns": 4810382042,
+      "refusal": {
+        "authentication": {
+          "checks": {
+            "detail_occurs_once": true,
+            "exactly_one_error_heading": true,
+            "no_verification_failure": true,
+            "returncode_is_one": true,
+            "terminal_summary_exact": true,
+            "title_occurs_once": true
+          },
+          "passed": true,
+          "terminal": "LLVM lowering failed: 1 error(s) in /private/tmp/sable-native-perf-bCmR9U/repo/tools/native_perf/workloads/merge.sable"
+        },
+        "closure": "The exact merge kernel passes borrowed i32 arrays; the native ABI currently admits borrowed u32 and bool arrays only.",
+        "detail_fragment": "function parameter type `&[i32]` has no LLVM value representation",
+        "title_fragment": "construct is outside the current LLVM backend subset"
+      },
+      "sable_source": "tools/native_perf/workloads/merge.sable",
+      "scope_nonclaim": null,
+      "semantic_profile": "merge [1,3,5,7] and [2,3,6], including three allocations, full-output comparison, and release per work unit",
+      "source_sha256": {
+        "c": "43e791966251e0ccdde4da6d5e1216a5b36f611be16449f97b308a6988742056",
+        "sable": "b9d91b1b72f1db670782488f532123322349ca0a93f5ce7c7ecc101145db296f",
+        "verified_subject": "686670cad91e0cecb11702df44c03fc2d3e7053d4bfa37ef20dcd638e0d5120b"
+      },
+      "verified_subject": "corpus/verifies/merge_sorted.sable",
+      "work_units": 262144
+    },
+    {
+      "c_source": "tools/native_perf/workloads/hashmap.c",
+      "comparison_status": "c_reference_only_native_blocked",
+      "entry": "perf_hashmap_entry",
+      "expected_exit": 42,
+      "id": "hashmap",
+      "native_admission": "blocked_expected",
+      "native_gate_elapsed_ns": 31117081500,
+      "refusal": {
+        "authentication": {
+          "checks": {
+            "detail_occurs_once": true,
+            "exactly_one_error_heading": true,
+            "no_verification_failure": true,
+            "returncode_is_one": true,
+            "terminal_summary_exact": true,
+            "title_occurs_once": true
+          },
+          "passed": true,
+          "terminal": "LLVM lowering failed: 1 error(s) in /private/tmp/sable-native-perf-bCmR9U/repo/tools/native_perf/workloads/hashmap_native.sable"
+        },
+        "closure": "The exact map is a monomorphized generic class with owned array fields, outside the private concrete integer-field scalar-owner class subset.",
+        "detail_fragment": "class local initializer uses `HashMap_i32_u64`",
+        "title_fragment": "class is outside the exact scalar-owner LLVM subset"
+      },
+      "sable_source": "tools/native_perf/workloads/hashmap_native.sable",
+      "scope_nonclaim": null,
+      "semantic_profile": "capacity-8 i32/u64 linear-probing map with colliding inserts, overwrite, two hits, one miss, size check, three allocations, and three releases per work unit",
+      "source_sha256": {
+        "c": "d8d5a1b38201c930132ac6f7eeaf5dbd15936cb107a83058ae2ae4aeccf5055b",
+        "sable": "ec3644121fbd56b7ba9d3825efa62d43c2ee4f803100359f1613a87ca98c39fe",
+        "verified_subject": "8e9d88b37e93ecba9f875e4facf1d89fa39a7f4e1f879595925c989041315c0e"
+      },
+      "verified_subject": "corpus/verifies/hashmap.sable",
+      "work_units": 262144
+    },
+    {
+      "c_source": "tools/native_perf/workloads/lomuto_partition_u32.c",
+      "closure_scope": "Exact non-recursive Lomuto partition kernel over admitted u32 arrays; excludes recursive quicksort.",
+      "comparison_eligibility": "optimization_trivialized",
+      "comparison_status": "admitted_noncomparable_optimization_trivialized",
+      "entry": "perf_lomuto_partition_u32_entry",
+      "expected_exit": 42,
+      "id": "lomuto_partition_u32",
+      "native_admission": "admitted_expected",
+      "native_gate_elapsed_ns": 1157507750,
+      "noncomparable_reason": "Clang -O2 precomputes the fixed-input partition and output oracle in both emitted Sable LLVM and C, so the surviving loop measures allocation, constant stores, release, and counting rather than the partition algorithm.",
+      "optimized_ir_authentication": {
+        "c": {
+          "checks": {
+            "dynamic_i32_stores": false,
+            "i32_ordering_compares": false
+          },
+          "counts": {
+            "dynamic_i32_loads": 0,
+            "dynamic_i32_stores": 0,
+            "dynamic_load_to_load_unsigned_ordering_compares": 0,
+            "i32_ordering_compares": 0,
+            "stores_through_dynamic_index_gep": 0
+          },
+          "passed": false,
+          "profile": "lomuto_partition_u32",
+          "purpose": "anti_trivialization_only_not_semantic_equivalence",
+          "requirements": {
+            "dynamic_i32_stores": {
+              "minimum": 1
+            },
+            "i32_ordering_compares": {
+              "minimum": 1
+            }
+          },
+          "sha256": "77b285d850f099828e2c3a7b310f795515ffd6248aaaeb48994a845b96dc0ee1"
+        },
+        "sable": {
+          "checks": {
+            "dynamic_i32_stores": false,
+            "i32_ordering_compares": false
+          },
+          "counts": {
+            "dynamic_i32_loads": 0,
+            "dynamic_i32_stores": 0,
+            "dynamic_load_to_load_unsigned_ordering_compares": 0,
+            "i32_ordering_compares": 0,
+            "stores_through_dynamic_index_gep": 0
+          },
+          "passed": false,
+          "profile": "lomuto_partition_u32",
+          "purpose": "anti_trivialization_only_not_semantic_equivalence",
+          "requirements": {
+            "dynamic_i32_stores": {
+              "minimum": 1
+            },
+            "i32_ordering_compares": {
+              "minimum": 1
+            }
+          },
+          "sha256": "28e08f9907609a47c2b3862ffdc99ba18456025415344db8a876186b5bb20792"
+        }
+      },
+      "optimized_ir_shape_profile": "lomuto_partition_u32",
+      "sable_source": "tools/native_perf/workloads/lomuto_partition_u32.sable",
+      "scope_nonclaim": "This measures partition only; it is not the blocked recursive quicksort workload.",
+      "semantic_profile": "exact Lomuto partition kernel on the quicksort input, using u32 native arrays with allocation, pivot/full-output comparison, and release per work unit",
+      "source_sha256": {
+        "c": "2535d9239e114f3f417cda90061f8db10e0f8cf9f47e80563466acf4765a8973",
+        "sable": "586ccde78ffbbd5e1bb2e076c527cf433493df0f702eaebb523668815c586a7f",
+        "verified_subject": "586ccde78ffbbd5e1bb2e076c527cf433493df0f702eaebb523668815c586a7f"
+      },
+      "verification": {
+        "accepted_for_comparison": true,
+        "assumed": 0,
+        "deferred": 0,
+        "extern_assumptions": 0,
+        "functions": 2,
+        "obligations": 41,
+        "proved": 41,
+        "rejection_reasons": [],
+        "status_lines": [
+          "fully verified"
+        ],
+        "summary_count": 1,
+        "unsafe_regions": 0
+      },
+      "verified_subject": "tools/native_perf/workloads/lomuto_partition_u32.sable",
+      "work_units": 262144
+    },
+    {
+      "c_o2": {
+        "median_ns": 21971917,
+        "median_ns_per_work_unit": 83.81621170043945,
+        "min_ns": 21536916,
+        "p95_ns": 24331333,
+        "samples_ns": [
+          22934500,
+          23289458,
+          24331333,
+          22022875,
+          22123167,
+          21961125,
+          21549500,
+          21908875,
+          21811625,
+          21536916,
+          22331875,
+          22216500,
+          21929667,
+          21789125,
+          21971917
+        ]
+      },
+      "c_source": "tools/native_perf/workloads/merge_u32.c",
+      "closure_scope": "Full merge control/data algorithm over admitted u32 arrays; excludes the canonical borrowed i32 ABI.",
+      "comparison_eligibility": "comparable",
+      "comparison_status": "comparable_admitted_pair",
+      "entry": "perf_merge_u32_entry",
+      "expected_exit": 42,
+      "id": "merge_u32",
+      "native_admission": "admitted_expected",
+      "native_gate_elapsed_ns": 1515329833,
+      "optimized_ir_authentication": {
+        "c": {
+          "checks": {
+            "dynamic_i32_stores": true,
+            "dynamic_load_to_load_unsigned_ordering_compares": true
+          },
+          "counts": {
+            "dynamic_i32_loads": 11,
+            "dynamic_i32_stores": 3,
+            "dynamic_load_to_load_unsigned_ordering_compares": 1,
+            "i32_ordering_compares": 1,
+            "stores_through_dynamic_index_gep": 3
+          },
+          "passed": true,
+          "profile": "merge_u32",
+          "purpose": "anti_trivialization_only_not_semantic_equivalence",
+          "requirements": {
+            "dynamic_i32_stores": {
+              "minimum": 1
+            },
+            "dynamic_load_to_load_unsigned_ordering_compares": {
+              "minimum": 1
+            }
+          },
+          "sha256": "084e58a7f4575eb1cd5dc2a98748a75ed4f237fea898bc27e8d7d3e57c266359"
+        },
+        "sable": {
+          "checks": {
+            "dynamic_i32_stores": true,
+            "dynamic_load_to_load_unsigned_ordering_compares": true
+          },
+          "counts": {
+            "dynamic_i32_loads": 16,
+            "dynamic_i32_stores": 9,
+            "dynamic_load_to_load_unsigned_ordering_compares": 1,
+            "i32_ordering_compares": 1,
+            "stores_through_dynamic_index_gep": 9
+          },
+          "passed": true,
+          "profile": "merge_u32",
+          "purpose": "anti_trivialization_only_not_semantic_equivalence",
+          "requirements": {
+            "dynamic_i32_stores": {
+              "minimum": 1
+            },
+            "dynamic_load_to_load_unsigned_ordering_compares": {
+              "minimum": 1
+            }
+          },
+          "sha256": "db5610eaec94f110cb4ec56ba6020718cff37195ade1860ce0efd3af02a17687"
+        }
+      },
+      "optimized_ir_shape_profile": "merge_u32",
+      "sable_o2": {
+        "median_ns": 22259417,
+        "median_ns_per_work_unit": 84.91293716430664,
+        "min_ns": 21507041,
+        "p95_ns": 23311459,
+        "samples_ns": [
+          23265208,
+          23311459,
+          22874500,
+          22390875,
+          22319166,
+          22865959,
+          21723125,
+          21791000,
+          22259417,
+          22257959,
+          22655375,
+          22102000,
+          21507041,
+          22126041,
+          21849292
+        ]
+      },
+      "sable_over_c_median_ratio": 1.0130848846734675,
+      "sable_source": "tools/native_perf/workloads/merge_u32.sable",
+      "scope_nonclaim": "This changes only the canonical workload's signed i32 element type to admitted u32; it is not evidence for the blocked i32 array ABI.",
+      "semantic_profile": "full two-input merge algorithm on [1,3,5,7] and [2,3,6], using u32 native arrays with three allocations, full-output comparison, and release per work unit",
+      "source_sha256": {
+        "c": "3ee11726e8c68963ca156b521058fcd69e62d192affa482e38a0ede4e2bab49d",
+        "sable": "4646620e752a61520b9400eb0fbb8e9da26ec9c503df723a22cd9de06e89b90d",
+        "verified_subject": "4646620e752a61520b9400eb0fbb8e9da26ec9c503df723a22cd9de06e89b90d"
+      },
+      "verification": {
+        "accepted_for_comparison": true,
+        "assumed": 0,
+        "deferred": 0,
+        "extern_assumptions": 0,
+        "functions": 2,
+        "obligations": 62,
+        "proved": 62,
+        "rejection_reasons": [],
+        "status_lines": [
+          "fully verified"
+        ],
+        "summary_count": 1,
+        "unsafe_regions": 0
+      },
+      "verified_subject": "tools/native_perf/workloads/merge_u32.sable",
+      "work_units": 262144
+    },
+    {
+      "c_o2": {
+        "median_ns": 24051875,
+        "median_ns_per_work_unit": 91.7506217956543,
+        "min_ns": 23038541,
+        "p95_ns": 25593666,
+        "samples_ns": [
+          24264750,
+          23077917,
+          24047208,
+          23972667,
+          24258417,
+          23267833,
+          25593666,
+          24787083,
+          24129125,
+          23913083,
+          24051875,
+          23038541,
+          25042417,
+          25396750,
+          23977542
+        ]
+      },
+      "c_source": "tools/native_perf/workloads/linear_probe_u32.c",
+      "closure_scope": "Fixed-capacity local-u32-array probing algorithm; excludes the canonical generic class and u64-value representation.",
+      "comparison_eligibility": "comparable",
+      "comparison_status": "comparable_admitted_pair",
+      "entry": "perf_linear_probe_u32_entry",
+      "expected_exit": 42,
+      "id": "linear_probe_u32",
+      "native_admission": "admitted_expected",
+      "native_gate_elapsed_ns": 1986570708,
+      "optimized_ir_authentication": {
+        "c": {
+          "checks": {
+            "dynamic_i32_loads": true,
+            "key_eq_17_compares": true,
+            "key_eq_25_compares": true,
+            "key_eq_9_compares": true,
+            "occupancy_eq_zero_compares": true,
+            "stores_through_dynamic_index_gep": true
+          },
+          "counts": {
+            "dynamic_i32_loads": 107,
+            "dynamic_i32_stores": 0,
+            "dynamic_load_to_load_unsigned_ordering_compares": 0,
+            "i32_ordering_compares": 0,
+            "key_eq_17_compares": 17,
+            "key_eq_25_compares": 8,
+            "key_eq_9_compares": 25,
+            "occupancy_eq_zero_compares": 53,
+            "stores_through_dynamic_index_gep": 16
+          },
+          "passed": true,
+          "profile": "linear_probe_u32",
+          "purpose": "anti_trivialization_only_not_semantic_equivalence",
+          "requirements": {
+            "dynamic_i32_loads": {
+              "minimum": 8
+            },
+            "key_eq_17_compares": {
+              "minimum": 1
+            },
+            "key_eq_25_compares": {
+              "minimum": 1
+            },
+            "key_eq_9_compares": {
+              "minimum": 1
+            },
+            "occupancy_eq_zero_compares": {
+              "minimum": 4
+            },
+            "stores_through_dynamic_index_gep": {
+              "minimum": 1
+            }
+          },
+          "sha256": "3fdfd26b4491291718582c0d93dd124c841fbef2f73e1b7cfb3d1f353575fbc9"
+        },
+        "sable": {
+          "checks": {
+            "dynamic_i32_loads": true,
+            "key_eq_17_compares": true,
+            "key_eq_25_compares": true,
+            "key_eq_9_compares": true,
+            "occupancy_eq_zero_compares": true,
+            "stores_through_dynamic_index_gep": true
+          },
+          "counts": {
+            "dynamic_i32_loads": 94,
+            "dynamic_i32_stores": 0,
+            "dynamic_load_to_load_unsigned_ordering_compares": 0,
+            "i32_ordering_compares": 0,
+            "key_eq_17_compares": 16,
+            "key_eq_25_compares": 8,
+            "key_eq_9_compares": 24,
+            "occupancy_eq_zero_compares": 45,
+            "stores_through_dynamic_index_gep": 12
+          },
+          "passed": true,
+          "profile": "linear_probe_u32",
+          "purpose": "anti_trivialization_only_not_semantic_equivalence",
+          "requirements": {
+            "dynamic_i32_loads": {
+              "minimum": 8
+            },
+            "key_eq_17_compares": {
+              "minimum": 1
+            },
+            "key_eq_25_compares": {
+              "minimum": 1
+            },
+            "key_eq_9_compares": {
+              "minimum": 1
+            },
+            "occupancy_eq_zero_compares": {
+              "minimum": 4
+            },
+            "stores_through_dynamic_index_gep": {
+              "minimum": 1
+            }
+          },
+          "sha256": "3ea00a623c72bc07bd5b55e0bbca52d5789a47da7974846bf4e620d80a0fb2dc"
+        }
+      },
+      "optimized_ir_shape_profile": "linear_probe_u32",
+      "sable_o2": {
+        "median_ns": 22197292,
+        "median_ns_per_work_unit": 84.67594909667969,
+        "min_ns": 22006542,
+        "p95_ns": 23635291,
+        "samples_ns": [
+          22182083,
+          22334208,
+          22191791,
+          22096750,
+          22089917,
+          23596916,
+          23635291,
+          22721250,
+          22197292,
+          22025166,
+          22060125,
+          22006542,
+          22822334,
+          22868917,
+          22497792
+        ]
+      },
+      "sable_over_c_median_ratio": 0.9228923732557233,
+      "sable_source": "tools/native_perf/workloads/linear_probe_u32.sable",
+      "scope_nonclaim": "This measures the probe algorithm and local arrays; it is not the blocked generic HashMap class, u64 values, or its full verified abstraction contract.",
+      "semantic_profile": "capacity-8 local-array u32 linear probing with colliding inserts, overwrite, two hits, one miss, three allocations, result comparison, and release per work unit",
+      "source_sha256": {
+        "c": "c2b0ba57989c462cbe51011a04bbf669c33569f80edc836afe0ca5e2c5890a14",
+        "sable": "6e2f92372377939c27ded96d1dc69e70e6e5b8287ed532801748f25630d48841",
+        "verified_subject": "6e2f92372377939c27ded96d1dc69e70e6e5b8287ed532801748f25630d48841"
+      },
+      "verification": {
+        "accepted_for_comparison": true,
+        "assumed": 0,
+        "deferred": 0,
+        "extern_assumptions": 0,
+        "functions": 3,
+        "obligations": 75,
+        "proved": 75,
+        "rejection_reasons": [],
+        "status_lines": [
+          "fully verified"
+        ],
+        "summary_count": 1,
+        "unsafe_regions": 0
+      },
+      "verified_subject": "tools/native_perf/workloads/linear_probe_u32.sable",
+      "work_units": 262144
+    }
+  ]
+}

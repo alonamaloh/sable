@@ -73,6 +73,20 @@ The runner:
 If a source, native gate, or expected status changes, the run fails. Review the
 semantic pair and closure before updating hashes or admission status.
 
+## Recorded baselines
+
+- Revision `ef8b38f8485806a59814e797547eaa742c463fd3` on
+  `alvaros-m2-air-arm64` (macOS 26.5, arm64): clean-checkout release compiler,
+  all six closure checks, and admitted native paths at `-O2`; comparable pairs
+  use three warmups and fifteen samples. The complete
+  [JSON report](baselines/ef8b38f-alvaros-m2-air-arm64.json) has SHA-256
+  `cb88d5c247d2cbb74df528b31e30510c86b080dbbf331dc1db76227110cebd82`.
+  The eligible median Sable/C ratios are `1.0130848846734675` for `merge_u32`
+  and `0.9228923732557233` for `linear_probe_u32`. `quicksort`, `merge`, and
+  `hashmap` have `c_reference_only_native_blocked`; `lomuto_partition_u32` has
+  `admitted_noncomparable_optimization_trivialized`. Those four workloads have
+  no timing samples or ratios.
+
 ## Interpretation and nonclaims
 
 - Ratios exist only for `comparison_status = "comparable_admitted_pair"`.
