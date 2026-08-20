@@ -356,6 +356,7 @@ const INGRESS_REQUEST_SCHEMA: &str = "sable-proof-ingress-request-v2";
 const INGRESS_RESULT_SCHEMA: &str = "sable-proof-ingress-result-v2";
 const DECLARATION_INVENTORY_REQUEST_SCHEMA: &str = "sable-declaration-inventory-request-v1";
 const DECLARATION_INVENTORY_RESULT_SCHEMA: &str = "sable-declaration-inventory-result-v1";
+const DECLARATION_OBSERVATION_SCHEMA: &str = "sable-declaration-observation-v1";
 
 /// Exact recursive Lean `Name` identity. Printable names are insufficient for
 /// hygienic components, so the transport preserves anonymous/str/num shape.
@@ -437,6 +438,130 @@ pub(crate) struct DeclarationModuleInventory {
     pub(crate) constants: Vec<ObservedConstantSlot>,
     pub(crate) extra_const_names: Vec<ObservedName>,
     pub(crate) extension_families: Vec<ObservedExtensionFamily>,
+}
+
+/// An opaque, compiler-owned path reserved for a future freshly compiled
+/// declaration-observation candidate. The path itself grants no authority and
+/// this tranche never writes or publishes it.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct DeclarationCandidateOlean {
+    expected_module_name: String,
+    path: PathBuf,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl DeclarationCandidateOlean {
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for DeclarationCandidateOlean {
+    fn drop(&mut self) {
+        // The process/nonce-scoped path was absent when this capability
+        // was allocated. Remove only the regular file a future compiler wrote;
+        // never follow a replacement symlink or recurse through a directory.
+        if std::fs::symlink_metadata(&self.path)
+            .is_ok_and(|metadata| !metadata.file_type().is_symlink() && metadata.is_file())
+        {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+/// In-memory binding between one exact source-side subject and one stable raw
+/// `ModuleData` observation. It is deliberately non-authoritative: no field
+/// attests declaration bodies, imports the candidate, authorizes cache reuse,
+/// or raises proof assurance. In particular, `expected_module_name` comes from
+/// the source subject; `readModuleData` does not authenticate a module name.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DeclarationModuleObservation {
+    schema: &'static str,
+    observational: bool,
+    authoritative: bool,
+    expected_module_name: String,
+    proof_environment_id: String,
+    proof_policy: String,
+    declaration_subject: DeclarationAuditSubject,
+    declaration_subject_json: Vec<u8>,
+    declaration_subject_sha256: String,
+    proof_ready_bytes: Vec<u8>,
+    proof_ready_sha256_before: String,
+    proof_ready_sha256_after: String,
+    candidate_olean_sha256_before: String,
+    candidate_olean_sha256_after: String,
+    inventory_request: Vec<u8>,
+    inventory_request_sha256: String,
+    inventory_result: Vec<u8>,
+    inventory_result_sha256: String,
+    inventory: DeclarationModuleInventory,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl DeclarationModuleObservation {
+    /// Exact, framed-by-fields evidence bytes for later policy work. The full
+    /// source subject, READY bytes, request, and result are retained alongside
+    /// their SHA-256 digests; this in-memory encoding is not an accepted
+    /// manifest and is never consulted by cache reuse.
+    pub(crate) fn canonical_json(&self) -> Vec<u8> {
+        debug_assert_eq!(self.schema, DECLARATION_OBSERVATION_SCHEMA);
+        debug_assert!(self.observational);
+        debug_assert!(!self.authoritative);
+        debug_assert_eq!(
+            self.declaration_subject.canonical_json(),
+            self.declaration_subject_json
+        );
+
+        let ready = std::str::from_utf8(&self.proof_ready_bytes)
+            .expect("validated proof READY bytes remain UTF-8");
+        let request = std::str::from_utf8(&self.inventory_request)
+            .expect("compiler-authored declaration inventory request remains UTF-8");
+        let result = std::str::from_utf8(&self.inventory_result)
+            .expect("strictly parsed declaration inventory result remains UTF-8");
+        let subject = std::str::from_utf8(&self.declaration_subject_json)
+            .expect("compiler-authored declaration subject remains UTF-8");
+
+        let mut json = String::new();
+        json.push_str("{\"schema\":");
+        push_json_string(&mut json, self.schema);
+        json.push_str(",\"observational\":true,\"authoritative\":false");
+        json.push_str(",\"expected_module_name\":");
+        push_json_string(&mut json, &self.expected_module_name);
+        json.push_str(",\"proof_environment_id\":");
+        push_json_string(&mut json, &self.proof_environment_id);
+        json.push_str(",\"proof_policy\":");
+        push_json_string(&mut json, &self.proof_policy);
+        json.push_str(",\"declaration_audit_subject\":");
+        json.push_str(subject);
+        json.push_str(",\"declaration_audit_subject_sha256\":");
+        push_json_string(&mut json, &self.declaration_subject_sha256);
+        json.push_str(",\"proof_ready_utf8\":");
+        push_json_string(&mut json, ready);
+        json.push_str(",\"proof_ready_sha256_before\":");
+        push_json_string(&mut json, &self.proof_ready_sha256_before);
+        json.push_str(",\"proof_ready_sha256_after\":");
+        push_json_string(&mut json, &self.proof_ready_sha256_after);
+        json.push_str(",\"candidate_olean_sha256_before\":");
+        push_json_string(&mut json, &self.candidate_olean_sha256_before);
+        json.push_str(",\"candidate_olean_sha256_after\":");
+        push_json_string(&mut json, &self.candidate_olean_sha256_after);
+        json.push_str(",\"inventory_request_utf8\":");
+        push_json_string(&mut json, request);
+        json.push_str(",\"inventory_request_sha256\":");
+        push_json_string(&mut json, &self.inventory_request_sha256);
+        json.push_str(",\"inventory_result_utf8\":");
+        push_json_string(&mut json, result);
+        json.push_str(",\"inventory_result_sha256\":");
+        push_json_string(&mut json, &self.inventory_result_sha256);
+        json.push('}');
+        json.into_bytes()
+    }
+
+    pub(crate) fn canonical_sha256(&self) -> String {
+        crate::sha256::hex(&self.canonical_json())
+    }
 }
 
 #[derive(Clone)]
@@ -1147,6 +1272,80 @@ pub const INVALID_LEAN_INGRESS_DIAGNOSTIC: &str = "proof.invalid_lean_ingress";
 /// on `LEAN_PATH` for every check, whether or not it exists yet.
 pub fn modules_dir(repo_root: &Path) -> PathBuf {
     repo_root.join(".sable-out").join("modules")
+}
+
+fn require_generated_module_name(module_name: &str) -> Result<(), String> {
+    if module_name.is_empty()
+        || module_name
+            .bytes()
+            .next()
+            .is_some_and(|byte| byte.is_ascii_digit())
+        || !module_name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+    {
+        return Err(format!(
+            "declaration observation expected module name `{module_name}` is not one compiler-authored Lean file stem"
+        ));
+    }
+    Ok(())
+}
+
+/// Allocate an absent, process-and-attempt-unique path for a future fresh Lean
+/// compilation. The caller must compile directly to this exact path before
+/// passing the opaque token to [`observe_declaration_module`]. B1c leaves that
+/// production integration deliberately dormant.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn unique_declaration_candidate_olean(
+    repo_root: &Path,
+    expected_module_name: &str,
+) -> Result<DeclarationCandidateOlean, String> {
+    if !repo_root.is_absolute() {
+        return Err(format!(
+            "declaration observation repository root {} must be absolute",
+            repo_root.display()
+        ));
+    }
+    require_generated_module_name(expected_module_name)?;
+    let parent = modules_dir(repo_root);
+    let parent_metadata = std::fs::symlink_metadata(&parent).map_err(|error| {
+        format!(
+            "cannot inspect declaration observation directory {}: {error}",
+            parent.display()
+        )
+    })?;
+    if parent_metadata.file_type().is_symlink() || !parent_metadata.is_dir() {
+        return Err(format!(
+            "declaration observation directory {} is not a regular non-symlink directory",
+            parent.display()
+        ));
+    }
+    for _ in 0..100 {
+        let nonce = NEXT_PROOF_TEMP.fetch_add(1, Ordering::Relaxed);
+        let path = parent.join(format!(
+            ".{expected_module_name}.declaration-observation.{}.{nonce}.olean",
+            std::process::id(),
+        ));
+        match std::fs::symlink_metadata(&path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(DeclarationCandidateOlean {
+                    expected_module_name: expected_module_name.to_owned(),
+                    path,
+                });
+            }
+            Ok(_) => continue,
+            Err(error) => {
+                return Err(format!(
+                    "cannot inspect declaration observation candidate {}: {error}",
+                    path.display()
+                ));
+            }
+        }
+    }
+    Err(format!(
+        "cannot allocate a unique declaration observation candidate in {}",
+        parent.display()
+    ))
 }
 
 /// Exact repository-local inputs that can affect a generated proof. The FNV
@@ -2149,6 +2348,49 @@ fn proof_build_executable_digest(path: &Path, description: &str) -> Result<Strin
     Ok(crate::sha256::hex(&bytes))
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ExactObservedFile {
+    bytes: Vec<u8>,
+    sha256: String,
+}
+
+/// Read one observation input only when it remains a regular non-symlink file
+/// across the read. The outer pre/post reads around the serialized child are
+/// still required: this inner check only closes kind/length changes during one
+/// hash operation. Same-user swap-and-restore remains part of the trusted-host
+/// boundary, as it does for the existing proof-build identities.
+#[allow(dead_code)]
+fn observe_regular_file(path: &Path, description: &str) -> Result<ExactObservedFile, String> {
+    let metadata_before = std::fs::symlink_metadata(path)
+        .map_err(|error| format!("cannot inspect {description} {}: {error}", path.display()))?;
+    if metadata_before.file_type().is_symlink() || !metadata_before.is_file() {
+        return Err(format!(
+            "{description} {} is not a regular non-symlink file",
+            path.display()
+        ));
+    }
+    let bytes = std::fs::read(path)
+        .map_err(|error| format!("cannot read {description} {}: {error}", path.display()))?;
+    let metadata_after = std::fs::symlink_metadata(path)
+        .map_err(|error| format!("cannot recheck {description} {}: {error}", path.display()))?;
+    let byte_len = u64::try_from(bytes.len())
+        .map_err(|_| format!("{description} {} is too large", path.display()))?;
+    if metadata_after.file_type().is_symlink()
+        || !metadata_after.is_file()
+        || metadata_before.len() != byte_len
+        || metadata_after.len() != byte_len
+    {
+        return Err(format!(
+            "{description} {} changed kind or length while being hashed",
+            path.display()
+        ));
+    }
+    Ok(ExactObservedFile {
+        sha256: crate::sha256::hex(&bytes),
+        bytes,
+    })
+}
+
 fn proof_build_output_digests(
     built: &Path,
     files: &BTreeMap<String, Vec<u8>>,
@@ -2722,6 +2964,301 @@ fn parse_declaration_inventory_output(
         extra_const_names,
         extension_families,
     })
+}
+
+fn validate_declaration_observation_subject(
+    proof_environment_id: &str,
+    proof_policy: &str,
+    subject: &DeclarationAuditSubject,
+    expected_emitted: &Emitted,
+    candidate: &DeclarationCandidateOlean,
+) -> Result<Vec<u8>, String> {
+    if subject.schema != DECLARATION_AUDIT_SUBJECT_SCHEMA {
+        return Err(format!(
+            "declaration observation subject has unsupported schema `{}`",
+            subject.schema
+        ));
+    }
+    if subject.proof_environment_id != proof_environment_id {
+        return Err(format!(
+            "declaration observation subject names proof environment `{}`, expected `{proof_environment_id}`",
+            subject.proof_environment_id
+        ));
+    }
+    if subject.proof_policy != proof_policy {
+        return Err(format!(
+            "declaration observation subject names proof policy `{}`, expected `{proof_policy}`",
+            subject.proof_policy
+        ));
+    }
+    require_generated_module_name(&subject.candidate.module_name)?;
+    if subject.candidate.module_name != candidate.expected_module_name {
+        return Err(format!(
+            "declaration observation candidate path is reserved for expected module `{}`, but the source subject names `{}`",
+            candidate.expected_module_name, subject.candidate.module_name
+        ));
+    }
+    let expected_candidate = DeclarationModuleSubject::from_emitted(
+        candidate.expected_module_name.clone(),
+        expected_emitted,
+    );
+    if subject.candidate != expected_candidate {
+        return Err(format!(
+            "declaration observation candidate subject does not exactly match the generated source digest and typed envelope for expected module `{}`",
+            subject.candidate.module_name
+        ));
+    }
+    Ok(subject.canonical_json())
+}
+
+#[allow(dead_code)]
+fn validate_declaration_candidate_path(
+    repo_root: &Path,
+    candidate: &DeclarationCandidateOlean,
+) -> Result<(), String> {
+    if !repo_root.is_absolute() || !candidate.path.is_absolute() {
+        return Err("declaration observation paths must be absolute".into());
+    }
+    let parent = modules_dir(repo_root);
+    if candidate.path.parent() != Some(parent.as_path()) {
+        return Err(format!(
+            "declaration observation candidate {} is outside the compiler-owned generated-module directory",
+            candidate.path.display()
+        ));
+    }
+    let parent_metadata = std::fs::symlink_metadata(&parent).map_err(|error| {
+        format!(
+            "cannot inspect declaration observation directory {}: {error}",
+            parent.display()
+        )
+    })?;
+    if parent_metadata.file_type().is_symlink() || !parent_metadata.is_dir() {
+        return Err(format!(
+            "declaration observation directory {} is not a regular non-symlink directory",
+            parent.display()
+        ));
+    }
+    require_generated_module_name(&candidate.expected_module_name)?;
+    let file_name = candidate
+        .path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            format!(
+                "declaration observation candidate path {} has no UTF-8 file name",
+                candidate.path.display()
+            )
+        })?;
+    let prefix = format!(
+        ".{}.declaration-observation.{}.",
+        candidate.expected_module_name,
+        std::process::id()
+    );
+    let nonce = file_name
+        .strip_prefix(&prefix)
+        .and_then(|tail| tail.strip_suffix(".olean"))
+        .filter(|tail| !tail.is_empty() && tail.bytes().all(|byte| byte.is_ascii_digit()))
+        .ok_or_else(|| {
+            format!(
+                "declaration observation candidate {} is not one compiler-allocated temporary `.olean` path",
+                candidate.path.display()
+            )
+        })?;
+    nonce.parse::<u64>().map_err(|_| {
+        format!(
+            "declaration observation candidate {} has an out-of-range allocation nonce",
+            candidate.path.display()
+        )
+    })?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn bind_declaration_observation(
+    proof_environment_id: &str,
+    proof_policy: &str,
+    subject: &DeclarationAuditSubject,
+    expected_emitted: &Emitted,
+    candidate: &DeclarationCandidateOlean,
+    proof_ready_before: ExactObservedFile,
+    proof_ready_after: ExactObservedFile,
+    candidate_before: ExactObservedFile,
+    candidate_after: ExactObservedFile,
+    inventory_request: Vec<u8>,
+    inventory_status_success: bool,
+    inventory_result: Vec<u8>,
+    inventory_stderr: Vec<u8>,
+) -> Result<DeclarationModuleObservation, String> {
+    let declaration_subject_json = validate_declaration_observation_subject(
+        proof_environment_id,
+        proof_policy,
+        subject,
+        expected_emitted,
+        candidate,
+    )?;
+    let expected_request = declaration_inventory_request(candidate.path())?;
+    if inventory_request != expected_request {
+        return Err(
+            "declaration observation did not use the exact request for its candidate path".into(),
+        );
+    }
+    for (description, observed) in [
+        ("proof READY before", &proof_ready_before),
+        ("proof READY after", &proof_ready_after),
+        ("candidate `.olean` before", &candidate_before),
+        ("candidate `.olean` after", &candidate_after),
+    ] {
+        if observed.sha256 != crate::sha256::hex(&observed.bytes) {
+            return Err(format!(
+                "declaration observation {description} SHA-256 does not match its exact bytes"
+            ));
+        }
+    }
+    if proof_ready_before.bytes != proof_ready_after.bytes
+        || proof_ready_before.sha256 != proof_ready_after.sha256
+    {
+        return Err("proof READY bytes changed during declaration observation".into());
+    }
+    if candidate_before.bytes != candidate_after.bytes
+        || candidate_before.sha256 != candidate_after.sha256
+    {
+        return Err("candidate `.olean` bytes changed during declaration observation".into());
+    }
+    if proof_ready_before.bytes.is_empty() {
+        return Err("proof READY bytes are empty during declaration observation".into());
+    }
+    std::str::from_utf8(&proof_ready_before.bytes)
+        .map_err(|error| format!("proof READY bytes are not UTF-8: {error}"))?;
+    let inventory = parse_declaration_inventory_output(
+        inventory_status_success,
+        &inventory_result,
+        &inventory_stderr,
+    )?;
+    let declaration_subject_sha256 = crate::sha256::hex(&declaration_subject_json);
+    let inventory_request_sha256 = crate::sha256::hex(&inventory_request);
+    let inventory_result_sha256 = crate::sha256::hex(&inventory_result);
+    Ok(DeclarationModuleObservation {
+        schema: DECLARATION_OBSERVATION_SCHEMA,
+        observational: true,
+        authoritative: false,
+        expected_module_name: subject.candidate.module_name.clone(),
+        proof_environment_id: proof_environment_id.to_owned(),
+        proof_policy: proof_policy.to_owned(),
+        declaration_subject: subject.clone(),
+        declaration_subject_json,
+        declaration_subject_sha256,
+        proof_ready_bytes: proof_ready_before.bytes,
+        proof_ready_sha256_before: proof_ready_before.sha256,
+        proof_ready_sha256_after: proof_ready_after.sha256,
+        candidate_olean_sha256_before: candidate_before.sha256,
+        candidate_olean_sha256_after: candidate_after.sha256,
+        inventory_request,
+        inventory_request_sha256,
+        inventory_result,
+        inventory_result_sha256,
+        inventory,
+    })
+}
+
+/// Observe one explicit, freshly compiled temporary `.olean` under the same
+/// global proof-workload serialization as Lean and the ingress auditor. This
+/// dormant B1c helper only binds exact bytes and `readModuleData` inventory; it
+/// neither imports/replays the candidate nor makes any acceptance decision.
+/// No production verification, publication, cache-hit, or assurance path calls
+/// it in this tranche.
+#[allow(dead_code)]
+pub(crate) fn observe_declaration_module(
+    repo_root: &Path,
+    environment: &ProofEnvironment,
+    subject: &DeclarationAuditSubject,
+    expected_emitted: &Emitted,
+    candidate: &DeclarationCandidateOlean,
+) -> Result<DeclarationModuleObservation, String> {
+    validate_declaration_candidate_path(repo_root, candidate)?;
+    validate_declaration_observation_subject(
+        environment.id(),
+        environment.policy(),
+        subject,
+        expected_emitted,
+        candidate,
+    )?;
+    let request = declaration_inventory_request(candidate.path())?;
+
+    // `ensure_built` may itself acquire the non-reentrant process mutex on a
+    // cold build, so resolve the immutable build before entering this workload.
+    let built = environment.ensure_built(repo_root)?;
+    let ready = built.join("READY");
+    let inventory_executable = declaration_inventory_path(&built);
+    let lean_dir = built.join("lean");
+
+    let _process_lock = ProofProcessLock::acquire(repo_root)?;
+    environment.validate_built(&built)?;
+    validate_declaration_candidate_path(repo_root, candidate)?;
+    let proof_ready_before = observe_regular_file(&ready, "proof READY")?;
+    let candidate_before = observe_regular_file(
+        candidate.path(),
+        "declaration observation candidate `.olean`",
+    )?;
+    let inventory_metadata = std::fs::symlink_metadata(&inventory_executable).map_err(|error| {
+        format!(
+            "cannot inspect observational declaration inventory {}: {error}",
+            inventory_executable.display()
+        )
+    })?;
+    if inventory_metadata.file_type().is_symlink() || !inventory_metadata.is_file() {
+        return Err(format!(
+            "observational declaration inventory {} is not a regular file",
+            inventory_executable.display()
+        ));
+    }
+    require_serial_lake_version(&lean_dir)?;
+
+    let mut command = serial_declaration_inventory_command(&lean_dir, &inventory_executable);
+    let mut child = command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("failed to run observational declaration inventory: {error}"))?;
+    let write_result = child
+        .stdin
+        .take()
+        .ok_or_else(|| "declaration inventory stdin pipe is unavailable".to_owned())
+        .and_then(|mut stdin| {
+            stdin
+                .write_all(&request)
+                .map_err(|error| format!("cannot write declaration inventory request: {error}"))
+        });
+    if let Err(message) = write_result {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(message);
+    }
+    let output = child
+        .wait_with_output()
+        .map_err(|error| format!("cannot wait for observational declaration inventory: {error}"))?;
+
+    let candidate_after = observe_regular_file(
+        candidate.path(),
+        "declaration observation candidate `.olean`",
+    )?;
+    environment.validate_built(&built)?;
+    let proof_ready_after = observe_regular_file(&ready, "proof READY")?;
+    bind_declaration_observation(
+        environment.id(),
+        environment.policy(),
+        subject,
+        expected_emitted,
+        candidate,
+        proof_ready_before,
+        proof_ready_after,
+        candidate_before,
+        candidate_after,
+        request,
+        output.status.success(),
+        output.stdout,
+        output.stderr,
+    )
 }
 
 fn require_terminal_sentinel(emitted: &Emitted) -> Result<(), IngressAuditFailure> {
@@ -3788,6 +4325,22 @@ mod proof_build_tests {
         }
     }
 
+    fn exact_observed_file(bytes: &[u8]) -> ExactObservedFile {
+        ExactObservedFile {
+            bytes: bytes.to_vec(),
+            sha256: crate::sha256::hex(bytes),
+        }
+    }
+
+    fn empty_declaration_inventory_result() -> Vec<u8> {
+        concat!(
+            r#"{"constants":[],"extension_families":[],"extra_const_names":[],"imports":[],"is_module":false,"observational":true,"schema":"sable-declaration-inventory-result-v1"}"#,
+            "\n"
+        )
+        .as_bytes()
+        .to_vec()
+    }
+
     #[test]
     fn declaration_audit_subject_has_one_exact_ordered_serialization() {
         let subject = DeclarationAuditSubject::new(
@@ -3899,6 +4452,358 @@ mod proof_build_tests {
                 "different-proof-policy",
                 vec![dependency_a, dependency_b]
             )
+        );
+    }
+
+    #[test]
+    fn declaration_observation_candidate_path_is_scoped_unique_and_self_cleaning() {
+        let root = unique_directory(
+            &std::env::temp_dir(),
+            "sable-declaration-observation-path-test",
+        )
+        .expect("create isolated observation path tree");
+        let _cleanup = TempProofTree(root.clone());
+        std::fs::create_dir_all(modules_dir(&root)).expect("create generated-module directory");
+
+        let first = unique_declaration_candidate_olean(&root, "Root_module")
+            .expect("allocate first candidate capability");
+        let second = unique_declaration_candidate_olean(&root, "Root_module")
+            .expect("allocate second candidate capability");
+        assert_ne!(first.path(), second.path());
+        assert_eq!(first.path().parent(), Some(modules_dir(&root).as_path()));
+        assert!(first.path().is_absolute());
+        assert!(
+            first
+                .path()
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with(".Root_module.declaration-observation."))
+        );
+
+        let first_path = first.path().to_path_buf();
+        std::fs::write(&first_path, b"future temporary candidate")
+            .expect("write only the capability-owned candidate path");
+        drop(first);
+        assert!(
+            std::fs::symlink_metadata(&first_path).is_err(),
+            "dropping the capability removes its regular temporary candidate"
+        );
+
+        assert!(unique_declaration_candidate_olean(&root, "../escape").is_err());
+        assert!(unique_declaration_candidate_olean(Path::new("relative"), "Root_module").is_err());
+        drop(second);
+    }
+
+    #[test]
+    fn declaration_observation_binds_exact_subject_ready_candidate_and_transport() {
+        let root = unique_directory(
+            &std::env::temp_dir(),
+            "sable-declaration-observation-binding-test",
+        )
+        .expect("create isolated observation binding tree");
+        let _cleanup = TempProofTree(root.clone());
+        std::fs::create_dir_all(modules_dir(&root)).expect("create generated-module directory");
+        let candidate = unique_declaration_candidate_olean(&root, "Root_module")
+            .expect("allocate candidate capability");
+        let emitted = draft_with_source("import Sable\n\n").finish("Root_module");
+        let subject = DeclarationAuditSubject::new(
+            "proof-environment-exact",
+            "proof-policy-exact",
+            DeclarationModuleSubject::from_emitted("Root_module", &emitted),
+            vec![declaration_module_fixture(
+                "Dependency",
+                "dependency-source-sha256",
+            )],
+        );
+        let ready = b"sable-proof-ready-v3\nproof-environment:proof-environment-exact\n";
+        let candidate_bytes = b"exact candidate olean bytes";
+        let request = declaration_inventory_request(candidate.path())
+            .expect("candidate has one exact inventory request");
+        let result = empty_declaration_inventory_result();
+        let observation = bind_declaration_observation(
+            "proof-environment-exact",
+            "proof-policy-exact",
+            &subject,
+            &emitted,
+            &candidate,
+            exact_observed_file(ready),
+            exact_observed_file(ready),
+            exact_observed_file(candidate_bytes),
+            exact_observed_file(candidate_bytes),
+            request.clone(),
+            true,
+            result.clone(),
+            Vec::new(),
+        )
+        .expect("stable exact observational evidence binds");
+
+        assert!(observation.observational);
+        assert!(!observation.authoritative);
+        assert_eq!(observation.expected_module_name, "Root_module");
+        assert_eq!(observation.declaration_subject, subject);
+        assert_eq!(
+            observation.declaration_subject_sha256,
+            crate::sha256::hex(&subject.canonical_json())
+        );
+        assert_eq!(observation.proof_ready_bytes, ready);
+        assert_eq!(
+            observation.proof_ready_sha256_before,
+            observation.proof_ready_sha256_after
+        );
+        assert_eq!(
+            observation.candidate_olean_sha256_before,
+            observation.candidate_olean_sha256_after
+        );
+        assert_eq!(observation.inventory_request, request);
+        assert_eq!(observation.inventory_result, result);
+        assert!(observation.inventory.observational);
+        assert!(!observation.inventory.is_module);
+
+        let canonical = observation.canonical_json();
+        let parsed: serde_json::Value =
+            serde_json::from_slice(&canonical).expect("observation binding is exact JSON");
+        assert_eq!(parsed["schema"], DECLARATION_OBSERVATION_SCHEMA);
+        assert_eq!(parsed["observational"], true);
+        assert_eq!(parsed["authoritative"], false);
+        assert_eq!(parsed["expected_module_name"], "Root_module");
+        assert_eq!(
+            parsed["declaration_audit_subject"],
+            serde_json::from_slice::<serde_json::Value>(&subject.canonical_json())
+                .expect("subject is JSON")
+        );
+        assert_eq!(
+            parsed["proof_ready_utf8"],
+            std::str::from_utf8(ready).expect("fixture READY is UTF-8")
+        );
+        assert_eq!(
+            parsed["inventory_request_utf8"],
+            std::str::from_utf8(&request).expect("request is UTF-8")
+        );
+        assert_eq!(
+            parsed["inventory_result_utf8"],
+            std::str::from_utf8(&result).expect("result is UTF-8")
+        );
+        assert_eq!(observation.canonical_sha256().len(), 64);
+        assert!(
+            observation
+                .canonical_sha256()
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+        );
+    }
+
+    #[test]
+    fn declaration_observation_rejects_every_changed_binding_input() {
+        let root = unique_directory(
+            &std::env::temp_dir(),
+            "sable-declaration-observation-rejection-test",
+        )
+        .expect("create isolated observation rejection tree");
+        let _cleanup = TempProofTree(root.clone());
+        std::fs::create_dir_all(modules_dir(&root)).expect("create generated-module directory");
+        let candidate = unique_declaration_candidate_olean(&root, "Root_module")
+            .expect("allocate candidate capability");
+        let emitted = draft_with_source("import Sable\n\n").finish("Root_module");
+        let subject = DeclarationAuditSubject::new(
+            "proof-environment",
+            "proof-policy",
+            DeclarationModuleSubject::from_emitted("Root_module", &emitted),
+            Vec::new(),
+        );
+        let ready = b"exact READY bytes\n";
+        let candidate_bytes = b"exact candidate bytes";
+        let request = declaration_inventory_request(candidate.path()).expect("exact request");
+        let result = empty_declaration_inventory_result();
+        let bind = |subject: &DeclarationAuditSubject,
+                    emitted: &Emitted,
+                    ready_after: &[u8],
+                    candidate_after: &[u8],
+                    request: Vec<u8>,
+                    status_success: bool,
+                    result: Vec<u8>,
+                    stderr: Vec<u8>| {
+            bind_declaration_observation(
+                "proof-environment",
+                "proof-policy",
+                subject,
+                emitted,
+                &candidate,
+                exact_observed_file(ready),
+                exact_observed_file(ready_after),
+                exact_observed_file(candidate_bytes),
+                exact_observed_file(candidate_after),
+                request,
+                status_success,
+                result,
+                stderr,
+            )
+        };
+
+        let mut changed_envelope = subject.clone();
+        changed_envelope.candidate.declaration_envelope.roots.pop();
+        assert!(
+            bind(
+                &changed_envelope,
+                &emitted,
+                ready,
+                candidate_bytes,
+                request.clone(),
+                true,
+                result.clone(),
+                Vec::new(),
+            )
+            .is_err()
+        );
+        let changed_emitted =
+            draft_with_source("import Sable\n-- changed source\n\n").finish("Root_module");
+        assert!(
+            bind(
+                &subject,
+                &changed_emitted,
+                ready,
+                candidate_bytes,
+                request.clone(),
+                true,
+                result.clone(),
+                Vec::new(),
+            )
+            .is_err()
+        );
+        assert!(
+            bind_declaration_observation(
+                "different-proof-environment",
+                "proof-policy",
+                &subject,
+                &emitted,
+                &candidate,
+                exact_observed_file(ready),
+                exact_observed_file(ready),
+                exact_observed_file(candidate_bytes),
+                exact_observed_file(candidate_bytes),
+                request.clone(),
+                true,
+                result.clone(),
+                Vec::new(),
+            )
+            .is_err()
+        );
+        assert!(
+            bind_declaration_observation(
+                "proof-environment",
+                "different-proof-policy",
+                &subject,
+                &emitted,
+                &candidate,
+                exact_observed_file(ready),
+                exact_observed_file(ready),
+                exact_observed_file(candidate_bytes),
+                exact_observed_file(candidate_bytes),
+                request.clone(),
+                true,
+                result.clone(),
+                Vec::new(),
+            )
+            .is_err()
+        );
+        let mut forged_digest = exact_observed_file(candidate_bytes);
+        forged_digest.sha256 = crate::sha256::hex(b"different bytes");
+        assert!(
+            bind_declaration_observation(
+                "proof-environment",
+                "proof-policy",
+                &subject,
+                &emitted,
+                &candidate,
+                exact_observed_file(ready),
+                exact_observed_file(ready),
+                forged_digest.clone(),
+                forged_digest,
+                request.clone(),
+                true,
+                result.clone(),
+                Vec::new(),
+            )
+            .is_err()
+        );
+        assert!(
+            bind(
+                &subject,
+                &emitted,
+                b"changed READY bytes\n",
+                candidate_bytes,
+                request.clone(),
+                true,
+                result.clone(),
+                Vec::new(),
+            )
+            .is_err()
+        );
+        assert!(
+            bind(
+                &subject,
+                &emitted,
+                ready,
+                b"changed candidate bytes",
+                request.clone(),
+                true,
+                result.clone(),
+                Vec::new(),
+            )
+            .is_err()
+        );
+        let mut changed_request = request.clone();
+        changed_request.push(b' ');
+        assert!(
+            bind(
+                &subject,
+                &emitted,
+                ready,
+                candidate_bytes,
+                changed_request,
+                true,
+                result.clone(),
+                Vec::new(),
+            )
+            .is_err()
+        );
+        assert!(
+            bind(
+                &subject,
+                &emitted,
+                ready,
+                candidate_bytes,
+                request.clone(),
+                false,
+                result.clone(),
+                Vec::new(),
+            )
+            .is_err()
+        );
+        assert!(
+            bind(
+                &subject,
+                &emitted,
+                ready,
+                candidate_bytes,
+                request.clone(),
+                true,
+                result.clone(),
+                b"warning\n".to_vec(),
+            )
+            .is_err()
+        );
+        assert!(
+            bind(
+                &subject,
+                &emitted,
+                ready,
+                candidate_bytes,
+                request,
+                true,
+                b"{}\n".to_vec(),
+                Vec::new(),
+            )
+            .is_err()
         );
     }
 
