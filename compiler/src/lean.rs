@@ -655,20 +655,7 @@ impl ProofEnvironment {
         write_proof_files(&built, &self.files)?;
         self.validate_snapshot(&built, "unbuilt proof workspace")?;
 
-        let lean_dir = built.join("lean");
-        let build = Command::new("lake")
-            .args(["-Kjobs=1", "build"])
-            .current_dir(&lean_dir)
-            .output()
-            .map_err(|error| format!("failed to run `lake -Kjobs=1 build`: {error}"))?;
-        if !build.status.success() {
-            return Err(format!(
-                "`lake -Kjobs=1 build` failed in {}:\n{}{}",
-                lean_dir.display(),
-                String::from_utf8_lossy(&build.stdout),
-                String::from_utf8_lossy(&build.stderr),
-            ));
-        }
+        build_proof_environment_serial(&built, &self.files)?;
         self.validate_snapshot(&built, "completed proof build")?;
         require_sable_olean(&built)?;
         publish_ready(&built, &ready, &self.id)?;
@@ -715,6 +702,104 @@ impl ProofEnvironment {
             ))
         }
     }
+}
+
+const SERIAL_LAKE_TOOLCHAIN: &str = "leanprover/lean4:v4.32.2";
+const SERIAL_LAKE_VERSION: &str = "Lake version 5.0.0-src+f3b06c7 (Lean version 4.32.2)";
+
+/// Build the captured local Lean library with Lake's asynchronous jobs forced
+/// inline by the audited Lean 4.32 runtime. An absent task manager is the only
+/// hard scheduler bound: positive worker counts may be exceeded to avoid
+/// deadlock. The one explicit package target therefore owns at most one Lean
+/// compiler child at a time.
+fn build_proof_environment_serial(
+    built: &Path,
+    files: &BTreeMap<String, Vec<u8>>,
+) -> Result<(), String> {
+    require_serial_lake_toolchain(files)?;
+    let lean_dir = built.join("lean");
+    require_serial_lake_version(&lean_dir)?;
+    let output = serial_lake_build_command(&lean_dir)
+        .output()
+        .map_err(|error| format!("failed to run serial Lake proof build: {error}"))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "serial Lake proof build failed with {} in {}:\n{}{}",
+            output.status,
+            lean_dir.display(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        ))
+    }
+}
+
+/// PATH and elan command resolution remain part of the trusted host boundary.
+/// Requiring the exact audited version before building fails closed when PATH
+/// accidentally selects a direct or otherwise different Lake installation.
+fn require_serial_lake_version(lean_dir: &Path) -> Result<(), String> {
+    let output = serial_lake_version_command(lean_dir)
+        .output()
+        .map_err(|error| format!("failed to identify Lake for serial proof build: {error}"))?;
+    validate_serial_lake_version(output.status.success(), &output.stdout, &output.stderr)
+}
+
+fn validate_serial_lake_version(
+    status_success: bool,
+    stdout: &[u8],
+    stderr: &[u8],
+) -> Result<(), String> {
+    let version_bytes = SERIAL_LAKE_VERSION.as_bytes();
+    let exact_stdout = stdout == version_bytes
+        || stdout.strip_suffix(b"\n") == Some(version_bytes)
+        || stdout.strip_suffix(b"\r\n") == Some(version_bytes);
+    if status_success && exact_stdout && stderr.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "serial proof build requires exact `{SERIAL_LAKE_VERSION}` from `lake --version` with no stderr; status_success={status_success}, stdout={:?}, stderr={:?}",
+            String::from_utf8_lossy(stdout),
+            String::from_utf8_lossy(stderr),
+        ))
+    }
+}
+
+fn require_serial_lake_toolchain(files: &BTreeMap<String, Vec<u8>>) -> Result<(), String> {
+    let Some(bytes) = files.get("lean/lean-toolchain") else {
+        return Err("serial proof build requires captured `lean/lean-toolchain` bytes".into());
+    };
+    let actual = std::str::from_utf8(bytes)
+        .map_err(|error| format!("captured `lean/lean-toolchain` is not UTF-8: {error}"))?;
+    let actual = actual
+        .strip_suffix("\r\n")
+        .or_else(|| actual.strip_suffix('\n'))
+        .unwrap_or(actual);
+    if actual == SERIAL_LAKE_TOOLCHAIN {
+        Ok(())
+    } else {
+        Err(format!(
+            "serial proof build has not been audited for captured toolchain `{actual}`; expected `{SERIAL_LAKE_TOOLCHAIN}`"
+        ))
+    }
+}
+
+fn serial_lake_command(lean_dir: &Path) -> Command {
+    let mut command = Command::new("lake");
+    command.env("LEAN_NUM_THREADS", "0").current_dir(lean_dir);
+    command
+}
+
+fn serial_lake_version_command(lean_dir: &Path) -> Command {
+    let mut command = serial_lake_command(lean_dir);
+    command.arg("--version");
+    command
+}
+
+fn serial_lake_build_command(lean_dir: &Path) -> Command {
+    let mut command = serial_lake_command(lean_dir);
+    command.args(["--quiet", "build", "Sable"]);
+    command
 }
 
 fn publish_ready(built: &Path, ready: &Path, id: &str) -> Result<(), String> {
@@ -1394,4 +1479,117 @@ pub fn dedup_by_name(diags: Vec<Diagnostic>) -> Vec<Diagnostic> {
         .into_iter()
         .filter(|d| seen.insert((d.name.clone(), d.span.start)))
         .collect()
+}
+
+#[cfg(test)]
+mod proof_build_tests {
+    use super::*;
+    use std::ffi::OsStr;
+
+    fn assert_serial_lake_command_base(command: &Command, lean_dir: &Path) {
+        assert_eq!(command.get_program(), OsStr::new("lake"));
+        assert_eq!(command.get_current_dir(), Some(lean_dir));
+        assert_eq!(
+            command.get_envs().collect::<Vec<_>>(),
+            [(OsStr::new("LEAN_NUM_THREADS"), Some(OsStr::new("0")))]
+        );
+    }
+
+    #[test]
+    fn serial_lake_commands_pin_one_environment_and_one_explicit_target() {
+        let lean_dir = Path::new("proof-environment/lean");
+        let version = serial_lake_version_command(lean_dir);
+        assert_serial_lake_command_base(&version, lean_dir);
+        assert_eq!(
+            version.get_args().collect::<Vec<_>>(),
+            ["--version"].iter().map(OsStr::new).collect::<Vec<_>>()
+        );
+
+        let build = serial_lake_build_command(lean_dir);
+        assert_serial_lake_command_base(&build, lean_dir);
+        assert_eq!(
+            build.get_args().collect::<Vec<_>>(),
+            ["--quiet", "build", "Sable"]
+                .iter()
+                .map(OsStr::new)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn serial_lake_version_parser_authenticates_one_exact_clean_line() {
+        for stdout in [
+            SERIAL_LAKE_VERSION.as_bytes().to_vec(),
+            format!("{SERIAL_LAKE_VERSION}\n").into_bytes(),
+            format!("{SERIAL_LAKE_VERSION}\r\n").into_bytes(),
+        ] {
+            validate_serial_lake_version(true, &stdout, b"")
+                .expect("the exact audited Lake and Lean version must pass");
+        }
+
+        for (status_success, stdout, stderr) in [
+            (false, SERIAL_LAKE_VERSION.as_bytes(), b"".as_slice()),
+            (
+                true,
+                b"Lake version 5.0.0-src+other (Lean version 4.32.2)".as_slice(),
+                b"".as_slice(),
+            ),
+            (
+                true,
+                b"Lake version 5.0.0-src+f3b06c7 (Lean version 4.33.0)".as_slice(),
+                b"".as_slice(),
+            ),
+            (
+                true,
+                SERIAL_LAKE_VERSION.as_bytes(),
+                b"unexpected warning\n".as_slice(),
+            ),
+        ] {
+            assert!(
+                validate_serial_lake_version(status_success, stdout, stderr).is_err(),
+                "status, stdout, and stderr must all match the audited preflight"
+            );
+        }
+
+        let extra_line = format!("{SERIAL_LAKE_VERSION}\nextra\n");
+        assert!(validate_serial_lake_version(true, extra_line.as_bytes(), b"").is_err());
+    }
+
+    #[test]
+    fn serial_lake_scheduler_fails_closed_outside_the_audited_toolchain() {
+        for bytes in [
+            b"leanprover/lean4:v4.32.2".as_slice(),
+            b"leanprover/lean4:v4.32.2\n".as_slice(),
+            b"leanprover/lean4:v4.32.2\r\n".as_slice(),
+        ] {
+            let files = BTreeMap::from([("lean/lean-toolchain".into(), bytes.to_vec())]);
+            require_serial_lake_toolchain(&files)
+                .expect("the pinned Lean 4.32.2 runtime has audited zero-worker semantics");
+        }
+
+        let wrong = BTreeMap::from([(
+            "lean/lean-toolchain".into(),
+            b"leanprover/lean4:v4.33.0\n".to_vec(),
+        )]);
+        assert!(
+            require_serial_lake_toolchain(&wrong)
+                .expect_err("an unaudited runtime must fail before Lake starts")
+                .contains("has not been audited")
+        );
+        assert!(
+            require_serial_lake_toolchain(&BTreeMap::new())
+                .expect_err("missing toolchain bytes must fail before Lake starts")
+                .contains("requires captured")
+        );
+    }
+
+    #[test]
+    fn obsolete_package_configuration_override_cannot_return() {
+        let source = include_str!("lean.rs");
+        let obsolete_argument = ["-K", "jobs", "=", "1"].concat();
+        assert!(
+            !source.contains(&obsolete_argument),
+            "a package configuration override is not a Lake scheduler bound"
+        );
+    }
 }

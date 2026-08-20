@@ -133,9 +133,12 @@ emit (compiler/src/lean.rs)           one Lean theorem per obligation, plus fixe
 check                                 capture one immutable ProofEnvironment before
   ▼                                   VC/profile work; publish its exact Lean source
   │                                   under .sable-out/proof-envs/<id>/source and
-  │                                   build once, under a per-id lock and one Lake
-  │                                   job, at the stable .../<id>/built path; READY
-  │                                   is written last and is never rebuilt;
+  │                                   build once, under a per-id lock, with the audited
+  │                                   Lean runtime task manager disabled so one explicit
+  │                                   Lake target owns at most one compiler child;
+  │                                   PATH/elan resolution remains trusted, while an exact
+  │                                   Lake/Lean version preflight rejects accidental drift;
+  │                                   READY is written last and is never rebuilt;
   │                                   batch Lean checks the exact generated text
   │                                   against that build + .sable-out/modules;
   │                                   the daemon receives the same text and id,
