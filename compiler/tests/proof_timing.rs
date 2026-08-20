@@ -615,7 +615,6 @@ fn relevant_environment() -> Result<Value, String> {
         "LEAN_SYSROOT",
         "RUSTFLAGS",
         "SABLE_GRIND_HEARTBEATS",
-        "SABLE_LEAN_JOBS",
         "SABLE_TEST_JOBS",
     ] {
         values.insert(
@@ -1199,7 +1198,6 @@ fn record_verifying_corpus_proof_times() {
     require_environment("LEAN_IMPORT_WORKERS", "1");
     require_environment("LEAN_NUM_THREADS", "0");
     require_environment("SABLE_TEST_JOBS", "1");
-    require_environment("SABLE_LEAN_JOBS", "1");
 
     let root = repo_root();
     let cache_mode = std::env::var("SABLE_PROOF_TIMING_CACHE_MODE")
@@ -1721,7 +1719,7 @@ fn record_verifying_corpus_proof_times() {
             "external_lean_process_concurrency": 1,
             "lean_task_manager": "disabled by required LEAN_NUM_THREADS=0 inherited by direct run_lean",
             "lean_import_workers": "exactly one by required LEAN_IMPORT_WORKERS=1 inherited by direct run_lean",
-            "orchestration_conventions": "SABLE_TEST_JOBS=1 and SABLE_LEAN_JOBS=1 are pinned for surrounding orchestration; direct run_lean does not consume them",
+            "orchestration_conventions": "SABLE_TEST_JOBS=1 pins the supported outer verification pool; the serial timing loop does not consume it",
             "expected_measured_subjects": EXPECTED_MEASURED_SUBJECTS,
             "expected_excluded_subjects": EXPECTED_EXCLUDED_SUBJECTS,
             "escape_hatch_policy": "every measured subject must have zero warnings, defers, and assumes",

@@ -86,7 +86,7 @@ pub fn inspect(start: &Path) -> Report {
         Check {
             status: CheckStatus::Warning,
             name: "prelude",
-            detail: "not built; run `cd lean && lake build` before the first check".into(),
+            detail: "not built; run `(cd lean && LEAN_NUM_THREADS=0 LEAN_IMPORT_WORKERS=1 lake --quiet build Sable)` before the first check".into(),
         }
     });
 

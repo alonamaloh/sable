@@ -14,21 +14,37 @@ use std::thread;
 // abort in this parallel harness even though the same check succeeds directly.
 // Keep the corpus workers at an explicit, CLI-comparable budget.
 const CORPUS_WORKER_STACK: usize = 16 * 1024 * 1024;
+const MAX_CORPUS_WORKERS: usize = 2;
+
+fn corpus_worker_count(configured: Option<&str>, available: usize) -> Result<usize, String> {
+    match configured {
+        Some(raw) => {
+            let workers = raw.parse::<usize>().map_err(|_| {
+                format!(
+                    "SABLE_TEST_JOBS must be an integer from 1 through {MAX_CORPUS_WORKERS}, got `{raw}`"
+                )
+            })?;
+            if (1..=MAX_CORPUS_WORKERS).contains(&workers) {
+                Ok(workers)
+            } else {
+                Err(format!(
+                    "SABLE_TEST_JOBS must be from 1 through {MAX_CORPUS_WORKERS}, got `{raw}`"
+                ))
+            }
+        }
+        None => Ok(available.max(1).min(MAX_CORPUS_WORKERS)),
+    }
+}
 
 /// Run `work` over `items` on a small thread pool; collect the failure
 /// strings. The Lean checks dominate wall clock and the files are
-/// independent, so this is a near-linear speedup.
+/// independent, so two workers are useful without permitting machine-sized
+/// proof-process fan-out.
 fn parallel<T: Send>(items: Vec<T>, work: impl Fn(&T) -> Vec<String> + Sync) -> Vec<String> {
-    let n = std::env::var("SABLE_TEST_JOBS")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        .filter(|n| *n > 0)
-        .unwrap_or_else(|| {
-            thread::available_parallelism()
-                .map(|p| p.get())
-                .unwrap_or(4)
-                .min(8)
-        });
+    let configured = std::env::var("SABLE_TEST_JOBS").ok();
+    let available = thread::available_parallelism().map_or(1, |parallelism| parallelism.get());
+    let n = corpus_worker_count(configured.as_deref(), available)
+        .unwrap_or_else(|error| panic!("{error}"));
     let items = Mutex::new(items.into_iter());
     let failures = Mutex::new(Vec::new());
     thread::scope(|s| {
@@ -49,6 +65,20 @@ fn parallel<T: Send>(items: Vec<T>, work: impl Fn(&T) -> Vec<String> + Sync) -> 
         }
     });
     failures.into_inner().unwrap()
+}
+
+#[test]
+fn corpus_worker_count_is_bounded_and_fails_closed() {
+    assert_eq!(corpus_worker_count(None, 1), Ok(1));
+    assert_eq!(corpus_worker_count(None, 64), Ok(2));
+    assert_eq!(corpus_worker_count(Some("1"), 64), Ok(1));
+    assert_eq!(corpus_worker_count(Some("2"), 1), Ok(2));
+    for invalid in ["", "0", "3", "16", "many"] {
+        assert!(
+            corpus_worker_count(Some(invalid), 64).is_err(),
+            "`{invalid}` must not enable unbounded corpus workers"
+        );
+    }
 }
 
 fn corpus_dir(sub: &str) -> PathBuf {

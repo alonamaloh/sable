@@ -32,11 +32,13 @@ python3 tools/soundness_mutations/runner.py --workers 2 \
   --report /tmp/sable-mutations.json
 ```
 
-Workers are deliberately bounded to 1–4. The defaults are two workers, a
+Workers are deliberately bounded to 1–2. The defaults are two workers, a
 five-minute compile timeout, and a three-minute timeout for each oracle. Use
 `--compile-timeout` and `--timeout` to adjust those limits. `--revision`
 accepts any commit-ish; `--limit N` is useful for a smoke run. Progress goes to
 stderr. The report is JSON on stdout unless `--report` is supplied.
+Each worker forces `LEAN_NUM_THREADS=0` and `LEAN_IMPORT_WORKERS=1`, so the two
+outer checks cannot multiply into hardware-sized Lean task or import pools.
 
 ## Result meanings
 

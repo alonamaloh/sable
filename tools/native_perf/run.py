@@ -23,6 +23,7 @@ from typing import Any
 
 
 ROOT = Path(__file__).resolve().parents[2]
+DAEMON_SOCKET = ROOT / ".sable-out" / "daemon.sock"
 DEFAULT_MANIFEST = Path(__file__).with_name("workloads.json")
 DEFAULT_CLOSURE = Path(__file__).with_name("closure.json")
 SCHEMA_VERSION = 2
@@ -94,6 +95,37 @@ def load_object(path: Path) -> dict[str, Any]:
     return loaded
 
 
+def bounded_child_env(ambient: dict[str, str] | None = None) -> dict[str, str]:
+    env = dict(os.environ if ambient is None else ambient)
+    env.update(
+        {
+            "CARGO_BUILD_JOBS": "1",
+            "CARGO_INCREMENTAL": "0",
+            "LEAN_IMPORT_WORKERS": "1",
+            "LEAN_NUM_THREADS": "0",
+        }
+    )
+    return env
+
+
+def path_entry_exists(path: Path) -> bool:
+    try:
+        path.lstat()
+        return True
+    except FileNotFoundError:
+        return False
+    except OSError as error:
+        raise HarnessError(f"cannot inspect path entry {path}: {error}") from error
+
+
+def require_no_daemon_socket(stage: str) -> None:
+    if path_entry_exists(DAEMON_SOCKET):
+        raise HarnessError(
+            f"{stage}: daemon socket entry exists at {DAEMON_SOCKET}; "
+            "stop the daemon and remove the entry so verification uses bounded batch Lean"
+        )
+
+
 def command(
     arguments: list[str], timeout: int, *, check: bool = False
 ) -> subprocess.CompletedProcess[str]:
@@ -101,6 +133,7 @@ def command(
         result = subprocess.run(
             arguments,
             cwd=ROOT,
+            env=bounded_child_env(),
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -521,6 +554,7 @@ def main() -> int:
     try:
         if not args.machine_label.strip():
             raise HarnessError("--machine-label must not be empty")
+        require_no_daemon_socket("native performance preflight")
         manifest_path = args.manifest.resolve()
         closure_path = args.closure.resolve()
         manifest = load_object(manifest_path)
@@ -599,6 +633,8 @@ def main() -> int:
                     "build",
                     "--release",
                     "--locked",
+                    "--jobs",
+                    "1",
                     "--manifest-path",
                     str(ROOT / "compiler" / "Cargo.toml"),
                 ],
@@ -687,6 +723,14 @@ def main() -> int:
                 "samples": args.samples,
                 "clock": "time.perf_counter_ns",
                 "process_model": "one process per sample; each process performs manifest work_units",
+                "preparation_concurrency": {
+                    "cargo_build_jobs": 1,
+                    "cargo_incremental": False,
+                    "sable_verification_processes": 1,
+                    "lean_num_threads": "0 (runner-forced)",
+                    "lean_import_workers": "1 (runner-forced)",
+                    "daemon": "forbidden by symlink-aware preflight and postflight",
+                },
                 "order": "alternating C/Sable first for admitted pairs",
                 "anti_trivialization_gate": (
                     "named optimized-LLVM structural profiles; rejects known constant "
@@ -1028,6 +1072,7 @@ def main() -> int:
                 item["comparison_status"] = "comparable_admitted_pair"
                 report["workloads"].append(item)
 
+        require_no_daemon_socket("native performance postflight")
         end_revision = first_line(["git", "rev-parse", "HEAD"], args.timeout_seconds)
         end_git_status = command(
             ["git", "status", "--porcelain=v1"], args.timeout_seconds, check=True

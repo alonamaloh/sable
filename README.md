@@ -75,8 +75,11 @@ requires Clang.
 
 ```sh
 # from the repository root
-(cd lean && lake build)
-cargo build --locked --release --manifest-path compiler/Cargo.toml
+export LEAN_NUM_THREADS=0 LEAN_IMPORT_WORKERS=1
+test ! -e .sable-out/daemon.sock && test ! -L .sable-out/daemon.sock
+(cd lean && lake --quiet build Sable)
+CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 \
+  cargo build --locked --release -j1 --manifest-path compiler/Cargo.toml
 compiler/target/release/sable doctor
 
 compiler/target/release/sable check corpus/verifies/div_round_up.sable
@@ -84,6 +87,10 @@ compiler/target/release/sable test -M corpus/verifies corpus/tests/test_arith.sa
 compiler/target/release/sable explain-type 'option<[bool]>'
 compiler/target/release/sable daemon   # optional warm checker, ~10x faster checks
 ```
+
+The exported Lean settings disable the hardware-sized task pool and keep import
+work to one worker. Supported test commands additionally use one Cargo job, one
+Rust test thread, and at most two explicit outer verification workers.
 
 `sable doctor` checks the checkout, Cargo, Lake, the exact version named by
 `lean/lean-toolchain`, the built prelude, hosted runtime, and Clang. Missing or

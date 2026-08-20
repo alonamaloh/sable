@@ -26,6 +26,7 @@ to flip between passing at 2000 and exceeding the full 50000 across
 runs. Deleting such a discharge makes the corpus flaky.
 
 Usage: discharge-audit.py <sable-binary> [-j N] [--json FILE]
+N is one or two; each worker may own one bounded Lean process.
 Read-only with respect to the checkout; needs a clean-enough repo for
 `git worktree add` of HEAD, and measures HEAD, not the working tree.
 """
@@ -45,6 +46,18 @@ CLAUSE_KEYWORDS = {
     "pre", "post", "invariant", "variant", "assert", "defer", "assume",
     "def", "spec", "requires", "theorem", "discharge", "use", "lemma",
 }
+
+
+def bounded_jobs(raw):
+    try:
+        jobs = int(raw)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(
+            "must be an integer from 1 through 2"
+        ) from error
+    if not 1 <= jobs <= 2:
+        raise argparse.ArgumentTypeError("must be from 1 through 2")
+    return jobs
 
 
 def repo_root():
@@ -115,9 +128,11 @@ class Audit:
     def check(self, fn, budget):
         env = dict(os.environ)
         env.pop("SABLE_GRIND_HEARTBEATS", None)
-        # each Lean process runs its own elaborator thread pool sized to
-        # the machine; uncapped, N parallel checks oversubscribe it N-fold
-        env.setdefault("LEAN_NUM_THREADS", "2")
+        # Each outer worker may own one Lean process. Disable Lean's task
+        # manager and keep import work single-worker so two audit workers do
+        # not multiply into hardware-sized inner pools.
+        env["LEAN_NUM_THREADS"] = "0"
+        env["LEAN_IMPORT_WORKERS"] = "1"
         if budget is not None:
             env["SABLE_GRIND_HEARTBEATS"] = str(budget)
         p = subprocess.run(
@@ -208,7 +223,14 @@ class Audit:
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("binary", help="path to the sable binary")
-    ap.add_argument("-j", "--jobs", type=int, default=4)
+    ap.add_argument(
+        "-j",
+        "--jobs",
+        type=bounded_jobs,
+        default=2,
+        metavar="{1,2}",
+        help="bounded concurrent Sable/Lean checks (default: 2)",
+    )
     ap.add_argument("--json", help="also write full results to this file")
     args = ap.parse_args()
 

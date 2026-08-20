@@ -32,6 +32,8 @@ fn read_message(reader: &mut impl BufRead) -> serde_json::Value {
 fn lsp_diagnostics_hover_and_tokens() {
     let mut child = Command::new(env!("CARGO_BIN_EXE_sable"))
         .arg("lsp")
+        .env("LEAN_NUM_THREADS", "0")
+        .env("LEAN_IMPORT_WORKERS", "1")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()

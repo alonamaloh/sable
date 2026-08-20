@@ -11,6 +11,7 @@
 
 use sable::{Options, load_checked};
 use std::collections::HashMap;
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -21,6 +22,61 @@ const FUEL: u64 = 1_000_000;
 
 fn repo_root() -> &'static Path {
     Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap()
+}
+
+fn bounded_lake_command(lean_dir: &Path) -> Command {
+    let mut command = Command::new("lake");
+    command
+        .env("LEAN_NUM_THREADS", "0")
+        .env("LEAN_IMPORT_WORKERS", "1")
+        .current_dir(lean_dir);
+    command
+}
+
+fn prelude_build_command(lean_dir: &Path) -> Command {
+    let mut command = bounded_lake_command(lean_dir);
+    command.args(["--quiet", "build", "Sable"]);
+    command
+}
+
+fn svm_driver_command(lean_dir: &Path, driver_path: &Path) -> Command {
+    let mut command = bounded_lake_command(lean_dir);
+    command.args(["env", "lean"]).arg(driver_path);
+    command
+}
+
+fn assert_bounded_lake_command(command: &Command, lean_dir: &Path) {
+    assert_eq!(command.get_program(), OsStr::new("lake"));
+    assert_eq!(command.get_current_dir(), Some(lean_dir));
+    let envs = command.get_envs().collect::<Vec<_>>();
+    assert!(envs.contains(&(OsStr::new("LEAN_NUM_THREADS"), Some(OsStr::new("0")))));
+    assert!(envs.contains(&(OsStr::new("LEAN_IMPORT_WORKERS"), Some(OsStr::new("1")))));
+}
+
+#[test]
+fn svm_lake_commands_pin_the_audited_scheduler_and_exact_target() {
+    let lean_dir = Path::new("proof-environment/lean");
+    let build = prelude_build_command(lean_dir);
+    assert_bounded_lake_command(&build, lean_dir);
+    assert_eq!(
+        build.get_args().collect::<Vec<_>>(),
+        ["--quiet", "build", "Sable"]
+            .iter()
+            .map(OsStr::new)
+            .collect::<Vec<_>>()
+    );
+
+    let driver_path = Path::new("generated/svm_driver.lean");
+    let driver = svm_driver_command(lean_dir, driver_path);
+    assert_bounded_lake_command(&driver, lean_dir);
+    assert_eq!(
+        driver.get_args().collect::<Vec<_>>(),
+        [
+            OsStr::new("env"),
+            OsStr::new("lean"),
+            driver_path.as_os_str()
+        ]
+    );
 }
 
 #[test]
@@ -96,11 +152,7 @@ fn svm_differential() {
     std::fs::write(&driver_path, &driver).unwrap();
 
     let lean_dir = repo_root().join("lean");
-    let lean_jobs = std::env::var("SABLE_LEAN_JOBS").unwrap_or_else(|_| "1".into());
-    let build = Command::new("lake")
-        .arg(format!("-Kjobs={lean_jobs}"))
-        .arg("build")
-        .current_dir(&lean_dir)
+    let build = prelude_build_command(&lean_dir)
         .output()
         .expect("failed to run `lake build`");
     assert!(
@@ -109,10 +161,7 @@ fn svm_differential() {
         String::from_utf8_lossy(&build.stdout),
         String::from_utf8_lossy(&build.stderr)
     );
-    let out = Command::new("lake")
-        .args(["env", "lean"])
-        .arg(&driver_path)
-        .current_dir(&lean_dir)
+    let out = svm_driver_command(&lean_dir, &driver_path)
         .output()
         .expect("failed to run `lake env lean`");
     let stdout = String::from_utf8_lossy(&out.stdout);

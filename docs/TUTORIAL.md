@@ -1,7 +1,10 @@
 # A tour of Sable
 
-Every code block below is checked by `cargo test --test docs`, so if the
-language moves and this page goes stale, CI says so.
+Every code block below is checked by the serialized
+`CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 LEAN_NUM_THREADS=0
+LEAN_IMPORT_WORKERS=1 SABLE_TEST_JOBS=1 cargo test --locked -j1 --test docs --
+--test-threads=1`,
+so if the language moves and this page goes stale, CI says so.
 
 Sable is one file holding two languages. Ordinary lines are a C-flavored
 program language. Lines beginning with `///` are Lean 4, and they say what the
@@ -9,7 +12,9 @@ program *means*. `sable check` compiles the program and proves the claims; a
 program that does not verify does not build.
 
 ```sh
-compiler/target/debug/sable check hello.sable
+test ! -e .sable-out/daemon.sock && test ! -L .sable-out/daemon.sock
+LEAN_NUM_THREADS=0 LEAN_IMPORT_WORKERS=1 \
+  compiler/target/debug/sable check hello.sable
 ```
 
 ## 1. A function and its contract
@@ -348,7 +353,7 @@ pub fn perimeter(u64 w, u64 h) -> u64 {
 ```
 
 ```sable
-// main.sable — checked with: sable check -M . main.sable
+// main.sable — checked with bounded Lean: LEAN_NUM_THREADS=0 LEAN_IMPORT_WORKERS=1 sable check -M . main.sable
 use geometry;
 
 /// post result = 14

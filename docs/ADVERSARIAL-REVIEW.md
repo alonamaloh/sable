@@ -111,6 +111,12 @@ from a current must-fail file alone.
 
 Run from the repository root. Install the stable Rust toolchain, `elan`, the
 pinned toolchain in `lean/lean-toolchain`, and Clang for native tests.
+Before any evidence command, require the batch path with a symlink-aware daemon
+socket check:
+
+```sh
+test ! -e .sable-out/daemon.sock && test ! -L .sable-out/daemon.sock
+```
 
 Build the complete Lean prelude and formal machine definitions:
 
@@ -121,8 +127,9 @@ Build the complete Lean prelude and formal machine definitions:
 Run the pairwise ownership interaction oracles:
 
 ```sh
-SABLE_TEST_JOBS=1 SABLE_LEAN_JOBS=1 \
-  cargo test --locked --manifest-path compiler/Cargo.toml \
+CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 LEAN_NUM_THREADS=0 \
+LEAN_IMPORT_WORKERS=1 SABLE_TEST_JOBS=1 \
+  cargo test --locked -j1 --manifest-path compiler/Cargo.toml \
   --test ownership_adversarial -- --test-threads=1
 ```
 
@@ -148,16 +155,18 @@ the manifest is curated and has no whole-compiler mutation score. See the
 Run the complete positive, must-fail, dynamic, and dynamic-fail corpus:
 
 ```sh
-SABLE_TEST_JOBS=1 SABLE_LEAN_JOBS=1 \
-  cargo test --locked --manifest-path compiler/Cargo.toml \
+CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 LEAN_NUM_THREADS=0 \
+LEAN_IMPORT_WORKERS=1 SABLE_TEST_JOBS=1 \
+  cargo test --locked -j1 --manifest-path compiler/Cargo.toml \
   --test corpus -- --test-threads=1
 ```
 
 Run the Rust-interpreter versus Lean-SVM differential:
 
 ```sh
-SABLE_LEAN_JOBS=1 \
-  cargo test --locked --manifest-path compiler/Cargo.toml \
+CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 LEAN_NUM_THREADS=0 \
+LEAN_IMPORT_WORKERS=1 \
+  cargo test --locked -j1 --manifest-path compiler/Cargo.toml \
   --test svm_diff -- --test-threads=1
 ```
 
@@ -165,8 +174,9 @@ Run the required interpreter versus Clang `-O0`/`-O2` native gates, including
 generated cases and CLI/ABI/trap checks:
 
 ```sh
-SABLE_REQUIRE_CLANG=1 SABLE_TEST_JOBS=1 SABLE_LEAN_JOBS=1 \
-  cargo test --locked --manifest-path compiler/Cargo.toml \
+CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 LEAN_NUM_THREADS=0 \
+LEAN_IMPORT_WORKERS=1 SABLE_REQUIRE_CLANG=1 SABLE_TEST_JOBS=1 \
+  cargo test --locked -j1 --manifest-path compiler/Cargo.toml \
   --test llvm_diff --test llvm_generated_diff --test llvm_cli \
   -- --test-threads=1
 ```
@@ -189,7 +199,8 @@ experiment is labeled `smoke_custom`, never `baseline`.
 When filing an issue or proposing a regression patch, include:
 
 1. the full base commit, `git status --short`, platform, `rustc --version`,
-   `clang --version` when relevant, and `(cd lean && lake env lean --version)`;
+   `clang --version` when relevant, and
+   `(cd lean && LEAN_NUM_THREADS=0 LEAN_IMPORT_WORKERS=1 lake env lean --version)`;
 2. one minimized `.sable` witness and the exact command used;
 3. the expected and actual diagnostic, proof result, interpreter result, and
    native result—distinguish “accepted invalid” from “Lean accepted a false

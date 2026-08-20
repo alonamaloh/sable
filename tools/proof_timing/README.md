@@ -51,8 +51,8 @@ but are not itemized by these root-subject metrics.
 Both modes require the test executable's authenticated Cargo output-profile
 identity to be exactly `release`, plus `CARGO_BUILD_JOBS=1`,
 `CARGO_INCREMENTAL=0`,
-`LEAN_NUM_THREADS=0`, `LEAN_IMPORT_WORKERS=1`, `SABLE_TEST_JOBS=1`, and
-`SABLE_LEAN_JOBS=1`, plus a stable nonempty machine label containing only ASCII
+`LEAN_NUM_THREADS=0`, `LEAN_IMPORT_WORKERS=1`, and `SABLE_TEST_JOBS=1`, plus a
+stable nonempty machine label containing only ASCII
 letters, digits, `.`, `_`, or `-`, a prebuilt and exactly validated immutable
 proof environment, no `.sable-out/daemon.sock`, existing local
 `.sable-out/roots` and `.sable-out/modules` directories, and a new absolute
@@ -164,7 +164,7 @@ machine return to its intended idle/thermal state after this preparation.
 ```sh
 git status --short
 git rev-parse HEAD
-test ! -e .sable-out/daemon.sock
+test ! -e .sable-out/daemon.sock && test ! -L .sable-out/daemon.sock
 unset SABLE_GRIND_HEARTBEATS ELAN_TOOLCHAIN LEAN_PATH LEAN_SYSROOT
 unset LEAN_SRC_PATH LEAN_GITHASH
 
@@ -175,7 +175,7 @@ LEAN_IMPORT_WORKERS=1 \
 
 CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 LEAN_NUM_THREADS=0 \
 LEAN_IMPORT_WORKERS=1 \
-SABLE_TEST_JOBS=1 SABLE_LEAN_JOBS=1 \
+SABLE_TEST_JOBS=1 \
   cargo run --release --locked --manifest-path compiler/Cargo.toml -- \
   check corpus/verifies/count_up.sable
 ```
@@ -194,8 +194,8 @@ SABLE_TIMING_REVISION="$(git rev-parse HEAD)"
 SABLE_TIMING_MACHINE="$(hostname)-proof-baseline"
 SABLE_TIMING_COLD="/tmp/sable-proof-${SABLE_TIMING_REVISION}-cold.json"
 SABLE_TIMING_WARM="/tmp/sable-proof-${SABLE_TIMING_REVISION}-warm.json"
-test ! -e "$SABLE_TIMING_COLD"
-test ! -e "$SABLE_TIMING_WARM"
+test ! -e "$SABLE_TIMING_COLD" && test ! -L "$SABLE_TIMING_COLD"
+test ! -e "$SABLE_TIMING_WARM" && test ! -L "$SABLE_TIMING_WARM"
 ```
 
 Record the cold series:
@@ -203,7 +203,7 @@ Record the cold series:
 ```sh
 CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 LEAN_NUM_THREADS=0 \
 LEAN_IMPORT_WORKERS=1 \
-SABLE_TEST_JOBS=1 SABLE_LEAN_JOBS=1 \
+SABLE_TEST_JOBS=1 \
 SABLE_PROOF_TIMING_CACHE_MODE=cold-roots \
 SABLE_PROOF_TIMING_MACHINE="$SABLE_TIMING_MACHINE" \
 SABLE_PROOF_TIMING_OUT="$SABLE_TIMING_COLD" \
@@ -218,7 +218,7 @@ record the linked warm series:
 ```sh
 CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 LEAN_NUM_THREADS=0 \
 LEAN_IMPORT_WORKERS=1 \
-SABLE_TEST_JOBS=1 SABLE_LEAN_JOBS=1 \
+SABLE_TEST_JOBS=1 \
 SABLE_PROOF_TIMING_CACHE_MODE=warm-artifacts \
 SABLE_PROOF_TIMING_MACHINE="$SABLE_TIMING_MACHINE" \
 SABLE_PROOF_TIMING_COLD_REPORT="$SABLE_TIMING_COLD" \
@@ -245,8 +245,8 @@ report review are complete.
 For a non-release-profile/debug-assertion/dirty experiment, set
 `SABLE_PROOF_TIMING_ALLOW_CUSTOM=1` on both cold and warm commands and prepare
 the same cache states. Retain `CARGO_BUILD_JOBS=1`, `CARGO_INCREMENTAL=0`,
-`LEAN_NUM_THREADS=0`, `LEAN_IMPORT_WORKERS=1`, `SABLE_TEST_JOBS=1`, and
-`SABLE_LEAN_JOBS=1`. Such reports say `smoke_custom` even if some other
+`LEAN_NUM_THREADS=0`, `LEAN_IMPORT_WORKERS=1`, and `SABLE_TEST_JOBS=1`. Such
+reports say `smoke_custom` even if some other
 baseline conditions happen to hold. Cache truthfulness, no-daemon operation,
 subject count, warm-lineage metadata checks, proof-build stability, and zero
 warning/defer/assume remain mandatory. Custom Lean/elan overrides or a custom

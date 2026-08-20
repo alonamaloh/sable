@@ -708,10 +708,10 @@ const SERIAL_LAKE_TOOLCHAIN: &str = "leanprover/lean4:v4.32.2";
 const SERIAL_LAKE_VERSION: &str = "Lake version 5.0.0-src+f3b06c7 (Lean version 4.32.2)";
 
 /// Build the captured local Lean library with Lake's asynchronous jobs forced
-/// inline by the audited Lean 4.32 runtime. An absent task manager is the only
-/// hard scheduler bound: positive worker counts may be exceeded to avoid
-/// deadlock. The one explicit package target therefore owns at most one Lean
-/// compiler child at a time.
+/// inline by the audited Lean 4.32 runtime and one import worker. An absent task
+/// manager is the only hard scheduler bound: positive task-worker counts may be
+/// exceeded to avoid deadlock. The one explicit package target therefore owns
+/// at most one Lean compiler child at a time.
 fn build_proof_environment_serial(
     built: &Path,
     files: &BTreeMap<String, Vec<u8>>,
@@ -786,7 +786,10 @@ fn require_serial_lake_toolchain(files: &BTreeMap<String, Vec<u8>>) -> Result<()
 
 fn serial_lake_command(lean_dir: &Path) -> Command {
     let mut command = Command::new("lake");
-    command.env("LEAN_NUM_THREADS", "0").current_dir(lean_dir);
+    command
+        .env("LEAN_NUM_THREADS", "0")
+        .env("LEAN_IMPORT_WORKERS", "1")
+        .current_dir(lean_dir);
     command
 }
 
@@ -1489,10 +1492,10 @@ mod proof_build_tests {
     fn assert_serial_lake_command_base(command: &Command, lean_dir: &Path) {
         assert_eq!(command.get_program(), OsStr::new("lake"));
         assert_eq!(command.get_current_dir(), Some(lean_dir));
-        assert_eq!(
-            command.get_envs().collect::<Vec<_>>(),
-            [(OsStr::new("LEAN_NUM_THREADS"), Some(OsStr::new("0")))]
-        );
+        let envs = command.get_envs().collect::<Vec<_>>();
+        assert_eq!(envs.len(), 2);
+        assert!(envs.contains(&(OsStr::new("LEAN_IMPORT_WORKERS"), Some(OsStr::new("1")))));
+        assert!(envs.contains(&(OsStr::new("LEAN_NUM_THREADS"), Some(OsStr::new("0")))));
     }
 
     #[test]

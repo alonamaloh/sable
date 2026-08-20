@@ -12,10 +12,12 @@ The compiler ships a language server: `sable lsp` (stdio). It provides:
   interface lines (`pre`/`post`) are highlighted: "a reader may ignore
   proofs"
 
-Build it once: `cd compiler && cargo build --release` (binary at
-`compiler/target/release/sable`).
+Build it once with one Cargo job:
+`(cd compiler && CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 cargo build --locked --release -j1)`
+(binary at `compiler/target/release/sable`).
 
-Optional but recommended: run `sable daemon` in a spare terminal — a
+Optional but recommended: run
+`LEAN_NUM_THREADS=0 LEAN_IMPORT_WORKERS=1 sable daemon` in a spare terminal — a
 persistent Lean server that makes every check (including the LSP's
 on-save verification and the Claude Code hook) ~10× faster
 (~0.25s instead of ~2.4s). Everything silently falls back to the batch
@@ -33,6 +35,10 @@ vim.api.nvim_create_autocmd("FileType", {
     vim.lsp.start({
       name = "sable",
       cmd = { "/path/to/sable/compiler/target/release/sable", "lsp" },
+      cmd_env = {
+        LEAN_NUM_THREADS = "0",
+        LEAN_IMPORT_WORKERS = "1",
+      },
     })
     vim.lsp.semantic_tokens and nil -- semantic tokens are on by default in 0.9+
   end,

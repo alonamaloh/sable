@@ -50,6 +50,18 @@ def utc_now() -> str:
     return dt.datetime.now(dt.timezone.utc).isoformat()
 
 
+def bounded_workers(raw: str) -> int:
+    try:
+        workers = int(raw)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(
+            "must be an integer from 1 through 2"
+        ) from error
+    if not 1 <= workers <= 2:
+        raise argparse.ArgumentTypeError("must be from 1 through 2")
+    return workers
+
+
 def progress(message: str) -> None:
     with PRINT_LOCK:
         print(message, file=sys.stderr, flush=True)
@@ -337,8 +349,9 @@ def worker_env(target: Path) -> dict[str, str]:
             "CARGO_BUILD_JOBS": "1",
             "CARGO_INCREMENTAL": "1",
             "CARGO_TERM_COLOR": "never",
+            "LEAN_IMPORT_WORKERS": "1",
+            "LEAN_NUM_THREADS": "0",
             "SABLE_TEST_JOBS": "1",
-            "SABLE_LEAN_JOBS": "1",
         }
     )
     return env
@@ -732,7 +745,13 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--dry-run", action="store_true", help="validate anchors/oracles and exit")
     result.add_argument("--mutant", action="append", default=[], help="run one id; repeatable")
     result.add_argument("--limit", type=int, help="run the first N selected mutants")
-    result.add_argument("--workers", type=int, default=2)
+    result.add_argument(
+        "--workers",
+        type=bounded_workers,
+        default=2,
+        metavar="{1,2}",
+        help="bounded mutation workers (default: 2)",
+    )
     result.add_argument("--compile-timeout", type=float, default=300.0)
     result.add_argument("--timeout", type=float, default=180.0, help="per-oracle timeout")
     result.add_argument("--report", type=Path, help="write JSON here instead of stdout")
@@ -769,8 +788,6 @@ def main() -> int:
         if not validation["valid"]:
             raise HarnessError("manifest validation failed:\n  " + "\n  ".join(validation["errors"]))
         selected = select_mutants(data, args.mutant, args.limit)
-        if not 1 <= args.workers <= 4:
-            raise HarnessError("--workers must be between 1 and 4")
         if args.compile_timeout <= 0 or args.timeout <= 0:
             raise HarnessError("timeouts must be positive")
         worker_count = min(args.workers, len(selected))

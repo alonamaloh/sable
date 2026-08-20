@@ -22,11 +22,20 @@ fn temp_dir(label: &str) -> PathBuf {
 }
 
 fn build_command() -> Command {
+    let daemon_socket = repo_root().join(".sable-out/daemon.sock");
+    match fs::symlink_metadata(&daemon_socket) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => panic!("cannot inspect {}: {error}", daemon_socket.display()),
+        Ok(_) => panic!(
+            "{} exists; native CLI integration tests require bounded batch Lean",
+            daemon_socket.display()
+        ),
+    }
     let mut command = Command::new(env!("CARGO_BIN_EXE_sable"));
     command
         .current_dir(repo_root())
-        .env("SABLE_LEAN_JOBS", "1")
-        .env("SABLE_TEST_JOBS", "1");
+        .env("LEAN_NUM_THREADS", "0")
+        .env("LEAN_IMPORT_WORKERS", "1");
     command
 }
 

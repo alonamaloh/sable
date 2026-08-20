@@ -5,12 +5,15 @@ Sable is a verified programming language: C-flavored program language, Lean 4 pr
 ## Build and test
 
 ```sh
-cd compiler && cargo build            # build the compiler
-cd compiler && cargo test             # unit tests + full corpus (runs Lean; slow-ish)
-cd lean && lake build                 # build the Sable prelude (needed once; cached)
-compiler/target/debug/sable check corpus/verifies/div_round_up.sable
+test ! -e .sable-out/daemon.sock && test ! -L .sable-out/daemon.sock
+(cd compiler && CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 cargo build --locked -j1)
+(cd compiler && CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 \
+  LEAN_NUM_THREADS=0 LEAN_IMPORT_WORKERS=1 SABLE_TEST_JOBS=1 \
+  cargo test --locked -j1 -- --test-threads=1)
+(cd lean && LEAN_NUM_THREADS=0 LEAN_IMPORT_WORKERS=1 lake --quiet build Sable)
+LEAN_NUM_THREADS=0 LEAN_IMPORT_WORKERS=1 compiler/target/debug/sable check corpus/verifies/div_round_up.sable
 compiler/target/debug/sable test -M corpus/verifies corpus/tests/test_sorting.sable   # dynamic checks, no Lean; -M resolves `use` imports
-compiler/target/debug/sable daemon &   # optional: warm checker (~10x faster sable check)
+LEAN_NUM_THREADS=0 LEAN_IMPORT_WORKERS=1 compiler/target/debug/sable daemon &   # optional: warm checker (~10x faster sable check)
 ```
 
 Lean is pinned by `lean/lean-toolchain`; elan fetches it automatically. Never upgrade the pin casually — it gets its own commit, tested against the corpus.

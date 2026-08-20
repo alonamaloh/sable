@@ -90,15 +90,27 @@ jobs:
 
       - name: Build Sable prelude (incl. SVM formalization)
         working-directory: lean
-        run: lake build
+        env:
+          LEAN_NUM_THREADS: "0"
+          LEAN_IMPORT_WORKERS: "1"
+        run: lake --quiet build Sable
 
       - name: Build compiler
         working-directory: compiler
-        run: cargo build --locked
+        env:
+          CARGO_BUILD_JOBS: "1"
+          CARGO_INCREMENTAL: "0"
+        run: cargo build --locked -j1
 
       - name: Full corpus + LSP tests
         working-directory: compiler
-        run: cargo test --locked
+        env:
+          CARGO_BUILD_JOBS: "1"
+          CARGO_INCREMENTAL: "0"
+          LEAN_NUM_THREADS: "0"
+          LEAN_IMPORT_WORKERS: "1"
+          SABLE_TEST_JOBS: "1"
+        run: cargo test --locked -j1 -- --test-threads=1
 
   native-differential:
     name: Native differential (Clang O0/O2)
@@ -138,16 +150,22 @@ jobs:
 
       - name: Build Sable prelude
         working-directory: lean
-        run: lake build
+        env:
+          LEAN_NUM_THREADS: "0"
+          LEAN_IMPORT_WORKERS: "1"
+        run: lake --quiet build Sable
 
       - name: Interpreter versus native code, ABI, and lifetime gates
         working-directory: compiler
         env:
+          CARGO_BUILD_JOBS: "1"
+          CARGO_INCREMENTAL: "0"
+          LEAN_NUM_THREADS: "0"
+          LEAN_IMPORT_WORKERS: "1"
           SABLE_REQUIRE_CLANG: "1"
-          SABLE_LEAN_JOBS: "1"
           SABLE_TEST_JOBS: "1"
         run: >-
-          cargo test --locked
+          cargo test --locked -j1
           --test llvm_diff
           --test llvm_generated_diff
           --test llvm_cli

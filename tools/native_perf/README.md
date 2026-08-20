@@ -28,7 +28,9 @@ are in `workloads.json`.
 Run from the repository root, giving the machine an explicit stable label:
 
 ```sh
-python3 tools/native_perf/run.py \
+test ! -e .sable-out/daemon.sock && test ! -L .sable-out/daemon.sock
+LEAN_NUM_THREADS=0 LEAN_IMPORT_WORKERS=1 \
+  python3 tools/native_perf/run.py \
   --machine-label apple-m2-air-local \
   --output /private/tmp/sable-native-perf.json
 ```
@@ -43,6 +45,15 @@ also marked `smoke_custom`, as are workload subsets and nondefault warmup/sample
 counts. Without `--compiler`, the runner builds the current clean checkout's
 locked release compiler before admission checks. Put baseline output outside
 the worktree; an in-worktree output path is also marked custom.
+
+The runner enforces one Cargo build job, disables incremental compilation for
+that release build, disables Lean's task manager, and uses one Lean import
+worker for every child command. It also rejects any daemon socket path entry,
+including a dangling symlink, both before and after the run so Sable cannot
+route verification through a server with unrelated process settings. The
+explicit Lean settings in the example make the supported invocation visible;
+inherited values are overwritten fail closed, and the enforced preparation
+concurrency is recorded in the report's protocol provenance.
 
 The runner:
 
