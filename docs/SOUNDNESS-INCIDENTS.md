@@ -70,7 +70,7 @@ and ten pre-merge or pre-admission near misses.
 | VF-07 | Confirmed verified-false | `b0f6851`, 2026-08-17 | yes | fail-open havoc dispatch |
 | VF-08 | Confirmed verified-false | `1dd9b40` / `c63300c`, 2026-08-18 | yes | borrow plus move in one call |
 | VF-09 | Confirmed verified-false | `4b4f93d`, 2026-08-20 | yes at `7957ad0`; no tagged release | pending-loan argument timing |
-| VF-10 | Confirmed verified-false; partial ingress mitigation | confirmed on `77bdf49`; status mitigation `a2d0adc`; warning/cache mitigation `9af008e`, 2026-08-20; declaration/axiom ingress open | yes at `77bdf49`; no tagged release | unauthenticated proof ingress |
+| VF-10 | Confirmed verified-false; source confined, dependency audit open | confirmed on `77bdf49`; status mitigation `a2d0adc`; warning/cache mitigation `9af008e`; source-confinement mitigation `94c5113`, 2026-08-20; compiled declaration/axiom audit open | yes at `77bdf49`; no tagged release | unauthenticated proof ingress |
 | AI-01 | Accepted-invalid | `fa92e12`, 2026-08-11 | yes | borrow-after-move |
 | AI-02 | Accepted-invalid/model mismatch | `842d1af`, 2026-08-16 | yes | owner visible during exposure |
 | AI-03 | Accepted-invalid | `a7969ec` / `c46ba94` / `3251c23`, 2026-08-12 | yes | incomplete per-place ownership state |
@@ -340,17 +340,26 @@ harness; neither result is rewritten here as an incident.
   `admit`, default-warning `sorryAx`, malformed Lean diagnostic transport, and
   every other unrecognized Lean warning before root or imported proof evidence
   can publish. It also binds that warning policy exactly into proof snapshots,
-  READY, artifact identities, in-flight builds, and `.ok` stamps. This closes
-  the warning/cache route, but not the incident: a continuation can suppress
-  `warn.sorry` around `sorryAx` or inject a warning-free axiom, the axiom closure
-  remains unauthenticated, and release remains blocked.
+  READY, artifact identities, in-flight builds, and `.ok` stamps. Commit
+  `94c5113` adds a separately built trusted parser: every raw
+  term consumes end of input, every ghost is exactly one expected `def` or
+  `theorem`, and arbitrary comment metadata is delimiter-safe and single-line
+  encoded. Continuation `axiom`, `set_option`, `#exit`, clause escapes, and
+  comment escapes now fail before Lean sees a candidate. READY also
+  SHA-256-binds the exact sorted local `.olean` set and parser executable. This
+  still does not close the incident: the declaration-level warning remains
+  fatal even when a theorem body locally suppresses `warn.sorry`, but compiled
+  declaration bodies and the axiom closure remain unauthenticated, and release
+  remains blocked.
 - **Regression and discovery:**
   [`proof_ingress.rs`](../compiler/tests/proof_ingress.rs) runs bounded batch
   witnesses for root and imported `sorry`, `admit`, direct `sorryAx`, warning
-  suppression, and an injected axiom. The warning-producing forms must now
-  fail with the named diagnostic and leave no final proof artifact; the two
-  warning-free forms must remain visibly provisional until the declaration and
-  transitive-axiom audits reject or account for them. The supplied source-level
+  suppression, continuation commands, clause escape, and an injected axiom.
+  Warning-producing and multi-command forms must fail with named diagnostics
+  and leave no final proof artifact. The single-command suppressed-`sorryAx`
+  witness also fails at Lean's declaration-level warning; the compiled
+  declaration and transitive-axiom audits remain required for dependencies and
+  other elaborated output. The supplied source-level
   review identified the routes; repository-local reproduction promoted the
   finding to confirmed verified-false.
 - **Certificate coverage now:** none. Existing certificates are declarations
