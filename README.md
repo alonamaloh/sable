@@ -46,7 +46,7 @@ not yet an end-to-end proof of the Rust compiler or native backend:
 | Claim | Present assurance |
 |---|---|
 | The generated Lean theorems are valid | Checked by the Lean kernel |
-| The obligations faithfully model the Sable program | The Rust checker/VC generator remain trusted engineering. The checker authors one exact ownership/mutation plan for admitted moves, calls, loans, receivers, sealed operations, exposures, and loop havoc, and VC generation consumes it fail-closed. One structural control/action model begins as a checker-consumed outline and is then retained for VC, SVM, interpreter, and LLVM paths, including exact traps, replacements, discarded class temporaries, and concrete class-drop links; explicit unique-borrow write-back additionally has a Lean-checked certificate. Neither plan is a mechanized proof of source translation |
+| The obligations faithfully model the Sable program | The Rust checker/VC generator remain trusted engineering. The checker authors one exact ownership/mutation plan for admitted moves, calls, loans, receivers, sealed operations, exposures, and loop havoc, and VC generation consumes it fail-closed. One structural control/action model begins as a checker-consumed outline and is then retained for VC, SVM, interpreter, and LLVM paths, including exact traps, replacements, discarded class temporaries, and concrete class-drop links. Explicit unique-borrow write-back, successful local/direct-`self` slot take/put write-back, and checker-recorded argument-schedule alias safety additionally have narrow Lean-checked certificates; their Rust discovery and source provenance remain trusted. Neither plan is a mechanized proof of source translation |
 | The interpreter matches the formal SVM subset | The Lean rules and functional evaluator agree by theorem; Rust and Lean outcomes are compared differentially |
 | Native execution matches Sable semantics | Lowering is fail-closed from the exact `VerifiedProgram`; curated subjects, range-checked bit-distinguishable scalar/control batches, and individually traced ownership cases across the current admitted native boundary are compared with the interpreter under Clang `-O0` and `-O2`. The generator is test-only typed case IR rendered to source—not the compiler's retained production control/action plan—and the handwritten LLVM emitter is not kernel-verified |
 
@@ -163,9 +163,9 @@ library. See
 ## Reading further
 
 - [`docs/TUTORIAL.md`](docs/TUTORIAL.md) — the language in a dozen examples.
-- [`corpus/`](corpus/) — the real documentation: ~120 programs that must
-  verify, one program per diagnostic that must fail, and dynamic tests. CI
-  keeps all of it green, so it never goes stale.
+- [`corpus/`](corpus/) — the real documentation: more than 700 verification,
+  must-fail, dynamic, paired, SVM-differential, and LLVM-differential programs.
+  CI keeps all of it green, so it never goes stale.
 - [`docs/design/sable-language-design.md`](docs/design/sable-language-design.md)
   — the normative design: syntax, contracts, ownership, ghost code,
   termination, escape hatches, and the machine model.
@@ -178,7 +178,13 @@ library. See
 - [`docs/ADVERSARIAL-REVIEW.md`](docs/ADVERSARIAL-REVIEW.md) — an evidence-first
   guide for external breakage attempts, exact reproducer commands, and honest
   reporting of proof/runtime findings.
+- [`tools/soundness_mutations/README.md`](tools/soundness_mutations/README.md)
+  — the curated trusted-semantics mutation protocol and immutable result sets.
+- [`tools/native_perf/README.md`](tools/native_perf/README.md) — the fail-closed
+  native-performance protocol, including canonical blockers and the narrow
+  C-comparable subset.
 - [`tools/proof_timing/README.md`](tools/proof_timing/README.md) — the exact
   release-only cold-roots/warm-artifacts protocol for comparable
   verification-wall-time evidence, including cache, revision, and
-  subject-manifest checks.
+  subject-manifest checks; recorded pairs are indexed
+  [here](tools/proof_timing/baselines/index.json).

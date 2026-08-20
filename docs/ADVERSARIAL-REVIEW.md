@@ -5,14 +5,18 @@ doing so. It is **not** an external audit, evidence that an external reviewer
 has participated, or proof that Sable is sound. A green run establishes only
 the claim made by that particular test over its admitted subset.
 
-The evidence this guide depends on is versioned: `4b4f93d` closes the latest
-known call-evaluation defects, `208a46a` adds the ownership interaction matrix,
-`a18ec36` records the incident ledger, `6450253` adds the curated mutation
-harness, `2ad556d` records its first complete baseline, `c9e81b1` adds closed
-argument-schedule certificates, `d7c3f90` adds their four focused mutations,
-`dac25ed` bounds proof-environment construction to one external Lean process,
-and `57451a5` expands the committed baseline to 24 curated mutations. Use a
-full commit hash when reporting a new result.
+The evidence this guide depends on is versioned. `4b4f93d` closes the latest
+known call-evaluation defects; `208a46a` adds the ownership interaction matrix;
+`a18ec36` records the incident ledger; `6450253` and `2ad556d` add the curated
+mutation harness and its first complete baseline; `ef8b38f` and `8986d8f` add
+the fail-closed native-performance protocol and its first clean result;
+`c9e81b1` and `d7c3f90` add closed argument-schedule certificates and their
+focused mutations; `dac25ed` bounds proof-environment construction to one
+external Lean process; `57451a5` records the expanded 24-mutant baseline;
+`658a131` hardens the proof-timing protocol; `25ebc21` bounds the remaining live
+audit/test workflows; and `4cee92f` records the first clean proof-verification
+timing pair.
+Use a full commit hash when reporting a new result.
 
 ## What to attack
 
@@ -181,6 +185,17 @@ LEAN_IMPORT_WORKERS=1 SABLE_REQUIRE_CLANG=1 SABLE_TEST_JOBS=1 \
   -- --test-threads=1
 ```
 
+The separate [native-performance protocol](../tools/native_perf/README.md)
+requires exact admission or refusal, zero proof escapes, authenticated Sable/C
+sources, semantic probes, and anti-trivialization checks before it emits a
+ratio. Its first clean baseline keeps the canonical quicksort, borrowed-i32
+merge, and generic map as blockers; it compares only the admitted `merge_u32`
+and `linear_probe_u32` workloads. The [immutable result](../tools/native_perf/baselines/ef8b38f-alvaros-m2-air-arm64.json)
+records median Sable/C ratios of 1.0131 and 0.9229 respectively. The admitted
+fixed-input partition is recorded as optimization-trivialized and deliberately
+has no ratio. These are small one-machine regression measurements, not
+performance claims about the canonical programs.
+
 Proof timing is release instrumentation, not a deterministic correctness or
 performance gate. Follow the exact
 [proof-timing v2 protocol](../tools/proof_timing/README.md): a baseline requires
@@ -193,6 +208,18 @@ report bytes, matching proof-build identity, and equivalent path/type/size
 cache metadata; it cannot prove temporal adjacency, unique physical cache
 lineage, or cache-content identity. An explicitly opted-in debug or dirty
 experiment is labeled `smoke_custom`, never `baseline`.
+
+The [baseline index](../tools/proof_timing/baselines/index.json) records the
+first clean v2 pair at revision `25ebc21e71fb7827bf50bd39432e00fd9754c234`:
+126/126 measured subjects verified with no warnings, defers, assumptions, or
+failures. End-to-end verification wall time was 313.915 seconds from the
+cold-roots state and 218.627 seconds from the warm-artifacts state. A separate
+250 ms process-table monitor observed at most one actual Lean compiler process
+in either phase. Each run emitted 4,403 ordinary obligations, 86 transition
+certificates, and 996 argument-schedule certificates (5,485 theorems and
+11,291,637 generated Lean bytes). The difference is observational; it does not
+isolate artifact reuse from OS page-cache, thermal, scheduler, or other machine
+state.
 
 ## Report a finding
 

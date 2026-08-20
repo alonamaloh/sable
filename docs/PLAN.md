@@ -2105,6 +2105,42 @@ C0 is the explicit consolidation gate before the later G3/G4 feature work:
    they remain last because rounding modes, NaNs, and proof vocabulary deserve
    a benchmark rather than speculative surface area.
 
+## Adversarial-week evidence checkpoint (complete, 2026-08-20)
+
+The one-week adversarial push now has durable, reproducible outputs rather
+than a one-time green test run:
+
+- an evidence-qualified incident ledger separates nine confirmed false proofs,
+  eight accepted-invalid families, three runtime/monitor divergences, three
+  fail-open ICE families, and ten pre-merge or pre-admission near misses;
+- the permanent pairwise ownership matrix and metamorphic controls exercise
+  evaluation order, nested effects, receivers, aliases, moves, branches,
+  early returns, and loops;
+- the curated mutation harness has an immutable 24-mutant baseline: 12
+  semantic kills, eight structural kills, and four honestly retained
+  `equivalent-or-survivor` cases whose seven focused witnesses were instead
+  rejected by the downstream argument-schedule certificate;
+- closed argument-schedule certificates independently decide the exact
+  checker-recorded receiver-first, left-to-right alias schedule. Their four
+  historical overlap witnesses and four certificate-family mutations are
+  pinned, while effect discovery and source provenance remain explicit Rust
+  trust boundaries;
+- the fail-closed native-performance protocol records the canonical
+  quicksort, borrowed-i32 merge, and generic map as blockers. Its first clean
+  baseline emits ratios only for two narrower admitted C-comparable workloads
+  and refuses to time an optimization-trivialized partition; and
+- the release-only proof-timing v2 protocol has its first clean cold-roots and
+  warm-artifacts pair: 126/126 subjects with no proof escapes or failures,
+  an authenticated revision, recorded toolchain and cache metadata, and a
+  separately monitored maximum of one Lean compiler process.
+
+The external adversarial-review guide is published, but this checkpoint does
+not claim that an outside reviewer has participated. The continuing work is to
+repeat mutation, native, and proof-timing baselines at meaningful revisions;
+investigate every survivor or regression; solicit independent review; and
+widen kernel-checked certificates only where the statement can be based on an
+independently observed carrier rather than generator-authored assumptions.
+
 ## Parallel track (low intensity)
 
 The SVM semantic oracle — **checkpoint reached, with the first profile
