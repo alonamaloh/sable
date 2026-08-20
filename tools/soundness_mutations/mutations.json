@@ -71,13 +71,13 @@
       "edits": [
         {
           "file": "compiler/src/check.rs",
-          "before": "    for argument in &call.arguments {\n        let CallArgumentEffect::Value(value) = &argument.effect else {\n",
-          "after": "    for argument in call.arguments.iter().take(0) {\n        let CallArgumentEffect::Value(value) = &argument.effect else {\n"
+          "before": "        for argument in &call.arguments {\n            let CallArgumentEffect::Value(value) = &argument.effect else {\n",
+          "after": "        for argument in call.arguments.iter().take(0) {\n            let CallArgumentEffect::Value(value) = &argument.effect else {\n"
         },
         {
           "file": "compiler/src/check.rs",
-          "before": "    for (loaned, _, loan_span) in loans {\n        if ctx\n            .moved\n            .difference(moved_before)\n            .any(|moved| loaned.overlaps(moved))\n        {\n            return Err(Diagnostic {\n                name: \"borrow.moved_in_call\".into(),\n                title: format!(\n                    \"`{}` is both lent and handed over in one call\",\n",
-          "after": "    for (loaned, _, loan_span) in loans.into_iter().take(0) {\n        if ctx\n            .moved\n            .difference(moved_before)\n            .any(|moved| loaned.overlaps(moved))\n        {\n            return Err(Diagnostic {\n                name: \"borrow.moved_in_call\".into(),\n                title: format!(\n                    \"`{}` is both lent and handed over in one call\",\n"
+          "before": "        for (loaned, _, loan_span) in loans {\n            if ctx\n                .moved\n                .difference(moved_before)\n                .any(|moved| loaned.overlaps(moved))\n            {\n                return Err(Diagnostic {\n                    name: \"borrow.moved_in_call\".into(),\n                    title: format!(\n                        \"`{}` is both lent and handed over in one call\",\n",
+          "after": "        for (loaned, _, loan_span) in loans.into_iter().take(0) {\n            if ctx\n                .moved\n                .difference(moved_before)\n                .any(|moved| loaned.overlaps(moved))\n            {\n                return Err(Diagnostic {\n                    name: \"borrow.moved_in_call\".into(),\n                    title: format!(\n                        \"`{}` is both lent and handed over in one call\",\n"
         }
       ],
       "oracles": [
@@ -142,8 +142,8 @@
       "edits": [
         {
           "file": "compiler/src/check.rs",
-          "before": "    for (loaned, _, loan_span) in loans {\n        if ctx\n            .moved\n            .difference(moved_before)\n            .any(|moved| loaned.overlaps(moved))\n        {\n            return Err(Diagnostic {\n                name: \"borrow.moved_in_call\".into(),\n                title: format!(\n                    \"`{}` is lent and moved while evaluating `{operation}`\",\n",
-          "after": "    for (loaned, _, loan_span) in loans.into_iter().take(0) {\n        if ctx\n            .moved\n            .difference(moved_before)\n            .any(|moved| loaned.overlaps(moved))\n        {\n            return Err(Diagnostic {\n                name: \"borrow.moved_in_call\".into(),\n                title: format!(\n                    \"`{}` is lent and moved while evaluating `{operation}`\",\n"
+          "before": "        for (loaned, _, loan_span) in loans {\n            if ctx\n                .moved\n                .difference(moved_before)\n                .any(|moved| loaned.overlaps(moved))\n            {\n                return Err(Diagnostic {\n                    name: \"borrow.moved_in_call\".into(),\n                    title: format!(\n                        \"`{}` is lent and moved while evaluating `{operation}`\",\n",
+          "after": "        for (loaned, _, loan_span) in loans.into_iter().take(0) {\n            if ctx\n                .moved\n                .difference(moved_before)\n                .any(|moved| loaned.overlaps(moved))\n            {\n                return Err(Diagnostic {\n                    name: \"borrow.moved_in_call\".into(),\n                    title: format!(\n                        \"`{}` is lent and moved while evaluating `{operation}`\",\n"
         }
       ],
       "oracles": [
@@ -232,6 +232,78 @@
           "path": "corpus/must-fail/loop_bool_field_stale.sable",
           "expect": "failed",
           "baseline_contains": "FlagLoop::make.post"
+        }
+      ]
+    },
+    {
+      "id": "certificate.argument_value_move_erased",
+      "family": "certificate",
+      "description": "Erase a checker-recorded owning argument move while translating it into the closed argument schedule.",
+      "edits": [
+        {
+          "file": "compiler/src/argument_schedule.rs",
+          "before": "        (ValueTransferKind::Move, Some(place)) => DirectEffect::Move {\n            place: place.clone(),\n        },\n",
+          "after": "        (ValueTransferKind::Move, Some(_)) => DirectEffect::Inert,\n"
+        }
+      ],
+      "oracles": [
+        {
+          "kind": "cargo-test",
+          "test": "argument_schedule::tests::historical_vf03_vf08_vf09_and_ai08_are_rejected_by_lean_when_checker_guards_are_weakened"
+        }
+      ]
+    },
+    {
+      "id": "certificate.nested_boundary_move_propagation_omitted",
+      "family": "certificate",
+      "description": "Drop a completed inner boundary's direct move instead of propagating it into the enclosing argument schedule.",
+      "edits": [
+        {
+          "file": "compiler/src/argument_schedule.rs",
+          "before": "        if let DirectEffect::Move { place } = &argument.direct {\n            completed.push(NestedEffect::Move(place.clone()));\n        }\n",
+          "after": "        let _ = &argument.direct;\n"
+        }
+      ],
+      "oracles": [
+        {
+          "kind": "cargo-test",
+          "test": "argument_schedule::tests::historical_vf03_vf08_vf09_and_ai08_are_rejected_by_lean_when_checker_guards_are_weakened"
+        }
+      ]
+    },
+    {
+      "id": "certificate.unique_shared_loan_conflict_weakened",
+      "family": "certificate",
+      "description": "Make the Lean decision accept an overlapping unique/shared loan pair unless both loans are unique.",
+      "edits": [
+        {
+          "file": "lean/Sable/Transition.lean",
+          "before": "    place.overlaps prior.1 && (unique || prior.2))\n",
+          "after": "    place.overlaps prior.1 && (unique && prior.2))\n"
+        }
+      ],
+      "oracles": [
+        {
+          "kind": "cargo-test",
+          "test": "argument_schedule::tests::historical_vf03_vf08_vf09_and_ai08_are_rejected_by_lean_when_checker_guards_are_weakened"
+        }
+      ]
+    },
+    {
+      "id": "certificate.pending_loan_nested_write_check_omitted",
+      "family": "certificate",
+      "description": "Make the Lean decision ignore a pending loan when a later nested argument effect writes overlapping storage.",
+      "edits": [
+        {
+          "file": "lean/Sable/Transition.lean",
+          "before": "  | .write place :: rest =>\n      if !place.valid || overlapsAny place moved ||\n          pending.any (fun loan => place.overlaps loan.1) then\n        none\n      else\n        applyNested pending moved rest\n",
+          "after": "  | .write place :: rest =>\n      if !place.valid || overlapsAny place moved then\n        none\n      else\n        applyNested pending moved rest\n"
+        }
+      ],
+      "oracles": [
+        {
+          "kind": "cargo-test",
+          "test": "argument_schedule::tests::historical_vf03_vf08_vf09_and_ai08_are_rejected_by_lean_when_checker_guards_are_weakened"
         }
       ]
     },

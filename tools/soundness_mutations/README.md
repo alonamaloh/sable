@@ -1,9 +1,9 @@
 # Curated soundness mutations
 
 This pilot answers a narrow question: do focused witnesses notice deliberate
-damage to Sable's checker, retained control plan, and VC generator? It is not a
-whole-program mutation score and does not claim that surviving mutants are
-sound.
+damage to Sable's checker, retained control plan, VC generator, and closed
+argument-schedule certificate? It is not a whole-program mutation score and
+does not claim that surviving mutants are sound.
 
 The runner uses only the Python standard library. It archives a committed Git
 revision into a temporary checkout, gives each worker its own
@@ -67,7 +67,12 @@ rendered marker, unexpected exit status, crash, or baseline timeout is a
 oracles. Every edit has repository-relative `file`, `before`, and `after`
 strings. Dry-run validation requires `before` to occur exactly once in the
 selected revision and rejects absolute paths, parent traversal, unknown
-families, missing sources, duplicate IDs, and malformed oracles.
+families, missing sources, duplicate IDs, and malformed oracles. Path authority
+is coupled to the declared family: `certificate` edits may touch only
+`compiler/src/argument_schedule.rs` or the exact closed-model source
+`lean/Sable/Transition.lean`, while checker, control, and VC edits remain
+limited to `compiler/src/**`. A non-certificate mutant cannot use the Lean
+exception, and a certificate mutant cannot mutate unrelated compiler code.
 
 Two oracle kinds are supported:
 
@@ -84,6 +89,13 @@ Prefer a small source whose only expected failure is the removed obligation.
 Use a structural unit test when a semantic source cannot directly forge the
 retained representation being guarded. Multiple focused oracles are allowed
 when they exercise genuinely different paths.
+
+The `certificate` family mutates either the independent Rust schedule
+extractor or the closed Lean decision. Its focused oracle uses test-only
+checker weakening to replay historical schedules and requires the certificate
+layer to reject them. These are structural certificate kills, not semantic
+soundness kills: the production checker still rejects each source before a
+certificate-only mutation could admit it.
 
 ## Cost and limitations
 
@@ -113,5 +125,6 @@ the result to the exact 20 mutations: 16 were semantic kills and four were
 structural kills, with no survivors, invalid mutants, crashes, timeouts, or
 harness errors. This is evidence that the selected witnesses detect those
 specific edits; it is not a whole-compiler mutation score or a soundness
-percentage. The elapsed time is retained for audit context only and is not a
-performance measurement.
+percentage. The certificate-family additions postdate that immutable baseline
+and are not included in its counts. The elapsed time is retained for audit
+context only and is not a performance measurement.

@@ -169,7 +169,11 @@ def validate_manifest(data: dict[str, Any], revision: str) -> dict[str, Any]:
     errors: list[str] = []
     ids: set[str] = set()
     source_cache: dict[str, str] = {}
-    allowed_families = {"checker", "vc", "control"}
+    allowed_families = {"certificate", "checker", "control", "vc"}
+    certificate_paths = {
+        "compiler/src/argument_schedule.rs",
+        "lean/Sable/Transition.lean",
+    }
     for index, mutant in enumerate(data["mutants"]):
         where = f"mutants[{index}]"
         if not isinstance(mutant, dict):
@@ -185,7 +189,9 @@ def validate_manifest(data: dict[str, Any], revision: str) -> dict[str, Any]:
             ids.add(mid)
         family = mutant.get("family")
         if not isinstance(family, str) or family not in allowed_families:
-            errors.append(f"{where}: family must be checker, vc, or control")
+            errors.append(
+                f"{where}: family must be certificate, checker, control, or vc"
+            )
         if not isinstance(mutant.get("description"), str) or not mutant["description"]:
             errors.append(f"{where}: description is required")
         edits = mutant.get("edits")
@@ -205,8 +211,15 @@ def validate_manifest(data: dict[str, Any], revision: str) -> dict[str, Any]:
             except (HarnessError, TypeError) as error:
                 errors.append(f"{edit_where}: {error}")
                 continue
-            if not path.startswith("compiler/src/"):
-                errors.append(f"{edit_where}: mutations are limited to compiler/src")
+            if family == "certificate" and path not in certificate_paths:
+                errors.append(
+                    f"{edit_where}: certificate mutations are limited to "
+                    "compiler/src/argument_schedule.rs or lean/Sable/Transition.lean"
+                )
+            elif family != "certificate" and not path.startswith("compiler/src/"):
+                errors.append(
+                    f"{edit_where}: non-certificate mutations are limited to compiler/src"
+                )
             if not isinstance(before, str) or not before:
                 errors.append(f"{edit_where}: before must be non-empty text")
                 continue
