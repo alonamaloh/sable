@@ -441,12 +441,14 @@ pub(crate) struct DeclarationModuleInventory {
 }
 
 /// An opaque, compiler-owned path reserved for a future freshly compiled
-/// declaration-observation candidate. The path itself grants no authority and
-/// this tranche never writes or publishes it.
+/// declaration-observation candidate. The dormant compound helper writes it
+/// only as an ephemeral input to inventory; it is never published and the path
+/// itself grants no authority.
 #[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct DeclarationCandidateOlean {
     expected_module_name: String,
+    directory: PathBuf,
     path: PathBuf,
 }
 
@@ -459,13 +461,63 @@ impl DeclarationCandidateOlean {
 
 impl Drop for DeclarationCandidateOlean {
     fn drop(&mut self) {
-        // The process/nonce-scoped path was absent when this capability
-        // was allocated. Remove only the regular file a future compiler wrote;
-        // never follow a replacement symlink or recurse through a directory.
+        // Remove only exact regular files Lean may derive from the owned `-o`
+        // path. Traditional generated modules produce just `.olean`; a future
+        // `module` source may also attempt server/private/IR sidecars, which
+        // this tranche rejects but must still clean without following links.
+        for path in declaration_candidate_output_paths(self) {
+            if std::fs::symlink_metadata(&path)
+                .is_ok_and(|metadata| !metadata.file_type().is_symlink() && metadata.is_file())
+            {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+        if std::fs::symlink_metadata(&self.directory)
+            .is_ok_and(|metadata| !metadata.file_type().is_symlink() && metadata.is_dir())
+        {
+            let _ = std::fs::remove_dir(&self.directory);
+        }
+    }
+}
+
+fn declaration_candidate_output_paths(candidate: &DeclarationCandidateOlean) -> [PathBuf; 4] {
+    let mut server = candidate.path.as_os_str().to_owned();
+    server.push(".server");
+    let mut private = candidate.path.as_os_str().to_owned();
+    private.push(".private");
+    [
+        candidate.path.clone(),
+        PathBuf::from(server),
+        PathBuf::from(private),
+        candidate.path.with_extension("ir"),
+    ]
+}
+
+/// Compiler-owned temporary source directory whose exact `<module>.lean` file
+/// gives Lean the expected module name under an explicit `--root`. The source
+/// and directory are removed only when they retain the narrow owned shape;
+/// unexpected residual files are deliberately left visible and rejected.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, PartialEq, Eq)]
+struct DeclarationCandidateSource {
+    expected_module_name: String,
+    directory: PathBuf,
+    path: PathBuf,
+}
+
+impl Drop for DeclarationCandidateSource {
+    fn drop(&mut self) {
         if std::fs::symlink_metadata(&self.path)
             .is_ok_and(|metadata| !metadata.file_type().is_symlink() && metadata.is_file())
         {
             let _ = std::fs::remove_file(&self.path);
+        }
+        // `remove_dir` is intentionally nonrecursive and succeeds only when no
+        // unmodeled compiler output or replacement entry remains.
+        if std::fs::symlink_metadata(&self.directory)
+            .is_ok_and(|metadata| !metadata.file_type().is_symlink() && metadata.is_dir())
+        {
+            let _ = std::fs::remove_dir(&self.directory);
         }
     }
 }
@@ -497,6 +549,30 @@ pub(crate) struct DeclarationModuleObservation {
     inventory_result: Vec<u8>,
     inventory_result_sha256: String,
     inventory: DeclarationModuleInventory,
+}
+
+/// Dormant one-workload result that binds strict batch compilation to the raw
+/// declaration inventory. It remains observational and non-authoritative:
+/// the temporary candidate is deleted before this value reaches its caller,
+/// and no cache, manifest, publication, or proof-assurance path consumes it.
+/// The nonce-bearing absolute source path may affect Lean metadata or bytes,
+/// so its candidate digest is specifically not a final-artifact identity.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CompiledDeclarationObservation {
+    observational: bool,
+    authoritative: bool,
+    ephemeral_source_root: PathBuf,
+    ephemeral_source_path: PathBuf,
+    ephemeral_candidate_root: PathBuf,
+    ephemeral_candidate_path: PathBuf,
+    source_sha256_before: String,
+    source_sha256_after_compile: String,
+    source_sha256_after_inventory: String,
+    lean_stdout: Vec<u8>,
+    lean_stdout_sha256: String,
+    lean_messages: Vec<LeanMessage>,
+    declaration: DeclarationModuleObservation,
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -1254,6 +1330,7 @@ pub fn find_repo_root(start: &Path) -> Option<PathBuf> {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LeanMessage {
     pub severity: String,
     pub line: usize,
@@ -1291,10 +1368,12 @@ fn require_generated_module_name(module_name: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Allocate an absent, process-and-attempt-unique path for a future fresh Lean
-/// compilation. The caller must compile directly to this exact path before
-/// passing the opaque token to [`observe_declaration_module`]. B1c leaves that
-/// production integration deliberately dormant.
+/// Allocate an empty, process-and-attempt-unique output directory and path for
+/// a future fresh Lean compilation. The caller must compile directly to this
+/// exact path before
+/// passing the opaque token to [`observe_declaration_module`]. B1d exercises
+/// this only in its dormant compound helper; production integration remains
+/// deliberately absent.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn unique_declaration_candidate_olean(
     repo_root: &Path,
@@ -1320,32 +1399,155 @@ pub(crate) fn unique_declaration_candidate_olean(
             parent.display()
         ));
     }
-    for _ in 0..100 {
-        let nonce = NEXT_PROOF_TEMP.fetch_add(1, Ordering::Relaxed);
-        let path = parent.join(format!(
-            ".{expected_module_name}.declaration-observation.{}.{nonce}.olean",
-            std::process::id(),
+    let directory = unique_directory(
+        &parent,
+        &format!("{expected_module_name}.declaration-output"),
+    )?;
+    Ok(DeclarationCandidateOlean {
+        expected_module_name: expected_module_name.to_owned(),
+        path: directory.join(format!("{expected_module_name}.olean")),
+        directory,
+    })
+}
+
+fn require_regular_directory(path: &Path, description: &str) -> Result<(), String> {
+    let metadata = std::fs::symlink_metadata(path)
+        .map_err(|error| format!("cannot inspect {description} {}: {error}", path.display()))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(format!(
+            "{description} {} is not a regular non-symlink directory",
+            path.display()
         ));
-        match std::fs::symlink_metadata(&path) {
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(DeclarationCandidateOlean {
-                    expected_module_name: expected_module_name.to_owned(),
-                    path,
-                });
-            }
-            Ok(_) => continue,
-            Err(error) => {
-                return Err(format!(
-                    "cannot inspect declaration observation candidate {}: {error}",
-                    path.display()
-                ));
-            }
+    }
+    Ok(())
+}
+
+fn ensure_declaration_observation_modules_dir(repo_root: &Path) -> Result<PathBuf, String> {
+    if !repo_root.is_absolute() {
+        return Err(format!(
+            "declaration observation repository root {} must be absolute",
+            repo_root.display()
+        ));
+    }
+    let output = repo_root.join(".sable-out");
+    match std::fs::create_dir(&output) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => {
+            return Err(format!(
+                "cannot create compiler output directory {}: {error}",
+                output.display()
+            ));
         }
     }
-    Err(format!(
-        "cannot allocate a unique declaration observation candidate in {}",
-        parent.display()
-    ))
+    require_regular_directory(&output, "compiler output directory")?;
+    let modules = modules_dir(repo_root);
+    match std::fs::create_dir(&modules) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => {
+            return Err(format!(
+                "cannot create declaration observation directory {}: {error}",
+                modules.display()
+            ));
+        }
+    }
+    require_regular_directory(&modules, "declaration observation directory")?;
+    Ok(modules)
+}
+
+fn unique_declaration_candidate_source(
+    repo_root: &Path,
+    expected_module_name: &str,
+    source: &str,
+) -> Result<DeclarationCandidateSource, String> {
+    require_generated_module_name(expected_module_name)?;
+    let modules = ensure_declaration_observation_modules_dir(repo_root)?;
+    let directory = unique_directory(
+        &modules,
+        &format!("{expected_module_name}.declaration-source"),
+    )?;
+    let candidate = DeclarationCandidateSource {
+        expected_module_name: expected_module_name.to_owned(),
+        path: directory.join(format!("{expected_module_name}.lean")),
+        directory,
+    };
+    OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&candidate.path)
+        .and_then(|mut file| {
+            file.write_all(source.as_bytes())?;
+            file.sync_all()
+        })
+        .map_err(|error| {
+            format!(
+                "cannot write declaration observation source {}: {error}",
+                candidate.path.display()
+            )
+        })?;
+    validate_declaration_candidate_source(repo_root, &candidate)?;
+    Ok(candidate)
+}
+
+fn validate_declaration_candidate_source(
+    repo_root: &Path,
+    candidate: &DeclarationCandidateSource,
+) -> Result<(), String> {
+    if !repo_root.is_absolute()
+        || !candidate.directory.is_absolute()
+        || !candidate.path.is_absolute()
+    {
+        return Err("declaration observation source paths must be absolute".into());
+    }
+    require_generated_module_name(&candidate.expected_module_name)?;
+    let modules = modules_dir(repo_root);
+    require_regular_directory(&modules, "declaration observation directory")?;
+    let expected_file_name = format!("{}.lean", candidate.expected_module_name);
+    if candidate.directory.parent() != Some(modules.as_path())
+        || candidate.path.parent() != Some(candidate.directory.as_path())
+        || candidate.path.file_name().and_then(|name| name.to_str())
+            != Some(expected_file_name.as_str())
+    {
+        return Err(format!(
+            "declaration observation source {} is outside its compiler-owned module-root shape",
+            candidate.path.display()
+        ));
+    }
+    require_regular_directory(&candidate.directory, "declaration observation source root")?;
+    let entries = std::fs::read_dir(&candidate.directory)
+        .map_err(|error| {
+            format!(
+                "cannot enumerate declaration observation source root {}: {error}",
+                candidate.directory.display()
+            )
+        })?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| {
+            format!(
+                "cannot enumerate an entry in declaration observation source root {}: {error}",
+                candidate.directory.display()
+            )
+        })?;
+    if entries.len() != 1 || entries[0].path() != candidate.path {
+        return Err(format!(
+            "declaration observation source root {} must contain exactly its owned source file",
+            candidate.directory.display()
+        ));
+    }
+    let metadata = std::fs::symlink_metadata(&candidate.path).map_err(|error| {
+        format!(
+            "cannot inspect declaration observation source {}: {error}",
+            candidate.path.display()
+        )
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(format!(
+            "declaration observation source {} is not a regular non-symlink file",
+            candidate.path.display()
+        ));
+    }
+    Ok(())
 }
 
 /// Exact repository-local inputs that can affect a generated proof. The FNV
@@ -2998,6 +3200,8 @@ fn validate_declaration_observation_subject(
             candidate.expected_module_name, subject.candidate.module_name
         ));
     }
+    require_terminal_sentinel_for_module(expected_emitted, &subject.candidate.module_name)
+        .map_err(|failure| failure.message)?;
     let expected_candidate = DeclarationModuleSubject::from_emitted(
         candidate.expected_module_name.clone(),
         expected_emitted,
@@ -3016,11 +3220,16 @@ fn validate_declaration_candidate_path(
     repo_root: &Path,
     candidate: &DeclarationCandidateOlean,
 ) -> Result<(), String> {
-    if !repo_root.is_absolute() || !candidate.path.is_absolute() {
+    if !repo_root.is_absolute()
+        || !candidate.directory.is_absolute()
+        || !candidate.path.is_absolute()
+    {
         return Err("declaration observation paths must be absolute".into());
     }
     let parent = modules_dir(repo_root);
-    if candidate.path.parent() != Some(parent.as_path()) {
+    if candidate.directory.parent() != Some(parent.as_path())
+        || candidate.path.parent() != Some(candidate.directory.as_path())
+    {
         return Err(format!(
             "declaration observation candidate {} is outside the compiler-owned generated-module directory",
             candidate.path.display()
@@ -3038,39 +3247,106 @@ fn validate_declaration_candidate_path(
             parent.display()
         ));
     }
+    require_regular_directory(
+        &candidate.directory,
+        "declaration observation candidate output root",
+    )?;
     require_generated_module_name(&candidate.expected_module_name)?;
-    let file_name = candidate
-        .path
+    let expected_file_name = format!("{}.olean", candidate.expected_module_name);
+    if candidate.path.file_name().and_then(|name| name.to_str())
+        != Some(expected_file_name.as_str())
+    {
+        return Err(format!(
+            "declaration observation candidate {} does not use its exact expected module file name",
+            candidate.path.display()
+        ));
+    }
+    let directory_name = candidate
+        .directory
         .file_name()
         .and_then(|name| name.to_str())
         .ok_or_else(|| {
             format!(
-                "declaration observation candidate path {} has no UTF-8 file name",
-                candidate.path.display()
+                "declaration observation candidate output root {} has no UTF-8 file name",
+                candidate.directory.display()
             )
         })?;
     let prefix = format!(
-        ".{}.declaration-observation.{}.",
+        ".{}.declaration-output.{}.",
         candidate.expected_module_name,
         std::process::id()
     );
-    let nonce = file_name
+    let nonce = directory_name
         .strip_prefix(&prefix)
-        .and_then(|tail| tail.strip_suffix(".olean"))
         .filter(|tail| !tail.is_empty() && tail.bytes().all(|byte| byte.is_ascii_digit()))
         .ok_or_else(|| {
             format!(
-                "declaration observation candidate {} is not one compiler-allocated temporary `.olean` path",
-                candidate.path.display()
+                "declaration observation candidate output root {} is not one compiler-allocated temporary directory",
+                candidate.directory.display()
             )
         })?;
     nonce.parse::<u64>().map_err(|_| {
         format!(
-            "declaration observation candidate {} has an out-of-range allocation nonce",
-            candidate.path.display()
+            "declaration observation candidate output root {} has an out-of-range allocation nonce",
+            candidate.directory.display()
         )
     })?;
     Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum DeclarationCandidateOutputState {
+    Empty,
+    TraditionalOlean,
+}
+
+fn require_declaration_candidate_output_state(
+    candidate: &DeclarationCandidateOlean,
+    expected: DeclarationCandidateOutputState,
+) -> Result<(), String> {
+    let mut entries = std::fs::read_dir(&candidate.directory)
+        .map_err(|error| {
+            format!(
+                "cannot enumerate declaration observation candidate output root {}: {error}",
+                candidate.directory.display()
+            )
+        })?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| {
+            format!(
+                "cannot enumerate an entry in declaration observation candidate output root {}: {error}",
+                candidate.directory.display()
+            )
+        })?;
+    entries.sort_by_key(std::fs::DirEntry::file_name);
+    match expected {
+        DeclarationCandidateOutputState::Empty if entries.is_empty() => Ok(()),
+        DeclarationCandidateOutputState::TraditionalOlean
+            if entries.len() == 1 && entries[0].path() == candidate.path =>
+        {
+            let metadata = std::fs::symlink_metadata(&candidate.path).map_err(|error| {
+                format!(
+                    "cannot inspect declaration observation candidate {}: {error}",
+                    candidate.path.display()
+                )
+            })?;
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                return Err(format!(
+                    "declaration observation candidate {} is not a regular non-symlink file",
+                    candidate.path.display()
+                ));
+            }
+            Ok(())
+        }
+        _ => Err(format!(
+            "declaration observation candidate output root {} contains an unexpected multipart, IR, or unowned output set: {:?}",
+            candidate.directory.display(),
+            entries
+                .iter()
+                .map(std::fs::DirEntry::file_name)
+                .collect::<Vec<_>>()
+        )),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3160,19 +3436,15 @@ fn bind_declaration_observation(
     })
 }
 
-/// Observe one explicit, freshly compiled temporary `.olean` under the same
-/// global proof-workload serialization as Lean and the ingress auditor. This
-/// dormant B1c helper only binds exact bytes and `readModuleData` inventory; it
-/// neither imports/replays the candidate nor makes any acceptance decision.
-/// No production verification, publication, cache-hit, or assurance path calls
-/// it in this tranche.
-#[allow(dead_code)]
-pub(crate) fn observe_declaration_module(
+fn observe_declaration_module_locked(
+    _process_lock: &ProofProcessLock,
     repo_root: &Path,
     environment: &ProofEnvironment,
+    built: &Path,
     subject: &DeclarationAuditSubject,
     expected_emitted: &Emitted,
     candidate: &DeclarationCandidateOlean,
+    proof_ready_before: ExactObservedFile,
 ) -> Result<DeclarationModuleObservation, String> {
     validate_declaration_candidate_path(repo_root, candidate)?;
     validate_declaration_observation_subject(
@@ -3183,18 +3455,16 @@ pub(crate) fn observe_declaration_module(
         candidate,
     )?;
     let request = declaration_inventory_request(candidate.path())?;
-
-    // `ensure_built` may itself acquire the non-reentrant process mutex on a
-    // cold build, so resolve the immutable build before entering this workload.
-    let built = environment.ensure_built(repo_root)?;
     let ready = built.join("READY");
     let inventory_executable = declaration_inventory_path(&built);
     let lean_dir = built.join("lean");
 
-    let _process_lock = ProofProcessLock::acquire(repo_root)?;
     environment.validate_built(&built)?;
     validate_declaration_candidate_path(repo_root, candidate)?;
-    let proof_ready_before = observe_regular_file(&ready, "proof READY")?;
+    require_declaration_candidate_output_state(
+        candidate,
+        DeclarationCandidateOutputState::TraditionalOlean,
+    )?;
     let candidate_before = observe_regular_file(
         candidate.path(),
         "declaration observation candidate `.olean`",
@@ -3242,6 +3512,10 @@ pub(crate) fn observe_declaration_module(
         candidate.path(),
         "declaration observation candidate `.olean`",
     )?;
+    require_declaration_candidate_output_state(
+        candidate,
+        DeclarationCandidateOutputState::TraditionalOlean,
+    )?;
     environment.validate_built(&built)?;
     let proof_ready_after = observe_regular_file(&ready, "proof READY")?;
     bind_declaration_observation(
@@ -3261,7 +3535,227 @@ pub(crate) fn observe_declaration_module(
     )
 }
 
-fn require_terminal_sentinel(emitted: &Emitted) -> Result<(), IngressAuditFailure> {
+/// Observe one explicit, freshly compiled temporary `.olean` under the same
+/// global proof-workload serialization as Lean and the ingress auditor. This
+/// dormant B1c helper only binds exact bytes and `readModuleData` inventory; it
+/// neither imports/replays the candidate nor makes any acceptance decision.
+/// No production verification, publication, cache-hit, or assurance path calls
+/// it in this tranche.
+#[allow(dead_code)]
+pub(crate) fn observe_declaration_module(
+    repo_root: &Path,
+    environment: &ProofEnvironment,
+    subject: &DeclarationAuditSubject,
+    expected_emitted: &Emitted,
+    candidate: &DeclarationCandidateOlean,
+) -> Result<DeclarationModuleObservation, String> {
+    validate_declaration_candidate_path(repo_root, candidate)?;
+    validate_declaration_observation_subject(
+        environment.id(),
+        environment.policy(),
+        subject,
+        expected_emitted,
+        candidate,
+    )?;
+    // `ensure_built` may itself acquire the non-reentrant process mutex on a
+    // cold build, so resolve the immutable build before entering this workload.
+    let built = environment.ensure_built(repo_root)?;
+    let ready = built.join("READY");
+    let process_lock = ProofProcessLock::acquire(repo_root)?;
+    environment.validate_built(&built)?;
+    let proof_ready_before = observe_regular_file(&ready, "proof READY")?;
+    observe_declaration_module_locked(
+        &process_lock,
+        repo_root,
+        environment,
+        &built,
+        subject,
+        expected_emitted,
+        candidate,
+        proof_ready_before,
+    )
+}
+
+fn require_exact_observed_source(
+    observed: &ExactObservedFile,
+    expected_source: &str,
+    phase: &str,
+) -> Result<(), String> {
+    if observed.sha256 != crate::sha256::hex(&observed.bytes) {
+        return Err(format!(
+            "declaration observation source SHA-256 does not match its exact bytes {phase}"
+        ));
+    }
+    if observed.bytes != expected_source.as_bytes() {
+        return Err(format!(
+            "declaration observation source bytes changed {phase}"
+        ));
+    }
+    Ok(())
+}
+
+fn require_absent_candidate(candidate: &DeclarationCandidateOlean) -> Result<(), String> {
+    require_declaration_candidate_output_state(candidate, DeclarationCandidateOutputState::Empty)
+}
+
+fn require_declaration_temporary_path_absent(path: &Path, description: &str) -> Result<(), String> {
+    match std::fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!(
+            "cannot confirm that {description} {} was removed: {error}",
+            path.display()
+        )),
+        Ok(_) => Err(format!(
+            "{description} {} remains after its compiler-owned lifecycle",
+            path.display()
+        )),
+    }
+}
+
+/// Compile and inventory one exact generated module as a single serialized,
+/// ephemeral observation. It authenticates every recorded ingress fragment
+/// before allowing Lean to execute the generated source. This helper remains
+/// deliberately dormant: no production verification, artifact publication,
+/// cache, or assurance path invokes or consumes it.
+/// The nonce-bearing source path may affect `.olean` bytes, so the returned
+/// digest cannot identify a future stable-path artifact without a new policy.
+#[allow(dead_code)]
+pub(crate) fn compile_and_observe_declaration_module(
+    repo_root: &Path,
+    environment: &ProofEnvironment,
+    emitted: &Emitted,
+    subject: &DeclarationAuditSubject,
+) -> Result<CompiledDeclarationObservation, String> {
+    // Compilation executes elaborators and tactics, so even this dormant,
+    // non-authoritative observation must pass the trusted parser boundary
+    // before generated source is materialized or the Lean compiler executes it.
+    audit_ingress(repo_root, environment, emitted).map_err(|failure| failure.message)?;
+
+    // A cold immutable proof build may acquire the same non-reentrant process
+    // mutex, so it must be resolved before this one compound workload begins.
+    let built = environment.ensure_built(repo_root)?;
+    ensure_declaration_observation_modules_dir(repo_root)?;
+    let expected_module_name = subject.candidate.module_name.clone();
+    let ready = built.join("READY");
+    let process_lock = ProofProcessLock::acquire(repo_root)?;
+    environment.validate_built(&built)?;
+    let observation = {
+        // These tokens are scoped inside the already-held process lock, so
+        // reverse-order Drop cleanup always finishes before another
+        // cooperating proof workload can enter this repository.
+        let source = unique_declaration_candidate_source(
+            repo_root,
+            &expected_module_name,
+            &emitted.lean_source,
+        )?;
+        let candidate = unique_declaration_candidate_olean(repo_root, &expected_module_name)?;
+        validate_declaration_observation_subject(
+            environment.id(),
+            environment.policy(),
+            subject,
+            emitted,
+            &candidate,
+        )?;
+        validate_declaration_candidate_source(repo_root, &source)?;
+        validate_declaration_candidate_path(repo_root, &candidate)?;
+
+        let command = generated_lean_command(
+            &built.join("lean"),
+            &modules_dir(repo_root),
+            &source.path,
+            Some((&source.directory, candidate.path())),
+        );
+        require_absent_candidate(&candidate)?;
+        let proof_ready_before = observe_regular_file(&ready, "proof READY")?;
+        let source_before = observe_regular_file(&source.path, "declaration observation source")?;
+        require_exact_observed_source(&source_before, &emitted.lean_source, "before compilation")?;
+
+        let lean_output = run_lean_locked(
+            &process_lock,
+            environment,
+            &built,
+            &source.path,
+            &emitted.lean_source,
+            command,
+        )?;
+        require_observational_compilation_acceptance(emitted, &lean_output)?;
+        validate_declaration_candidate_source(repo_root, &source)?;
+        let source_after_compile =
+            observe_regular_file(&source.path, "declaration observation source")?;
+        require_exact_observed_source(
+            &source_after_compile,
+            &emitted.lean_source,
+            "after compilation",
+        )?;
+
+        let declaration = observe_declaration_module_locked(
+            &process_lock,
+            repo_root,
+            environment,
+            &built,
+            subject,
+            emitted,
+            &candidate,
+            proof_ready_before,
+        )?;
+        validate_declaration_candidate_source(repo_root, &source)?;
+        let source_after_inventory =
+            observe_regular_file(&source.path, "declaration observation source")?;
+        require_exact_observed_source(
+            &source_after_inventory,
+            &emitted.lean_source,
+            "after inventory",
+        )?;
+        if source_before.bytes != source_after_compile.bytes
+            || source_before.bytes != source_after_inventory.bytes
+        {
+            return Err(
+                "declaration observation source did not remain byte-identical across compilation and inventory"
+                    .into(),
+            );
+        }
+
+        CompiledDeclarationObservation {
+            observational: true,
+            authoritative: false,
+            ephemeral_source_root: source.directory.clone(),
+            ephemeral_source_path: source.path.clone(),
+            ephemeral_candidate_root: candidate.directory.clone(),
+            ephemeral_candidate_path: candidate.path.clone(),
+            source_sha256_before: source_before.sha256,
+            source_sha256_after_compile: source_after_compile.sha256,
+            source_sha256_after_inventory: source_after_inventory.sha256,
+            lean_stdout_sha256: crate::sha256::hex(&lean_output.stdout),
+            lean_stdout: lean_output.stdout,
+            lean_messages: lean_output.messages,
+            declaration,
+        }
+    };
+
+    for (path, description) in [
+        (&observation.ephemeral_source_path, "ephemeral source file"),
+        (
+            &observation.ephemeral_source_root,
+            "ephemeral source directory",
+        ),
+        (
+            &observation.ephemeral_candidate_path,
+            "ephemeral candidate file",
+        ),
+        (
+            &observation.ephemeral_candidate_root,
+            "ephemeral candidate directory",
+        ),
+    ] {
+        require_declaration_temporary_path_absent(path, description)?;
+    }
+    drop(process_lock);
+    Ok(observation)
+}
+
+fn terminal_sentinel_preimage(
+    emitted: &Emitted,
+) -> Result<(&ExpectedDeclarationRoot, &str), IngressAuditFailure> {
     let Some(root) = emitted.declaration_envelope.roots.last() else {
         return Err(ingress_transport_failure(
             emitted,
@@ -3279,6 +3773,31 @@ fn require_terminal_sentinel(emitted: &Emitted) -> Result<(), IngressAuditFailur
         return Err(ingress_transport_failure(
             emitted,
             "generated Lean source does not end in its recorded terminal sentinel",
+        ));
+    }
+    let pre_sentinel_source = emitted
+        .lean_source
+        .strip_suffix(&command)
+        .expect("the exact terminal command was checked as a suffix");
+    Ok((root, pre_sentinel_source))
+}
+
+fn require_terminal_sentinel(emitted: &Emitted) -> Result<(), IngressAuditFailure> {
+    terminal_sentinel_preimage(emitted).map(|_| ())
+}
+
+fn require_terminal_sentinel_for_module(
+    emitted: &Emitted,
+    expected_module_name: &str,
+) -> Result<(), IngressAuditFailure> {
+    let (root, pre_sentinel_source) = terminal_sentinel_preimage(emitted)?;
+    let expected_name = terminal_sentinel_name(expected_module_name, pre_sentinel_source);
+    if root.name != expected_name {
+        return Err(ingress_transport_failure(
+            emitted,
+            format!(
+                "generated Lean terminal sentinel does not bind expected module `{expected_module_name}`"
+            ),
         ));
     }
     Ok(())
@@ -3504,37 +4023,44 @@ fn parse_ingress_audit_output(
     ))
 }
 
-/// Check a generated file against an immutable proof build. With `olean_out`,
-/// additionally compile it into an importable generated-module artifact.
-pub fn run_lean(
-    repo_root: &Path,
-    environment: &ProofEnvironment,
-    lean_file: &Path,
-    olean_out: Option<&Path>,
-    expected_source: &str,
-) -> Result<Vec<LeanMessage>, String> {
-    let built = environment.ensure_built(repo_root)?;
-    let lean_dir = built.join("lean");
-    require_generated_source(lean_file, expected_source, "before Lean checking")?;
+struct StrictBatchLeanOutput {
+    status_success: bool,
+    stdout: Vec<u8>,
+    messages: Vec<LeanMessage>,
+}
 
+fn generated_lean_command(
+    lean_dir: &Path,
+    generated_modules: &Path,
+    lean_file: &Path,
+    compile_output: Option<(&Path, &Path)>,
+) -> Command {
     let mut cmd = serial_lean_command(&lean_dir);
     // `lake env` prepends the authenticated proof workspace; generated
     // dependency modules are the only inherited addition.
-    cmd.env("LEAN_PATH", modules_dir(repo_root));
-    if let Some(olean) = olean_out {
-        cmd.arg("--root")
-            .arg(modules_dir(repo_root))
-            .arg("-o")
-            .arg(olean);
+    cmd.env("LEAN_PATH", generated_modules);
+    if let Some((module_root, olean)) = compile_output {
+        cmd.arg("--root").arg(module_root).arg("-o").arg(olean);
     }
-    let _process_lock = ProofProcessLock::acquire(repo_root)?;
-    environment.validate_built(&built)?;
-    require_serial_lake_version(&lean_dir)?;
-    let output = cmd
-        .arg(lean_file)
+    cmd.arg(lean_file);
+    cmd
+}
+
+fn run_lean_locked(
+    _process_lock: &ProofProcessLock,
+    environment: &ProofEnvironment,
+    built: &Path,
+    lean_file: &Path,
+    expected_source: &str,
+    mut command: Command,
+) -> Result<StrictBatchLeanOutput, String> {
+    environment.validate_built(built)?;
+    require_generated_source(lean_file, expected_source, "before Lean checking")?;
+    require_serial_lake_version(&built.join("lean"))?;
+    let output = command
         .output()
         .map_err(|err| format!("failed to run `lean`: {err}"))?;
-    environment.validate_built(&built)?;
+    environment.validate_built(built)?;
     require_generated_source(lean_file, expected_source, "while Lean was checking")?;
 
     let messages = parse_lean_output(&output.stdout, &output.stderr)?;
@@ -3550,7 +4076,41 @@ pub fn run_lean(
         ));
     }
 
-    Ok(messages)
+    Ok(StrictBatchLeanOutput {
+        status_success: output.status.success(),
+        stdout: output.stdout,
+        messages,
+    })
+}
+
+/// Check a generated file against an immutable proof build. With `olean_out`,
+/// additionally compile it into an importable generated-module artifact.
+pub fn run_lean(
+    repo_root: &Path,
+    environment: &ProofEnvironment,
+    lean_file: &Path,
+    olean_out: Option<&Path>,
+    expected_source: &str,
+) -> Result<Vec<LeanMessage>, String> {
+    let built = environment.ensure_built(repo_root)?;
+    require_generated_source(lean_file, expected_source, "before Lean checking")?;
+    let generated_modules = modules_dir(repo_root);
+    let command = generated_lean_command(
+        &built.join("lean"),
+        &generated_modules,
+        lean_file,
+        olean_out.map(|output| (generated_modules.as_path(), output)),
+    );
+    let process_lock = ProofProcessLock::acquire(repo_root)?;
+    run_lean_locked(
+        &process_lock,
+        environment,
+        &built,
+        lean_file,
+        expected_source,
+        command,
+    )
+    .map(|output| output.messages)
 }
 
 pub(crate) fn supported_diagnostic_severity(severity: &str) -> bool {
@@ -3893,6 +4453,37 @@ fn diagnostic_disposition(emitted: &Emitted, message: &LeanMessage) -> Diagnosti
     } else {
         DiagnosticDisposition::FatalUnexpected
     }
+}
+
+fn require_observational_compilation_acceptance(
+    emitted: &Emitted,
+    output: &StrictBatchLeanOutput,
+) -> Result<(), String> {
+    if let Some(message) = output
+        .messages
+        .iter()
+        .find(|message| message.severity == "error")
+    {
+        return Err(format!(
+            "declaration observation Lean compilation reported an error on line {}: {}",
+            message.line, message.data
+        ));
+    }
+    if !output.status_success {
+        return Err(
+            "declaration observation Lean compilation exited unsuccessfully without an accepted result"
+                .into(),
+        );
+    }
+    if let Some(message) = output.messages.iter().find(|message| {
+        diagnostic_disposition(emitted, message) == DiagnosticDisposition::FatalUnexpected
+    }) {
+        return Err(format!(
+            "declaration observation Lean compilation emitted an unrecognized `{}` diagnostic on line {}: {}",
+            message.severity, message.line, message.data
+        ));
+    }
+    Ok(())
 }
 
 fn warning_span(entry: Option<&MapEntry>, vc: &VcResult) -> Span {
@@ -4470,28 +5061,224 @@ mod proof_build_tests {
         let second = unique_declaration_candidate_olean(&root, "Root_module")
             .expect("allocate second candidate capability");
         assert_ne!(first.path(), second.path());
-        assert_eq!(first.path().parent(), Some(modules_dir(&root).as_path()));
+        assert_eq!(first.path().parent(), Some(first.directory.as_path()));
+        assert_eq!(first.directory.parent(), Some(modules_dir(&root).as_path()));
         assert!(first.path().is_absolute());
+        assert_eq!(
+            first.path().file_name().and_then(|name| name.to_str()),
+            Some("Root_module.olean")
+        );
         assert!(
             first
-                .path()
+                .directory
                 .file_name()
                 .and_then(|name| name.to_str())
-                .is_some_and(|name| name.starts_with(".Root_module.declaration-observation."))
+                .is_some_and(|name| name.starts_with(".Root_module.declaration-output."))
         );
 
         let first_path = first.path().to_path_buf();
+        let first_directory = first.directory.clone();
         std::fs::write(&first_path, b"future temporary candidate")
             .expect("write only the capability-owned candidate path");
+        require_declaration_candidate_output_state(
+            &first,
+            DeclarationCandidateOutputState::TraditionalOlean,
+        )
+        .expect("one regular traditional olean is the exact admitted output set");
+        let server_sidecar = declaration_candidate_output_paths(&first)[1].clone();
+        std::fs::write(&server_sidecar, b"future module-system sidecar")
+            .expect("write rejected sidecar fixture");
+        assert!(
+            require_declaration_candidate_output_state(
+                &first,
+                DeclarationCandidateOutputState::TraditionalOlean,
+            )
+            .is_err()
+        );
         drop(first);
         assert!(
             std::fs::symlink_metadata(&first_path).is_err(),
             "dropping the capability removes its regular temporary candidate"
         );
+        assert!(std::fs::symlink_metadata(&server_sidecar).is_err());
+        assert!(std::fs::symlink_metadata(&first_directory).is_err());
 
         assert!(unique_declaration_candidate_olean(&root, "../escape").is_err());
         assert!(unique_declaration_candidate_olean(Path::new("relative"), "Root_module").is_err());
         drop(second);
+    }
+
+    #[test]
+    fn declaration_compilation_source_lifecycle_is_exact_and_nonrecursive() {
+        let root = unique_directory(
+            &std::env::temp_dir(),
+            "sable-declaration-compilation-source-test",
+        )
+        .expect("create isolated compilation source tree");
+        let _cleanup = TempProofTree(root.clone());
+        let exact_source = "import Sable\n\n";
+
+        let source = unique_declaration_candidate_source(&root, "Root_module", exact_source)
+            .expect("allocate exact temporary source");
+        assert_eq!(
+            source.path.file_name().and_then(|name| name.to_str()),
+            Some("Root_module.lean")
+        );
+        assert_eq!(source.path.parent(), Some(source.directory.as_path()));
+        assert_eq!(
+            source.directory.parent(),
+            Some(modules_dir(&root).as_path())
+        );
+        validate_declaration_candidate_source(&root, &source)
+            .expect("one exact regular source is the complete workspace");
+        let observed = observe_regular_file(&source.path, "test source")
+            .expect("observe exact regular source");
+        require_exact_observed_source(&observed, exact_source, "in the test")
+            .expect("source bytes and digest match");
+        let source_dir = source.directory.clone();
+        let source_path = source.path.clone();
+        drop(source);
+        assert!(std::fs::symlink_metadata(&source_path).is_err());
+        assert!(std::fs::symlink_metadata(&source_dir).is_err());
+
+        let changed = unique_declaration_candidate_source(&root, "Changed", exact_source)
+            .expect("allocate mutation fixture");
+        std::fs::write(&changed.path, "import Sable\n-- changed\n").expect("mutate owned fixture");
+        let changed_bytes = observe_regular_file(&changed.path, "changed test source")
+            .expect("observe changed source");
+        assert!(
+            require_exact_observed_source(&changed_bytes, exact_source, "after mutation").is_err()
+        );
+        drop(changed);
+
+        let residual = unique_declaration_candidate_source(&root, "Residual", exact_source)
+            .expect("allocate residual fixture");
+        let residual_dir = residual.directory.clone();
+        let residual_source = residual.path.clone();
+        std::fs::write(residual_dir.join("unexpected.output"), b"unmodeled")
+            .expect("write unexpected residual");
+        assert!(validate_declaration_candidate_source(&root, &residual).is_err());
+        drop(residual);
+        assert!(std::fs::symlink_metadata(&residual_source).is_err());
+        assert!(
+            residual_dir.is_dir(),
+            "nonrecursive cleanup leaves an unexpected residual visible"
+        );
+
+        let preexisting = unique_declaration_candidate_olean(&root, "Preexisting")
+            .expect("allocate output capability");
+        std::fs::write(preexisting.path(), b"preexisting candidate")
+            .expect("create candidate before compilation");
+        assert!(require_absent_candidate(&preexisting).is_err());
+        drop(preexisting);
+    }
+
+    #[test]
+    fn declaration_compilation_source_rejects_a_replacement_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let root = unique_directory(
+            &std::env::temp_dir(),
+            "sable-declaration-compilation-symlink-test",
+        )
+        .expect("create isolated symlink test tree");
+        let _cleanup = TempProofTree(root.clone());
+        let source = unique_declaration_candidate_source(&root, "Root_module", "import Sable\n")
+            .expect("allocate source fixture");
+        let target = root.join("attacker-controlled.lean");
+        std::fs::write(&target, "import Sable\n").expect("write symlink target");
+        std::fs::remove_file(&source.path).expect("replace owned source fixture");
+        symlink(&target, &source.path).expect("install replacement symlink");
+        assert!(validate_declaration_candidate_source(&root, &source).is_err());
+        assert!(observe_regular_file(&source.path, "replacement source").is_err());
+        let source_dir = source.directory.clone();
+        drop(source);
+        assert!(
+            source_dir.is_dir(),
+            "cleanup refuses to follow or remove a replacement symlink"
+        );
+    }
+
+    #[test]
+    fn declaration_compilation_gate_requires_exit_zero_no_errors_and_owned_warnings() {
+        let emitted = Emitted {
+            lean_source: String::new(),
+            names: EmittedNames::default(),
+            ingress: Vec::new(),
+            declaration_envelope: ExpectedDeclarationEnvelope::default(),
+            map: vec![MapEntry {
+                first_line: 7,
+                last_line: 9,
+                target: MapTarget::Obligation(0),
+            }],
+        };
+        let allowed_warning = LeanMessage {
+            severity: "warning".into(),
+            line: 8,
+            data: "expensive automation: `grind` closed this goal using 20k of its \
+                   100k-heartbeat budget — consider a `discharge` script"
+                .into(),
+        };
+        let information = LeanMessage {
+            severity: "information".into(),
+            line: 8,
+            data: "Try this:\n  grind only [foo]".into(),
+        };
+        require_observational_compilation_acceptance(
+            &emitted,
+            &StrictBatchLeanOutput {
+                status_success: true,
+                stdout: Vec::new(),
+                messages: vec![allowed_warning.clone(), information],
+            },
+        )
+        .expect("the existing owned expensive-automation exception remains nonfatal");
+
+        for output in [
+            StrictBatchLeanOutput {
+                status_success: false,
+                stdout: Vec::new(),
+                messages: Vec::new(),
+            },
+            StrictBatchLeanOutput {
+                status_success: false,
+                stdout: Vec::new(),
+                messages: vec![LeanMessage {
+                    severity: "error".into(),
+                    line: 1,
+                    data: "failed proof".into(),
+                }],
+            },
+            StrictBatchLeanOutput {
+                status_success: true,
+                stdout: Vec::new(),
+                messages: vec![LeanMessage {
+                    severity: "error".into(),
+                    line: 1,
+                    data: "error despite exit zero".into(),
+                }],
+            },
+            StrictBatchLeanOutput {
+                status_success: true,
+                stdout: Vec::new(),
+                messages: vec![LeanMessage {
+                    severity: "warning".into(),
+                    line: 8,
+                    data: "declaration uses 'sorry'".into(),
+                }],
+            },
+            StrictBatchLeanOutput {
+                status_success: true,
+                stdout: Vec::new(),
+                messages: vec![LeanMessage {
+                    severity: allowed_warning.severity.clone(),
+                    line: 10,
+                    data: allowed_warning.data.clone(),
+                }],
+            },
+        ] {
+            assert!(require_observational_compilation_acceptance(&emitted, &output).is_err());
+        }
     }
 
     #[test]
@@ -4653,6 +5440,27 @@ mod proof_build_tests {
                 Vec::new(),
             )
             .is_err()
+        );
+        let relabeled_emitted = draft_with_source("import Sable\n\n").finish("Original_module");
+        let relabeled_subject = DeclarationAuditSubject::new(
+            "proof-environment",
+            "proof-policy",
+            DeclarationModuleSubject::from_emitted("Root_module", &relabeled_emitted),
+            Vec::new(),
+        );
+        assert!(
+            bind(
+                &relabeled_subject,
+                &relabeled_emitted,
+                ready,
+                candidate_bytes,
+                request.clone(),
+                true,
+                result.clone(),
+                Vec::new(),
+            )
+            .is_err(),
+            "an Emitted value finalized for another module cannot be relabeled"
         );
         let changed_emitted =
             draft_with_source("import Sable\n-- changed source\n\n").finish("Root_module");
@@ -5169,6 +5977,96 @@ mod proof_build_tests {
     }
 
     #[test]
+    #[ignore = "end-to-end canary; explicitly runs the pinned proof build, ingress auditor, Lean compiler, and declaration inventory"]
+    fn declaration_compile_and_observe_cross_language_canary() {
+        assert_eq!(
+            std::env::var("SABLE_RUN_DECLARATION_COMPILE_OBSERVATION_CANARY").as_deref(),
+            Ok("1"),
+            "set SABLE_RUN_DECLARATION_COMPILE_OBSERVATION_CANARY=1 to authorize this ignored Lean canary"
+        );
+        let repo_root = PathBuf::from(
+            std::env::var_os("SABLE_DECLARATION_COMPILE_OBSERVATION_REPO")
+                .expect("set SABLE_DECLARATION_COMPILE_OBSERVATION_REPO to the explicit repo root"),
+        );
+        assert!(repo_root.is_absolute());
+        let environment =
+            ProofEnvironment::capture(&repo_root).expect("capture exact proof environment");
+        let module_name = "SableGeneratedDeclarationObservationCanary";
+        let emitted = draft_with_source("import Sable\n\n").finish(module_name);
+        let subject = DeclarationAuditSubject::new(
+            environment.id(),
+            environment.policy(),
+            DeclarationModuleSubject::from_emitted(module_name, &emitted),
+            Vec::new(),
+        );
+        let temporary_entries = |root: &Path| -> std::collections::BTreeSet<String> {
+            let modules = modules_dir(root);
+            let Ok(entries) = std::fs::read_dir(modules) else {
+                return std::collections::BTreeSet::new();
+            };
+            entries
+                .filter_map(Result::ok)
+                .filter_map(|entry| entry.file_name().into_string().ok())
+                .filter(|name| {
+                    name.contains(".declaration-source.") || name.contains(".declaration-output.")
+                })
+                .collect()
+        };
+        let before = temporary_entries(&repo_root);
+        let observation =
+            compile_and_observe_declaration_module(&repo_root, &environment, &emitted, &subject)
+                .expect("strict ephemeral compilation and inventory observation pass");
+        let after = temporary_entries(&repo_root);
+
+        assert_eq!(before, after, "all owned temporary paths are cleaned");
+        assert!(
+            std::fs::symlink_metadata(&observation.ephemeral_source_path).is_err(),
+            "the exact ephemeral source file is removed before return"
+        );
+        assert!(
+            std::fs::symlink_metadata(&observation.ephemeral_source_root).is_err(),
+            "the exact ephemeral source directory is removed before return"
+        );
+        assert!(
+            std::fs::symlink_metadata(&observation.ephemeral_candidate_path).is_err(),
+            "the exact ephemeral candidate file is removed before return"
+        );
+        assert!(
+            std::fs::symlink_metadata(&observation.ephemeral_candidate_root).is_err(),
+            "the exact ephemeral candidate directory is removed before return"
+        );
+        assert!(observation.observational);
+        assert!(!observation.authoritative);
+        assert_eq!(
+            observation.source_sha256_before,
+            crate::sha256::hex(emitted.lean_source.as_bytes())
+        );
+        assert_eq!(
+            observation.source_sha256_before,
+            observation.source_sha256_after_compile
+        );
+        assert_eq!(
+            observation.source_sha256_before,
+            observation.source_sha256_after_inventory
+        );
+        assert_eq!(
+            observation.lean_stdout_sha256,
+            crate::sha256::hex(&observation.lean_stdout)
+        );
+        assert!(
+            observation
+                .lean_messages
+                .iter()
+                .all(|message| message.severity != "error")
+        );
+        assert!(observation.declaration.observational);
+        assert!(!observation.declaration.authoritative);
+        assert_eq!(observation.declaration.expected_module_name, module_name);
+        assert!(observation.declaration.inventory.observational);
+        assert!(!observation.declaration.inventory.is_module);
+    }
+
+    #[test]
     fn declaration_inventory_transport_rejects_noncanonical_or_loose_evidence() {
         let exact = concat!(
             r#"{"constants":[],"extension_families":[],"extra_const_names":[],"imports":[],"is_module":false,"observational":true,"schema":"sable-declaration-inventory-result-v1"}"#,
@@ -5493,6 +6391,49 @@ mod proof_build_tests {
         assert_eq!(
             declaration_inventory.get_args().collect::<Vec<_>>(),
             [OsStr::new("env"), declaration_inventory_path.as_os_str()]
+        );
+    }
+
+    #[test]
+    fn declaration_compilation_command_pins_ephemeral_root_output_source_and_dependencies() {
+        let lean_dir = Path::new("proof-environment/lean");
+        let modules = Path::new("/repo/.sable-out/modules");
+        let source_root = modules.join(".Root_module.declaration-source.42.7");
+        let source = source_root.join("Root_module.lean");
+        let candidate = modules
+            .join(".Root_module.declaration-output.42.8")
+            .join("Root_module.olean");
+        let command =
+            generated_lean_command(lean_dir, modules, &source, Some((&source_root, &candidate)));
+        assert_eq!(command.get_program(), OsStr::new("lake"));
+        assert_eq!(command.get_current_dir(), Some(lean_dir));
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            [
+                OsStr::new("env"),
+                OsStr::new("lean"),
+                OsStr::new("--json"),
+                OsStr::new("--root"),
+                source_root.as_os_str(),
+                OsStr::new("-o"),
+                candidate.as_os_str(),
+                source.as_os_str(),
+            ]
+        );
+        let envs = command.get_envs().collect::<Vec<_>>();
+        assert!(envs.contains(&(OsStr::new("LEAN_PATH"), Some(modules.as_os_str()))));
+        for name in PROOF_TOOL_OVERRIDES {
+            if name != "LEAN_PATH" {
+                assert!(
+                    envs.contains(&(OsStr::new(name), None)),
+                    "declaration compilation removes ambient override {name}"
+                );
+            }
+        }
+        assert_eq!(
+            source.file_name().and_then(|name| name.to_str()),
+            Some("Root_module.lean"),
+            "the explicit root yields the exact expected module name"
         );
     }
 
