@@ -3,7 +3,7 @@
 This is the audit ledger for defects at Sable's semantic boundaries. It is a
 record of evidence, not a claim that every compiler bug is a soundness bug and
 not a substitute for the future source-to-SVM soundness theorem. The snapshot
-below covers repository history through `208a46a` on 2026-08-20.
+below covers repository history through `a2d0adc` on 2026-08-20.
 
 ## Method
 
@@ -46,13 +46,16 @@ than guessing.
 The current certificate boundary matters when reading the final field in each
 record. ADRs 0087–0088 certify selected explicit unique-borrow call write-back;
 ADR 0093 additionally certifies structural local/direct-field slot take and put
-write-back. The checker-authored ownership plan and retained control plan have
-exact fail-closed consumers, but are trusted Rust data, not certificates. The
-local SVM move frame theorem proves one machine step, not source translation.
+write-back. ADR 0094 separately certifies the alias-safety decision for a
+closed checker-recorded receiver-first, left-to-right argument schedule. Its
+typed-AST/ownership-record extraction remains trusted Rust provenance. The
+checker-authored ownership plan and retained control plan have exact fail-closed
+consumers, but are trusted Rust data, not certificates. The local SVM move
+frame theorem proves one machine step, not source translation.
 
 ## Summary
 
-The count is nine confirmed verified-false root causes, eight accepted-invalid
+The count is ten confirmed verified-false root causes, eight accepted-invalid
 families, three runtime/monitoring divergences, three fail-open ICE families,
 and ten pre-merge or pre-admission near misses.
 
@@ -67,6 +70,7 @@ and ten pre-merge or pre-admission near misses.
 | VF-07 | Confirmed verified-false | `b0f6851`, 2026-08-17 | yes | fail-open havoc dispatch |
 | VF-08 | Confirmed verified-false | `1dd9b40` / `c63300c`, 2026-08-18 | yes | borrow plus move in one call |
 | VF-09 | Confirmed verified-false | `4b4f93d`, 2026-08-20 | yes at `7957ad0`; no tagged release | pending-loan argument timing |
+| VF-10 | Confirmed verified-false; strongest-status mitigation only | confirmed on `77bdf49`; status mitigation `a2d0adc`, 2026-08-20; ingress open | yes at `77bdf49`; no tagged release | unauthenticated proof ingress |
 | AI-01 | Accepted-invalid | `fa92e12`, 2026-08-11 | yes | borrow-after-move |
 | AI-02 | Accepted-invalid/model mismatch | `842d1af`, 2026-08-16 | yes | owner visible during exposure |
 | AI-03 | Accepted-invalid | `a7969ec` / `c46ba94` / `3251c23`, 2026-08-12 | yes | incomplete per-place ownership state |
@@ -152,9 +156,10 @@ harness; neither result is rewritten here as an incident.
   [`borrow_conflict.sable`](../corpus/must-fail/borrow_conflict.sable) and
   [`borrow_conflict_field.sable`](../corpus/must-fail/borrow_conflict_field.sable).
   The defect was found while scoping the place engine for resource work.
-- **Certificate coverage now:** none for disjointness. A call write-back
-  certificate can validate the selected post-state without proving that two
-  selected argument places are disjoint.
+- **Certificate coverage now:** partial after ADR 0094. The closed recorded
+  argument schedule rejects overlapping unique/shared loans, but typed-AST and
+  ownership-record extraction remain trusted provenance. A call write-back
+  certificate separately validates the selected post-state.
 
 ### VF-04 — a mutating method call hidden in an initializer escaped loop havoc
 
@@ -270,9 +275,9 @@ harness; neither result is rewritten here as an incident.
   The base array case was found adjacent to owned-array parameter admission;
   adversarial review found the nested and class counterexamples and invalidated
   an earlier hand argument that the class case was safe.
-- **Certificate coverage now:** none for borrow/move conflict. The ownership
-  plan records the independently checked transitions; it does not certify
-  their non-overlap.
+- **Certificate coverage now:** partial after ADR 0094. The closed recorded
+  argument schedule rejects a move overlapping a pending loan, but extraction
+  of the move and loan records from the source remains trusted Rust provenance.
 
 ### VF-09 — an earlier pending shared loan survived a later nested mutation
 
@@ -307,10 +312,44 @@ harness; neither result is rewritten here as an incident.
   direct false-post timing twin absent from the handwritten corpus. `208a46a`
   turns that sprint into a deterministic integration matrix with proof,
   interpreter, diagnostic, and metamorphic oracles.
-- **Certificate coverage now:** none for evaluation scheduling or pending-loan
-  stability. A
-  call-havoc certificate can validate a selected unique write-back without
-  proving that a prior shared loan made the later nested mutation inadmissible.
+- **Certificate coverage now:** partial after ADR 0094. The closed recorded
+  schedule checks receiver-first, left-to-right pending-loan stability against
+  later nested effects. Effect discovery and schedule extraction remain
+  trusted; the call-havoc certificate separately validates selected unique
+  write-back.
+
+### VF-10 — unauthenticated proof ingress could certify a false post
+
+- **Window and exposure:** the exact introducing revision is not yet
+  attributed. Published main revision `77bdf49` accepted both witnesses and
+  reported `status: fully verified`; no tag exists in the affected history.
+- **Witness and false claim:** both programs declare `post result = 1` and
+  return zero. One discharges the obligation with `sorry`, introducing
+  `sorryAx`. The other appends `axiom fabricated : False` as a continuation of
+  a user theorem and later eliminates that false axiom. Lean accepted both
+  generated documents, while the checked runtime monitor rejected the claimed
+  postcondition.
+- **Root cause:** user Lean text could change the proof environment without an
+  exact declaration-delta check, and successful verification did not audit the
+  complete transitive axiom dependency closure. Ignoring the `sorry` warning
+  exposed one route; an ordinary injected axiom can be warning-free, so making
+  warnings fatal alone would not close the incident.
+- **Mitigation and remaining exposure:** `a2d0adc` removes the strongest status
+  globally and reports `Lean accepted; proof dependencies unaudited` through
+  an explicit assurance boundary. This contains the claim but does not fix
+  ingress: both witnesses remain accepted, the axiom closure remains
+  unauthenticated, and release remains blocked.
+- **Regression and discovery:**
+  [`proof_ingress.rs`](../compiler/tests/proof_ingress.rs) runs both witnesses
+  under bounded batch Lean and requires the exact provisional status. When
+  ingress is sealed, this regression must instead require their exact rejection
+  diagnostic. The supplied source-level review identified the routes;
+  repository-local reproduction promoted the finding to confirmed
+  verified-false.
+- **Certificate coverage now:** none. Existing certificates are declarations
+  in the same environment and do not authenticate its axiom closure. Closure
+  requires exact permitted declaration deltas, a transitive axiom audit, and
+  content-bound trust manifests for roots and imports.
 
 ## Accepted-invalid incidents
 
@@ -474,9 +513,9 @@ harness; neither result is rewritten here as an incident.
   requires `borrow.moved_in_call`; focused checker tests also cover nested
   mutation, completed-earlier, and disjoint-effect cases. The VF-09 fix audit
   found the sibling family.
-- **Certificate coverage now:** none for pending-loan admission. Retained sealed
-  effects provide one checker-authored source of mutation identity, but no
-  certificate proves their cross-argument liveness rule.
+- **Certificate coverage now:** partial after ADR 0094. The closed recorded
+  schedule rejects the pending-loan/later-move combination, but extraction of
+  sealed effects and moved-place deltas remains trusted Rust provenance.
 
 ## Runtime and monitoring divergences
 
@@ -801,13 +840,21 @@ C0 changes the expected failure mode without completing the soundness proof.
 Shared place identity, one checker-authored ownership plan, retained structured
 control, exhaustive dispatch, and exact consumer reconciliation make many
 former omissions named internal refusals. Call and slot write-back certificates
-put the Lean kernel under selected structural transitions. None proves that the
-checker chose every required mutation, rejected every alias, or translated the
-source into the right plan. VF-08, AI-05, VF-09, and AI-08 are the clearest
-reason to keep testing admission and evaluation-order interactions
+put the Lean kernel under selected structural transitions; the argument-schedule
+certificate checks alias safety for one closed recorded schedule. None proves
+that the checker chose every required mutation, rejected every alias, or
+translated the source into the right plan. VF-08, AI-05, VF-09, and AI-08 are
+the clearest reason to keep testing admission and evaluation-order interactions
 independently of plan-consumer correctness.
 
-This ledger is the baseline for trend claims. A future entry should be added in
-the commit that fixes the incident, with a minimized witness and regression;
-pre-merge findings should be recorded too, but never counted as exposed or
-verified-false without the corresponding evidence.
+VF-10 is a different trust-boundary failure from the ownership cluster:
+accepted Lean declarations received Sable's strongest status without an
+authenticated axiom closure. The global status downgrade contains the claim
+but leaves ingress open, so this remains an unresolved release-blocking
+incident rather than evidence of a completed fix.
+
+This ledger is the baseline for trend claims. A future confirmed incident
+should be added with a minimized witness and regression; mitigation and fix
+hashes should remain distinct when containment precedes closure. Pre-merge
+findings should be recorded too, but never counted as exposed or verified-false
+without the corresponding evidence.
