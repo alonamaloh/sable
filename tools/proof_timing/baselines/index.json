@@ -1,0 +1,42 @@
+{
+  "schema": "sable-proof-timing-baseline-index-v1",
+  "pairs": [
+    {
+      "revision": "25ebc21e71fb7827bf50bd39432e00fd9754c234",
+      "machine": "alvaros-m2-air-arm64",
+      "series_id": "20260820T024046Z",
+      "protocol_schema": "sable-proof-timing-v2",
+      "proof_environment_id": "proof-env-v2-fnv64:efcb796dad17d027",
+      "subject_manifest_sha256": "f71017b0076fbd614fd937a78c21afcdae2b1f14b9680ce722dd870ff63d2fcb",
+      "cold": {
+        "path": "tools/proof_timing/baselines/25ebc21e71fb7827bf50bd39432e00fd9754c234/alvaros-m2-air-arm64/20260820T024046Z-cold-roots.json",
+        "sha256": "35541629c14b837f5ac0505e2dbdabaa1067bdd292d494ed1bb29240db56b7cb",
+        "verification_wall_total_ns": 313915229292,
+        "subject_median_ns": 819984875,
+        "subject_p95_ns": 11512766209
+      },
+      "warm": {
+        "path": "tools/proof_timing/baselines/25ebc21e71fb7827bf50bd39432e00fd9754c234/alvaros-m2-air-arm64/20260820T024046Z-warm-artifacts.json",
+        "sha256": "bc70e245711597776cfa037d4a382c5aae9f628dd18f75b641deff8061ee5c7a",
+        "verification_wall_total_ns": 218626943125,
+        "subject_median_ns": 791871166,
+        "subject_p95_ns": 5262346875
+      },
+      "external_monitor": {
+        "sampling_interval_ms": 250,
+        "identity": "basename of ps comm equals lean",
+        "max_actual_lean_processes": 1,
+        "hard_process_ceiling": 2,
+        "cold_load1_range": [
+          2.78,
+          6.21
+        ],
+        "warm_load1_range": [
+          4.46,
+          6.76
+        ]
+      },
+      "context": "First clean proof-timing v2 cold/warm pair. Both reports are baseline/ok with 126 of 126 measured subjects verified and zero warnings, defers, assumptions, or failures. The external process observation is separate from the raw reports. The cold/warm difference is observational and does not isolate artifact-cache effects from page-cache, thermal, or scheduler state."
+    }
+  ]
+}
