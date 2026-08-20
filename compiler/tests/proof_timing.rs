@@ -181,17 +181,21 @@ struct ProofBuildIdentity {
     sable_olean: ProofBuildFileIdentity,
     local_oleans: Vec<ProofBuildFileIdentity>,
     proof_auditor: ProofBuildFileIdentity,
+    /// READY-bound observational inventory executable. It is provenance only:
+    /// the v3 timing workload does not invoke it per document.
+    declaration_inventory: ProofBuildFileIdentity,
 }
 
 impl ProofBuildIdentity {
     fn to_json(&self) -> Value {
         json!({
             "manifest_sha256": self.manifest_sha256,
-            "manifest_kind": "READY plus the exact sorted local .olean set and proof-ingress auditor; content SHA-256, size, and mtime are bound for every file; Unix reports also bind device/inode",
+            "manifest_kind": "READY plus the exact sorted local .olean set, proof-ingress auditor, and dormant observational declaration inventory; content SHA-256, size, and mtime are bound for every file; Unix reports also bind device/inode",
             "ready": self.ready.to_json(),
             "sable_olean": self.sable_olean.to_json(),
             "local_oleans": self.local_oleans.iter().map(ProofBuildFileIdentity::to_json).collect::<Vec<_>>(),
             "proof_auditor": self.proof_auditor.to_json(),
+            "declaration_inventory": self.declaration_inventory.to_json(),
         })
     }
 }
@@ -857,28 +861,23 @@ fn collect_proof_build_oleans(
     Ok(())
 }
 
-fn proof_build_identity(root: &Path, id: &str) -> Result<ProofBuildIdentity, String> {
-    let built = proof_environment_built_dir(root, id);
-    let ready = proof_build_file_identity(&built.join("READY"), "READY", true)?;
-    let olean_root = built.join("lean/.lake/build/lib/lean");
-    let mut local_oleans = Vec::new();
-    collect_proof_build_oleans(&olean_root, Path::new(""), &mut local_oleans)?;
-    local_oleans.sort_by(|left, right| left.path.cmp(&right.path));
-    let sable_olean = local_oleans
-        .iter()
-        .find(|entry| entry.path == "Sable.olean")
-        .cloned()
-        .ok_or_else(|| "proof-build identity is missing `Sable.olean`".to_owned())?;
-    let proof_auditor = proof_build_file_identity(
-        &built.join("lean/.lake/build/bin/sable-proof-audit"),
-        "lean/.lake/build/bin/sable-proof-audit",
-        true,
-    )?;
+// Internal framing revision within timing schema v3. The measured workload and
+// report schema stay v3; `.1` records that the READY-bound dormant declaration
+// inventory binary joined the complete proof-build identity.
+const PROOF_BUILD_IDENTITY_DOMAIN: &[u8] = b"sable-proof-timing-proof-build-identity-v3.1";
+
+fn proof_build_manifest_sha256(
+    ready: &ProofBuildFileIdentity,
+    local_oleans: &[ProofBuildFileIdentity],
+    proof_auditor: &ProofBuildFileIdentity,
+    declaration_inventory: &ProofBuildFileIdentity,
+) -> String {
     let mut framed = Vec::new();
-    frame(&mut framed, b"sable-proof-timing-proof-build-identity-v3");
-    for entry in std::iter::once(&ready)
+    frame(&mut framed, PROOF_BUILD_IDENTITY_DOMAIN);
+    for entry in std::iter::once(ready)
         .chain(local_oleans.iter())
-        .chain(std::iter::once(&proof_auditor))
+        .chain(std::iter::once(proof_auditor))
+        .chain(std::iter::once(declaration_inventory))
     {
         frame(&mut framed, entry.path.as_bytes());
         frame(&mut framed, &entry.bytes.to_le_bytes());
@@ -903,12 +902,44 @@ fn proof_build_identity(root: &Path, id: &str) -> Result<ProofBuildIdentity, Str
                 .as_bytes(),
         );
     }
+    sha256::hex(&framed)
+}
+
+fn proof_build_identity(root: &Path, id: &str) -> Result<ProofBuildIdentity, String> {
+    let built = proof_environment_built_dir(root, id);
+    let ready = proof_build_file_identity(&built.join("READY"), "READY", true)?;
+    let olean_root = built.join("lean/.lake/build/lib/lean");
+    let mut local_oleans = Vec::new();
+    collect_proof_build_oleans(&olean_root, Path::new(""), &mut local_oleans)?;
+    local_oleans.sort_by(|left, right| left.path.cmp(&right.path));
+    let sable_olean = local_oleans
+        .iter()
+        .find(|entry| entry.path == "Sable.olean")
+        .cloned()
+        .ok_or_else(|| "proof-build identity is missing `Sable.olean`".to_owned())?;
+    let proof_auditor = proof_build_file_identity(
+        &built.join("lean/.lake/build/bin/sable-proof-audit"),
+        "lean/.lake/build/bin/sable-proof-audit",
+        true,
+    )?;
+    let declaration_inventory = proof_build_file_identity(
+        &built.join("lean/.lake/build/bin/sable-declaration-audit"),
+        "lean/.lake/build/bin/sable-declaration-audit",
+        true,
+    )?;
+    let manifest_sha256 = proof_build_manifest_sha256(
+        &ready,
+        &local_oleans,
+        &proof_auditor,
+        &declaration_inventory,
+    );
     Ok(ProofBuildIdentity {
-        manifest_sha256: sha256::hex(&framed),
+        manifest_sha256,
         ready,
         sable_olean,
         local_oleans,
         proof_auditor,
+        declaration_inventory,
     })
 }
 
@@ -1211,6 +1242,67 @@ fn executable_profile_uses_the_exact_cargo_output_directory() {
     assert!(
         executable_cargo_profile(Path::new("bin/proof_timing-deadbeef")).is_err(),
         "a copied executable without Cargo profile provenance fails closed"
+    );
+}
+
+#[test]
+fn proof_build_identity_frames_the_dormant_declaration_inventory() {
+    let identity = |path: &str, content: &str| ProofBuildFileIdentity {
+        path: path.into(),
+        bytes: 17,
+        modified_unix_ns: 23,
+        device: Some(29),
+        inode: Some(31),
+        content_sha256: Some(content.into()),
+    };
+    let ready = identity("READY", "ready-sha256");
+    let local_oleans = vec![identity("Sable.olean", "sable-olean-sha256")];
+    let proof_auditor = identity(
+        "lean/.lake/build/bin/sable-proof-audit",
+        "proof-auditor-sha256",
+    );
+    let declaration_inventory = identity(
+        "lean/.lake/build/bin/sable-declaration-audit",
+        "declaration-inventory-sha256",
+    );
+    let exact = proof_build_manifest_sha256(
+        &ready,
+        &local_oleans,
+        &proof_auditor,
+        &declaration_inventory,
+    );
+    let changed_inventory = identity(
+        "lean/.lake/build/bin/sable-declaration-audit",
+        "changed-declaration-inventory-sha256",
+    );
+    assert_ne!(
+        exact,
+        proof_build_manifest_sha256(&ready, &local_oleans, &proof_auditor, &changed_inventory,),
+        "the dormant binary remains part of exact timing provenance"
+    );
+    assert_eq!(
+        PROOF_BUILD_IDENTITY_DOMAIN,
+        b"sable-proof-timing-proof-build-identity-v3.1"
+    );
+
+    let build = ProofBuildIdentity {
+        manifest_sha256: exact,
+        ready,
+        sable_olean: local_oleans[0].clone(),
+        local_oleans,
+        proof_auditor,
+        declaration_inventory,
+    };
+    let json = build.to_json();
+    assert_eq!(
+        json["declaration_inventory"]["path"],
+        "lean/.lake/build/bin/sable-declaration-audit"
+    );
+    assert!(
+        json["manifest_kind"]
+            .as_str()
+            .expect("manifest kind is text")
+            .contains("dormant observational declaration inventory")
     );
 }
 

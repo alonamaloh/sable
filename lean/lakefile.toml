@@ -1,5 +1,5 @@
 name = "sable"
-defaultTargets = ["Sable", "sable-proof-audit"]
+defaultTargets = ["Sable", "sable-proof-audit", "sable-declaration-audit"]
 enableArtifactCache = false
 restoreAllArtifacts = false
 
@@ -9,3 +9,7 @@ name = "Sable"
 [[lean_exe]]
 name = "sable-proof-audit"
 root = "SableProofAudit"
+
+[[lean_exe]]
+name = "sable-declaration-audit"
+root = "SableDeclarationAudit"

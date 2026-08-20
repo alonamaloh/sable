@@ -354,6 +354,90 @@ fn append_framed(output: &mut Vec<u8>, value: &[u8]) {
 
 const INGRESS_REQUEST_SCHEMA: &str = "sable-proof-ingress-request-v2";
 const INGRESS_RESULT_SCHEMA: &str = "sable-proof-ingress-result-v2";
+const DECLARATION_INVENTORY_REQUEST_SCHEMA: &str = "sable-declaration-inventory-request-v1";
+const DECLARATION_INVENTORY_RESULT_SCHEMA: &str = "sable-declaration-inventory-result-v1";
+
+/// Exact recursive Lean `Name` identity. Printable names are insufficient for
+/// hygienic components, so the transport preserves anonymous/str/num shape.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ObservedName {
+    Anonymous,
+    Str {
+        prefix: Box<ObservedName>,
+        value: String,
+    },
+    Num {
+        prefix: Box<ObservedName>,
+        value: u64,
+    },
+}
+
+/// Observed header flags for one direct import in serialized `ModuleData`.
+/// This records bytes produced by Lean; it does not authenticate the imported
+/// module or make the candidate acceptable.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ObservedModuleImport {
+    pub(crate) module: ObservedName,
+    pub(crate) import_all: bool,
+    pub(crate) is_exported: bool,
+    pub(crate) is_meta: bool,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ObservedConstantKind {
+    Axiom,
+    Definition,
+    Theorem,
+    Opaque,
+    Quotient,
+    Inductive,
+    Constructor,
+    Recursor,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ObservedConstantSafety {
+    Safe,
+    Unsafe,
+    Partial,
+}
+
+/// One index in the parallel `ModuleData.constNames`/`constants` arrays.
+/// Either side may be absent so malformed unequal arrays remain observable
+/// rather than being silently truncated by `zip`.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ObservedConstantSlot {
+    pub(crate) const_name: Option<ObservedName>,
+    pub(crate) info_name: Option<ObservedName>,
+    pub(crate) kind: Option<ObservedConstantKind>,
+    pub(crate) safety: Option<ObservedConstantSafety>,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ObservedExtensionFamily {
+    pub(crate) name: ObservedName,
+    pub(crate) count: usize,
+}
+
+/// Strictly parsed, observational output from `Lean.readModuleData`.
+/// No candidate declarations have been imported, replayed, or accepted, and
+/// this value must never authorize cache reuse or raise proof assurance.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DeclarationModuleInventory {
+    pub(crate) observational: bool,
+    pub(crate) is_module: bool,
+    pub(crate) imports: Vec<ObservedModuleImport>,
+    pub(crate) constants: Vec<ObservedConstantSlot>,
+    pub(crate) extra_const_names: Vec<ObservedName>,
+    pub(crate) extension_families: Vec<ObservedExtensionFamily>,
+}
 
 #[derive(Clone)]
 pub(crate) struct IngressFragment {
@@ -1260,12 +1344,13 @@ impl ProofEnvironment {
 }
 
 const PROOF_POLICY_MARKER_FILE: &str = ".sable-verification-policy";
-const PROOF_READY_STAMP_VERSION: &str = "sable-proof-ready-v2";
+const PROOF_READY_STAMP_VERSION: &str = "sable-proof-ready-v3";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ProofBuildOutputDigests {
     local_olean_sha256: BTreeMap<String, String>,
     proof_auditor_sha256: String,
+    declaration_inventory_sha256: String,
 }
 
 fn proof_policy_marker(proof_policy: &str) -> String {
@@ -1342,8 +1427,8 @@ fn proof_ready_stamp(
         ));
     }
     stamp.push_str(&format!(
-        "proof-auditor-sha256:{}\n",
-        output_digests.proof_auditor_sha256,
+        "proof-auditor-sha256:{}\ndeclaration-inventory-sha256:{}\n",
+        output_digests.proof_auditor_sha256, output_digests.declaration_inventory_sha256,
     ));
     stamp
 }
@@ -1402,7 +1487,7 @@ const PROOF_TOOL_OVERRIDES: [&str; 23] = [
 /// Build the captured local Lean library with Lake's asynchronous jobs forced
 /// inline by the audited Lean 4.32 runtime and one import worker. An absent task
 /// manager is the only hard scheduler bound: positive task-worker counts may be
-/// exceeded to avoid deadlock. The two explicit repository targets build in one
+/// exceeded to avoid deadlock. The three explicit repository targets build in one
 /// serialized Lake workload with at most one Lean compiler runtime at a time.
 fn build_proof_environment_serial(
     built: &Path,
@@ -1556,7 +1641,13 @@ fn serial_lake_version_command(lean_dir: &Path) -> Command {
 
 fn serial_lake_build_command(lean_dir: &Path) -> Command {
     let mut command = serial_lake_command(lean_dir);
-    command.args(["--quiet", "build", "Sable", "sable-proof-audit"]);
+    command.args([
+        "--quiet",
+        "build",
+        "Sable",
+        "sable-proof-audit",
+        "sable-declaration-audit",
+    ]);
     command
 }
 
@@ -1569,6 +1660,16 @@ fn serial_lean_command(lean_dir: &Path) -> Command {
 fn serial_proof_auditor_command(lean_dir: &Path, auditor: &Path) -> Command {
     let mut command = serial_lake_command(lean_dir);
     command.args(["env"]).arg(auditor);
+    command
+}
+
+/// Dormant B1b command shape for the observational ModuleData inventory. It is
+/// sanitized and READY-bound now, but production verification does not invoke
+/// it until a later tranche defines and reviews the compiled audit policy.
+#[cfg_attr(not(test), allow(dead_code))]
+fn serial_declaration_inventory_command(lean_dir: &Path, inventory: &Path) -> Command {
+    let mut command = serial_lake_command(lean_dir);
+    command.args(["env"]).arg(inventory);
     command
 }
 
@@ -1873,7 +1974,11 @@ fn remove_unready_built(environment_dir: &Path, built: &Path) -> Result<(), Stri
 fn expected_local_olean_paths(
     files: &BTreeMap<String, Vec<u8>>,
 ) -> Result<std::collections::BTreeSet<String>, String> {
-    for required in ["lean/Sable.lean", "lean/SableProofAudit.lean"] {
+    for required in [
+        "lean/Sable.lean",
+        "lean/SableProofAudit.lean",
+        "lean/SableDeclarationAudit.lean",
+    ] {
         if !files.contains_key(required) {
             return Err(format!(
                 "proof environment is missing trusted output root `{required}`"
@@ -1883,10 +1988,11 @@ fn expected_local_olean_paths(
     for label in files.keys().filter(|label| label.ends_with(".lean")) {
         if label != "lean/Sable.lean"
             && label != "lean/SableProofAudit.lean"
+            && label != "lean/SableDeclarationAudit.lean"
             && !label.starts_with("lean/Sable/")
         {
             return Err(format!(
-                "proof environment contains unsupported Lean source root `{label}`; the trusted output layout is exactly `Sable.lean`, `SableProofAudit.lean`, and `Sable/**`"
+                "proof environment contains unsupported Lean source root `{label}`; the trusted output layout is exactly `Sable.lean`, `SableProofAudit.lean`, `SableDeclarationAudit.lean`, and `Sable/**`"
             ));
         }
     }
@@ -1895,6 +2001,7 @@ fn expected_local_olean_paths(
         .filter(|label| {
             label.as_str() == "lean/Sable.lean"
                 || label.as_str() == "lean/SableProofAudit.lean"
+                || label.as_str() == "lean/SableDeclarationAudit.lean"
                 || label.starts_with("lean/Sable/")
         })
         .filter_map(|label| {
@@ -2008,6 +2115,40 @@ fn unsupported_proof_output_name(file_name: &str) -> bool {
         || file_name.ends_with(".ir")
 }
 
+fn proof_build_executable_digest(path: &Path, description: &str) -> Result<String, String> {
+    let metadata = std::fs::symlink_metadata(path).map_err(|error| {
+        format!(
+            "proof build is missing {description} {}: {error}",
+            path.display()
+        )
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(format!(
+            "proof build output {description} {} is not a regular file",
+            path.display()
+        ));
+    }
+    let bytes = std::fs::read(path).map_err(|error| {
+        format!(
+            "cannot hash trusted proof build output {description} {}: {error}",
+            path.display()
+        )
+    })?;
+    let metadata_after = std::fs::symlink_metadata(path).map_err(|error| {
+        format!(
+            "cannot recheck trusted proof build output {description} {}: {error}",
+            path.display()
+        )
+    })?;
+    if metadata_after.file_type().is_symlink() || !metadata_after.is_file() {
+        return Err(format!(
+            "proof build output {description} {} changed kind while being hashed",
+            path.display()
+        ));
+    }
+    Ok(crate::sha256::hex(&bytes))
+}
+
 fn proof_build_output_digests(
     built: &Path,
     files: &BTreeMap<String, Vec<u8>>,
@@ -2024,45 +2165,25 @@ fn proof_build_output_digests(
             "local proof outputs do not exactly match captured Lean sources; missing={missing:?}, unexpected={unexpected:?}"
         ));
     }
-    let proof_auditor = proof_auditor_path(built);
-    let metadata = std::fs::symlink_metadata(&proof_auditor).map_err(|error| {
-        format!(
-            "proof build is missing {}: {error}",
-            proof_auditor.display()
-        )
-    })?;
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
-        return Err(format!(
-            "proof build output {} is not a regular file",
-            proof_auditor.display()
-        ));
-    }
-    let proof_auditor_bytes = std::fs::read(&proof_auditor).map_err(|error| {
-        format!(
-            "cannot hash trusted proof build output {}: {error}",
-            proof_auditor.display()
-        )
-    })?;
-    let metadata_after = std::fs::symlink_metadata(&proof_auditor).map_err(|error| {
-        format!(
-            "cannot recheck trusted proof build output {}: {error}",
-            proof_auditor.display()
-        )
-    })?;
-    if metadata_after.file_type().is_symlink() || !metadata_after.is_file() {
-        return Err(format!(
-            "proof build output {} changed kind while being hashed",
-            proof_auditor.display()
-        ));
-    }
     Ok(ProofBuildOutputDigests {
         local_olean_sha256,
-        proof_auditor_sha256: crate::sha256::hex(&proof_auditor_bytes),
+        proof_auditor_sha256: proof_build_executable_digest(
+            &proof_auditor_path(built),
+            "proof-ingress auditor",
+        )?,
+        declaration_inventory_sha256: proof_build_executable_digest(
+            &declaration_inventory_path(built),
+            "observational declaration inventory",
+        )?,
     })
 }
 
 fn proof_auditor_path(built: &Path) -> PathBuf {
     built.join("lean/.lake/build/bin/sable-proof-audit")
+}
+
+fn declaration_inventory_path(built: &Path) -> PathBuf {
+    built.join("lean/.lake/build/bin/sable-declaration-audit")
 }
 
 fn fingerprint_bytes(mut hash: u64, bytes: &[u8]) -> u64 {
@@ -2228,6 +2349,379 @@ fn ingress_audit_request(emitted: &Emitted) -> Result<Vec<u8>, serde_json::Error
             "expected_modifiers": &fragment.expected_modifiers,
         })).collect::<Vec<_>>(),
     }))
+}
+
+/// Construct the exact request understood by the observational declaration
+/// inventory executable. B1b deliberately has no production call site.
+#[cfg_attr(not(test), allow(dead_code))]
+fn declaration_inventory_request(candidate_olean: &Path) -> Result<Vec<u8>, String> {
+    let candidate_olean = candidate_olean.to_str().ok_or_else(|| {
+        format!(
+            "declaration inventory candidate path {} is not UTF-8",
+            candidate_olean.display()
+        )
+    })?;
+    if candidate_olean.is_empty() {
+        return Err("declaration inventory candidate path must be nonempty".into());
+    }
+    serde_json::to_vec(&serde_json::json!({
+        "schema": DECLARATION_INVENTORY_REQUEST_SCHEMA,
+        "candidate_olean": candidate_olean,
+    }))
+    .map_err(|error| format!("cannot encode declaration inventory request: {error}"))
+}
+
+fn exact_inventory_object<'a>(
+    value: &'a serde_json::Value,
+    fields: &[&str],
+    description: &str,
+) -> Result<&'a serde_json::Map<String, serde_json::Value>, String> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| format!("{description} must be a JSON object"))?;
+    if object.len() != fields.len() || fields.iter().any(|field| !object.contains_key(*field)) {
+        return Err(format!(
+            "{description} must contain exactly fields {fields:?}, got {:?}",
+            object.keys().collect::<Vec<_>>()
+        ));
+    }
+    Ok(object)
+}
+
+fn inventory_string(
+    object: &serde_json::Map<String, serde_json::Value>,
+    field: &str,
+    description: &str,
+) -> Result<String, String> {
+    object
+        .get(field)
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+        .ok_or_else(|| format!("{description} field `{field}` must be a string"))
+}
+
+fn inventory_bool(
+    object: &serde_json::Map<String, serde_json::Value>,
+    field: &str,
+    description: &str,
+) -> Result<bool, String> {
+    object
+        .get(field)
+        .and_then(serde_json::Value::as_bool)
+        .ok_or_else(|| format!("{description} field `{field}` must be a Boolean"))
+}
+
+fn inventory_array<'a>(
+    object: &'a serde_json::Map<String, serde_json::Value>,
+    field: &str,
+    description: &str,
+) -> Result<&'a Vec<serde_json::Value>, String> {
+    object
+        .get(field)
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| format!("{description} field `{field}` must be an array"))
+}
+
+fn inventory_optional_string(
+    object: &serde_json::Map<String, serde_json::Value>,
+    field: &str,
+    description: &str,
+) -> Result<Option<String>, String> {
+    match object.get(field) {
+        Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::String(value)) => Ok(Some(value.clone())),
+        _ => Err(format!(
+            "{description} field `{field}` must be a string or null"
+        )),
+    }
+}
+
+fn parse_observed_name(
+    value: &serde_json::Value,
+    description: &str,
+) -> Result<ObservedName, String> {
+    if value.is_null() {
+        return Ok(ObservedName::Anonymous);
+    }
+    let object = value
+        .as_object()
+        .ok_or_else(|| format!("{description} must be a structural Lean name"))?;
+    if object.contains_key("str") {
+        let object = exact_inventory_object(value, &["str"], description)?;
+        let parts = object["str"]
+            .as_array()
+            .filter(|parts| parts.len() == 2)
+            .ok_or_else(|| format!("{description} `str` must contain prefix and value"))?;
+        let prefix = parse_observed_name(&parts[0], &format!("{description} prefix"))?;
+        let value = parts[1]
+            .as_str()
+            .ok_or_else(|| format!("{description} `str` value must be a string"))?;
+        return Ok(ObservedName::Str {
+            prefix: Box::new(prefix),
+            value: value.to_owned(),
+        });
+    }
+    if object.contains_key("num") {
+        let object = exact_inventory_object(value, &["num"], description)?;
+        let parts = object["num"]
+            .as_array()
+            .filter(|parts| parts.len() == 2)
+            .ok_or_else(|| format!("{description} `num` must contain prefix and value"))?;
+        let prefix = parse_observed_name(&parts[0], &format!("{description} prefix"))?;
+        let value = parts[1]
+            .as_u64()
+            .ok_or_else(|| format!("{description} `num` value must be a u64"))?;
+        return Ok(ObservedName::Num {
+            prefix: Box::new(prefix),
+            value,
+        });
+    }
+    Err(format!(
+        "{description} must be anonymous, `str`, or `num`, got fields {:?}",
+        object.keys().collect::<Vec<_>>()
+    ))
+}
+
+fn inventory_optional_name(
+    object: &serde_json::Map<String, serde_json::Value>,
+    field: &str,
+    description: &str,
+) -> Result<Option<ObservedName>, String> {
+    let value = object
+        .get(field)
+        .ok_or_else(|| format!("{description} lacks field `{field}`"))?;
+    if value.is_null() {
+        return Ok(None);
+    }
+    let present =
+        exact_inventory_object(value, &["some"], &format!("{description} field `{field}`"))?;
+    parse_observed_name(
+        &present["some"],
+        &format!("{description} field `{field}` value"),
+    )
+    .map(Some)
+}
+
+fn parse_observed_constant_kind(value: &str) -> Result<ObservedConstantKind, String> {
+    match value {
+        "axiom" => Ok(ObservedConstantKind::Axiom),
+        "definition" => Ok(ObservedConstantKind::Definition),
+        "theorem" => Ok(ObservedConstantKind::Theorem),
+        "opaque" => Ok(ObservedConstantKind::Opaque),
+        "quotient" => Ok(ObservedConstantKind::Quotient),
+        "inductive" => Ok(ObservedConstantKind::Inductive),
+        "constructor" => Ok(ObservedConstantKind::Constructor),
+        "recursor" => Ok(ObservedConstantKind::Recursor),
+        other => Err(format!(
+            "declaration inventory constant has unsupported kind `{other}`"
+        )),
+    }
+}
+
+fn parse_observed_constant_safety(value: &str) -> Result<ObservedConstantSafety, String> {
+    match value {
+        "safe" => Ok(ObservedConstantSafety::Safe),
+        "unsafe" => Ok(ObservedConstantSafety::Unsafe),
+        "partial" => Ok(ObservedConstantSafety::Partial),
+        other => Err(format!(
+            "declaration inventory constant has unsupported safety `{other}`"
+        )),
+    }
+}
+
+/// Parse one exact canonical output line from the observational inventory
+/// executable. Requiring byte-for-byte canonical JSON also rejects duplicate
+/// fields, alternative field order, and whitespace that `serde_json::Value`
+/// would otherwise normalize away.
+#[cfg_attr(not(test), allow(dead_code))]
+fn parse_declaration_inventory_output(
+    status_success: bool,
+    stdout: &[u8],
+    stderr: &[u8],
+) -> Result<DeclarationModuleInventory, String> {
+    let stdout = std::str::from_utf8(stdout)
+        .map_err(|error| format!("declaration inventory stdout is not UTF-8: {error}"))?;
+    let stderr = std::str::from_utf8(stderr)
+        .map_err(|error| format!("declaration inventory stderr is not UTF-8: {error}"))?;
+    if !status_success || !stderr.is_empty() {
+        return Err(format!(
+            "declaration inventory transport failed: status_success={status_success}, stdout={stdout:?}, stderr={stderr:?}"
+        ));
+    }
+    let Some(line) = stdout.strip_suffix('\n') else {
+        return Err(
+            "declaration inventory stdout must be exactly one newline-terminated JSON result"
+                .into(),
+        );
+    };
+    if line.is_empty() || line.contains(['\n', '\r']) {
+        return Err("declaration inventory stdout must contain exactly one JSON line".into());
+    }
+    let value: serde_json::Value = serde_json::from_str(line)
+        .map_err(|error| format!("declaration inventory result is not valid JSON: {error}"))?;
+    let canonical = serde_json::to_vec(&value)
+        .map_err(|error| format!("cannot reproduce declaration inventory JSON: {error}"))?;
+    if canonical != line.as_bytes() {
+        return Err("declaration inventory result is not the exact canonical JSON encoding".into());
+    }
+    let object = value
+        .as_object()
+        .ok_or_else(|| "declaration inventory result must be a JSON object".to_owned())?;
+    if object.get("schema").and_then(serde_json::Value::as_str)
+        != Some(DECLARATION_INVENTORY_RESULT_SCHEMA)
+    {
+        return Err("declaration inventory result has the wrong or missing schema".into());
+    }
+    if object
+        .get("observational")
+        .and_then(serde_json::Value::as_bool)
+        != Some(true)
+    {
+        return Err("declaration inventory result must identify itself as observational".into());
+    }
+    if object.contains_key("error_kind") || object.contains_key("message") {
+        let object = exact_inventory_object(
+            &value,
+            &["schema", "observational", "error_kind", "message"],
+            "declaration inventory rejection",
+        )?;
+        let kind = inventory_string(object, "error_kind", "declaration inventory rejection")?;
+        if !matches!(kind.as_str(), "transport" | "request" | "inventory") {
+            return Err(format!(
+                "declaration inventory rejection has unsupported error kind `{kind}`"
+            ));
+        }
+        let message = inventory_string(object, "message", "declaration inventory rejection")?;
+        return Err(format!(
+            "declaration inventory rejected its {kind} boundary: {message}"
+        ));
+    }
+
+    let object = exact_inventory_object(
+        &value,
+        &[
+            "schema",
+            "observational",
+            "is_module",
+            "imports",
+            "constants",
+            "extra_const_names",
+            "extension_families",
+        ],
+        "declaration inventory result",
+    )?;
+    let is_module = inventory_bool(object, "is_module", "declaration inventory result")?;
+
+    let mut imports = Vec::new();
+    for (index, value) in inventory_array(object, "imports", "declaration inventory result")?
+        .iter()
+        .enumerate()
+    {
+        let description = format!("declaration inventory import {index}");
+        let import = exact_inventory_object(
+            value,
+            &["module", "import_all", "is_exported", "is_meta"],
+            &description,
+        )?;
+        imports.push(ObservedModuleImport {
+            module: parse_observed_name(
+                &import["module"],
+                &format!("{description} field `module`"),
+            )?,
+            import_all: inventory_bool(import, "import_all", &description)?,
+            is_exported: inventory_bool(import, "is_exported", &description)?,
+            is_meta: inventory_bool(import, "is_meta", &description)?,
+        });
+    }
+
+    let mut constants = Vec::new();
+    for (index, value) in inventory_array(object, "constants", "declaration inventory result")?
+        .iter()
+        .enumerate()
+    {
+        let description = format!("declaration inventory constant slot {index}");
+        let constant = exact_inventory_object(
+            value,
+            &["const_name", "info_name", "kind", "safety"],
+            &description,
+        )?;
+        let const_name = inventory_optional_name(constant, "const_name", &description)?;
+        let info_name = inventory_optional_name(constant, "info_name", &description)?;
+        let kind = inventory_optional_string(constant, "kind", &description)?;
+        let safety = inventory_optional_string(constant, "safety", &description)?;
+        if const_name.is_none() && info_name.is_none() {
+            return Err(format!(
+                "{description} has neither side of the parallel arrays"
+            ));
+        }
+        let (kind, safety) = match info_name.as_ref() {
+            Some(_) => {
+                let kind = kind
+                    .ok_or_else(|| format!("{description} has constant information but no kind"))?;
+                let safety = safety.ok_or_else(|| {
+                    format!("{description} has constant information but no safety")
+                })?;
+                (
+                    Some(parse_observed_constant_kind(&kind)?),
+                    Some(parse_observed_constant_safety(&safety)?),
+                )
+            }
+            None => {
+                if kind.is_some() || safety.is_some() {
+                    return Err(format!(
+                        "{description} has kind or safety without constant information"
+                    ));
+                }
+                (None, None)
+            }
+        };
+        constants.push(ObservedConstantSlot {
+            const_name,
+            info_name,
+            kind,
+            safety,
+        });
+    }
+
+    let extra_const_names =
+        inventory_array(object, "extra_const_names", "declaration inventory result")?
+            .iter()
+            .enumerate()
+            .map(|(index, value)| {
+                parse_observed_name(
+                    value,
+                    &format!("declaration inventory extra constant name {index}"),
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+    let mut extension_families = Vec::new();
+    for (index, value) in
+        inventory_array(object, "extension_families", "declaration inventory result")?
+            .iter()
+            .enumerate()
+    {
+        let description = format!("declaration inventory extension family {index}");
+        let extension = exact_inventory_object(value, &["name", "count"], &description)?;
+        let count = extension
+            .get("count")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|count| usize::try_from(count).ok())
+            .ok_or_else(|| format!("{description} field `count` must be a usize"))?;
+        extension_families.push(ObservedExtensionFamily {
+            name: parse_observed_name(&extension["name"], &format!("{description} field `name`"))?,
+            count,
+        });
+    }
+
+    Ok(DeclarationModuleInventory {
+        observational: true,
+        is_module,
+        imports,
+        constants,
+        extra_const_names,
+        extension_families,
+    })
 }
 
 fn require_terminal_sentinel(emitted: &Emitted) -> Result<(), IngressAuditFailure> {
@@ -3631,6 +4125,229 @@ mod proof_build_tests {
     }
 
     #[test]
+    fn declaration_inventory_request_is_one_exact_observational_subject() {
+        assert_eq!(
+            declaration_inventory_request(Path::new("/tmp/Candidate.olean"))
+                .expect("UTF-8 candidate path serializes"),
+            br#"{"candidate_olean":"/tmp/Candidate.olean","schema":"sable-declaration-inventory-request-v1"}"#
+        );
+        assert!(declaration_inventory_request(Path::new("")).is_err());
+    }
+
+    #[test]
+    fn declaration_inventory_transport_preserves_order_flags_and_structural_names() {
+        let output = concat!(
+            r#"{"constants":[{"const_name":{"some":{"str":[{"str":[null,"Sable"]},"fact"]}},"info_name":{"some":{"str":[{"str":[null,"Sable"]},"fact"]}},"kind":"theorem","safety":"safe"},{"const_name":{"some":{"str":[null,"unpaired"]}},"info_name":null,"kind":null,"safety":null},{"const_name":null,"info_name":{"some":{"num":[{"str":[null,"_hyg"]},7]}},"kind":"definition","safety":"partial"}],"extension_families":[{"count":2,"name":{"str":[null,"@family"]}}],"extra_const_names":[{"num":[null,42]}],"imports":[{"import_all":true,"is_exported":false,"is_meta":true,"module":{"str":[null,"Sable"]}}],"is_module":false,"observational":true,"schema":"sable-declaration-inventory-result-v1"}"#,
+            "\n"
+        );
+        let inventory = parse_declaration_inventory_output(true, output.as_bytes(), b"")
+            .expect("the exact canonical observational inventory passes");
+        assert!(inventory.observational);
+        assert!(!inventory.is_module);
+        assert_eq!(
+            inventory.imports,
+            vec![ObservedModuleImport {
+                module: ObservedName::Str {
+                    prefix: Box::new(ObservedName::Anonymous),
+                    value: "Sable".into(),
+                },
+                import_all: true,
+                is_exported: false,
+                is_meta: true,
+            }]
+        );
+        assert_eq!(inventory.constants.len(), 3);
+        assert_eq!(
+            inventory.constants[0].kind,
+            Some(ObservedConstantKind::Theorem)
+        );
+        assert_eq!(
+            inventory.constants[0].safety,
+            Some(ObservedConstantSafety::Safe)
+        );
+        assert!(inventory.constants[1].const_name.is_some());
+        assert!(inventory.constants[1].info_name.is_none());
+        assert!(inventory.constants[2].const_name.is_none());
+        assert_eq!(
+            inventory.constants[2].info_name,
+            Some(ObservedName::Num {
+                prefix: Box::new(ObservedName::Str {
+                    prefix: Box::new(ObservedName::Anonymous),
+                    value: "_hyg".into(),
+                }),
+                value: 7,
+            })
+        );
+        assert_eq!(
+            inventory.extra_const_names,
+            vec![ObservedName::Num {
+                prefix: Box::new(ObservedName::Anonymous),
+                value: 42,
+            }]
+        );
+        assert_eq!(inventory.extension_families[0].count, 2);
+    }
+
+    #[test]
+    #[ignore = "cross-language canary; requires explicit built inventory executable and candidate olean paths"]
+    fn declaration_inventory_cross_language_canary() {
+        use std::io::Write as _;
+
+        let regular_env_path = |name: &str| {
+            let path = PathBuf::from(
+                std::env::var_os(name)
+                    .unwrap_or_else(|| panic!("set {name} to one explicit regular file path")),
+            );
+            let metadata = std::fs::symlink_metadata(&path).unwrap_or_else(|error| {
+                panic!("cannot inspect {name} {}: {error}", path.display())
+            });
+            assert!(
+                !metadata.file_type().is_symlink() && metadata.is_file(),
+                "{name} {} must be a regular non-symlink file",
+                path.display()
+            );
+            path
+        };
+        let executable = regular_env_path("SABLE_DECLARATION_INVENTORY_EXE");
+        let candidate = regular_env_path("SABLE_DECLARATION_INVENTORY_CANDIDATE");
+        let request = declaration_inventory_request(&candidate)
+            .expect("the explicit candidate path has an exact inventory request");
+
+        let mut child = Command::new(&executable)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap_or_else(|error| {
+                panic!(
+                    "cannot spawn declaration inventory {}: {error}",
+                    executable.display()
+                )
+            });
+        {
+            let mut stdin = child
+                .stdin
+                .take()
+                .expect("declaration inventory stdin pipe is available");
+            stdin
+                .write_all(&request)
+                .expect("write the exact declaration inventory request");
+        }
+        let output = child
+            .wait_with_output()
+            .expect("wait for the declaration inventory process");
+        let inventory = parse_declaration_inventory_output(
+            output.status.success(),
+            &output.stdout,
+            &output.stderr,
+        )
+        .expect("cross-language output satisfies the exact canonical transport");
+        assert!(inventory.observational);
+        let nonanonymous = |name: &ObservedName| !matches!(name, ObservedName::Anonymous);
+        let has_structural_name = inventory
+            .imports
+            .iter()
+            .any(|import| nonanonymous(&import.module))
+            || inventory.constants.iter().any(|constant| {
+                constant.const_name.as_ref().is_some_and(&nonanonymous)
+                    || constant.info_name.as_ref().is_some_and(&nonanonymous)
+            })
+            || inventory.extra_const_names.iter().any(&nonanonymous)
+            || inventory
+                .extension_families
+                .iter()
+                .any(|family| nonanonymous(&family.name));
+        assert!(
+            has_structural_name,
+            "candidate inventory must expose at least one nonanonymous structural Lean name"
+        );
+    }
+
+    #[test]
+    fn declaration_inventory_transport_rejects_noncanonical_or_loose_evidence() {
+        let exact = concat!(
+            r#"{"constants":[],"extension_families":[],"extra_const_names":[],"imports":[],"is_module":false,"observational":true,"schema":"sable-declaration-inventory-result-v1"}"#,
+            "\n"
+        );
+        parse_declaration_inventory_output(true, exact.as_bytes(), b"")
+            .expect("the empty exact inventory passes");
+        let without_newline = exact.strip_suffix('\n').expect("fixture has newline");
+        let cases = vec![
+            without_newline.as_bytes().to_vec(),
+            format!("{without_newline}\r\n").into_bytes(),
+            format!("{exact}{{}}\n").into_bytes(),
+            concat!(
+                r#"{"schema":"sable-declaration-inventory-result-v1","observational":true,"is_module":false,"imports":[],"extra_const_names":[],"extension_families":[],"constants":[]}"#,
+                "\n"
+            )
+            .as_bytes()
+            .to_vec(),
+            concat!(
+                r#"{"constants":[],"extension_families":[],"extra_const_names":[],"imports":[],"is_module":false,"observational":true,"schema":"sable-declaration-inventory-result-v1","schema":"sable-declaration-inventory-result-v1"}"#,
+                "\n"
+            )
+            .as_bytes()
+            .to_vec(),
+            concat!(
+                r#"{"constants":[],"extension_families":[],"extra_const_names":[],"imports":[],"is_module":false,"observational":false,"schema":"sable-declaration-inventory-result-v1"}"#,
+                "\n"
+            )
+            .as_bytes()
+            .to_vec(),
+            concat!(
+                r#"{"constants":[],"extension_families":[],"extra_const_names":[],"imports":[],"is_module":false,"observational":true,"schema":"sable-declaration-inventory-result-v0"}"#,
+                "\n"
+            )
+            .as_bytes()
+            .to_vec(),
+            concat!(
+                r#"{"constants":[],"extension_families":[],"extra_const_names":[],"imports":[],"is_module":false,"observational":true,"schema":"sable-declaration-inventory-result-v1","unknown":0}"#,
+                "\n"
+            )
+            .as_bytes()
+            .to_vec(),
+            concat!(
+                r#"{"constants":[{"const_name":{"some":{"display":"not-structural"}},"info_name":null,"kind":null,"safety":null}],"extension_families":[],"extra_const_names":[],"imports":[],"is_module":false,"observational":true,"schema":"sable-declaration-inventory-result-v1"}"#,
+                "\n"
+            )
+            .as_bytes()
+            .to_vec(),
+            concat!(
+                r#"{"constants":[{"const_name":null,"info_name":null,"kind":null,"safety":null}],"extension_families":[],"extra_const_names":[],"imports":[],"is_module":false,"observational":true,"schema":"sable-declaration-inventory-result-v1"}"#,
+                "\n"
+            )
+            .as_bytes()
+            .to_vec(),
+            concat!(
+                r#"{"constants":[{"const_name":null,"info_name":{"some":{"str":[null,"x"]}},"kind":"forged","safety":"safe"}],"extension_families":[],"extra_const_names":[],"imports":[],"is_module":false,"observational":true,"schema":"sable-declaration-inventory-result-v1"}"#,
+                "\n"
+            )
+            .as_bytes()
+            .to_vec(),
+        ];
+        for output in cases {
+            assert!(parse_declaration_inventory_output(true, &output, b"").is_err());
+        }
+        assert!(parse_declaration_inventory_output(false, exact.as_bytes(), b"").is_err());
+        assert!(parse_declaration_inventory_output(true, exact.as_bytes(), b"warning\n").is_err());
+
+        let rejected = concat!(
+            r#"{"error_kind":"request","message":"bad request","observational":true,"schema":"sable-declaration-inventory-result-v1"}"#,
+            "\n"
+        );
+        assert!(
+            parse_declaration_inventory_output(true, rejected.as_bytes(), b"")
+                .expect_err("an exact rejection remains a failure")
+                .contains("request boundary")
+        );
+        let forged = concat!(
+            r#"{"error_kind":"accepted","message":"forged","observational":true,"schema":"sable-declaration-inventory-result-v1"}"#,
+            "\n"
+        );
+        assert!(parse_declaration_inventory_output(true, forged.as_bytes(), b"").is_err());
+    }
+
+    #[test]
     fn dependency_and_module_system_outputs_require_a_policy_review() {
         let exact_manifest = include_bytes!("../../lean/lake-manifest.json").to_vec();
         let exact = BTreeMap::from([("lean/lake-manifest.json".into(), exact_manifest)]);
@@ -3684,6 +4401,7 @@ mod proof_build_tests {
         let _cleanup = TempProofTree(built.clone());
         let olean_root = built.join("lean/.lake/build/lib/lean");
         let auditor = proof_auditor_path(&built);
+        let declaration_inventory = declaration_inventory_path(&built);
         std::fs::create_dir_all(olean_root.join("Sable"))
             .expect("create nested proof-output directory");
         std::fs::create_dir_all(auditor.parent().expect("auditor has a parent"))
@@ -3694,13 +4412,24 @@ mod proof_build_tests {
             b"auditor library olean",
         )
         .expect("write auditor library olean");
+        std::fs::write(
+            olean_root.join("SableDeclarationAudit.olean"),
+            b"declaration inventory library olean",
+        )
+        .expect("write declaration inventory library olean");
         std::fs::write(olean_root.join("Sable/Fixture.olean"), b"fixture olean")
             .expect("write nested olean");
         std::fs::write(&auditor, b"native auditor").expect("write native auditor");
+        std::fs::write(&declaration_inventory, b"native declaration inventory")
+            .expect("write native declaration inventory");
 
         let files = BTreeMap::from([
             ("lean/Sable.lean".into(), b"import Sable.Fixture".to_vec()),
             ("lean/SableProofAudit.lean".into(), b"import Sable".to_vec()),
+            (
+                "lean/SableDeclarationAudit.lean".into(),
+                b"import Lean".to_vec(),
+            ),
             (
                 "lean/Sable/Fixture.lean".into(),
                 b"def fixture := 0".to_vec(),
@@ -3713,9 +4442,20 @@ mod proof_build_tests {
             [
                 "Sable.olean",
                 "Sable/Fixture.olean",
+                "SableDeclarationAudit.olean",
                 "SableProofAudit.olean"
             ]
         );
+
+        std::fs::remove_file(&declaration_inventory)
+            .expect("remove observational declaration inventory executable");
+        assert!(
+            proof_build_output_digests(&built, &files)
+                .expect_err("a missing declaration inventory executable fails closed")
+                .contains("observational declaration inventory")
+        );
+        std::fs::write(&declaration_inventory, b"native declaration inventory")
+            .expect("restore native declaration inventory");
 
         std::fs::remove_file(olean_root.join("Sable/Fixture.olean"))
             .expect("remove expected nested olean");
@@ -3810,10 +4550,16 @@ mod proof_build_tests {
         assert_serial_lake_command_base(&build, lean_dir);
         assert_eq!(
             build.get_args().collect::<Vec<_>>(),
-            ["--quiet", "build", "Sable", "sable-proof-audit"]
-                .iter()
-                .map(OsStr::new)
-                .collect::<Vec<_>>()
+            [
+                "--quiet",
+                "build",
+                "Sable",
+                "sable-proof-audit",
+                "sable-declaration-audit",
+            ]
+            .iter()
+            .map(OsStr::new)
+            .collect::<Vec<_>>()
         );
 
         let lean = serial_lean_command(lean_dir);
@@ -3832,6 +4578,16 @@ mod proof_build_tests {
         assert_eq!(
             auditor.get_args().collect::<Vec<_>>(),
             [OsStr::new("env"), auditor_path.as_os_str()]
+        );
+
+        let declaration_inventory_path =
+            Path::new("proof-environment/lean/.lake/build/bin/sable-declaration-audit");
+        let declaration_inventory =
+            serial_declaration_inventory_command(lean_dir, declaration_inventory_path);
+        assert_serial_lake_command_base(&declaration_inventory, lean_dir);
+        assert_eq!(
+            declaration_inventory.get_args().collect::<Vec<_>>(),
+            [OsStr::new("env"), declaration_inventory_path.as_os_str()]
         );
     }
 
@@ -3961,8 +4717,13 @@ mod proof_build_tests {
                     "SableProofAudit.olean".into(),
                     crate::sha256::hex(b"exact auditor olean"),
                 ),
+                (
+                    "SableDeclarationAudit.olean".into(),
+                    crate::sha256::hex(b"exact declaration inventory olean"),
+                ),
             ]),
             proof_auditor_sha256: crate::sha256::hex(b"exact proof auditor"),
+            declaration_inventory_sha256: crate::sha256::hex(b"exact declaration inventory"),
         };
         let exact_ready = proof_ready_stamp(&current, PROOF_POLICY_VERSION, &output_digests);
         assert!(proof_ready_stamp_matches(
@@ -3991,18 +4752,9 @@ mod proof_build_tests {
             "even an id collision cannot hide an exact policy mismatch"
         );
         let swapped = ProofBuildOutputDigests {
-            local_olean_sha256: BTreeMap::from([
-                (
-                    "Sable.olean".into(),
-                    output_digests.proof_auditor_sha256.clone(),
-                ),
-                (
-                    "SableProofAudit.olean".into(),
-                    output_digests.local_olean_sha256["Sable.olean"].clone(),
-                ),
-            ]),
-            proof_auditor_sha256: output_digests.local_olean_sha256["SableProofAudit.olean"]
-                .clone(),
+            local_olean_sha256: output_digests.local_olean_sha256.clone(),
+            proof_auditor_sha256: output_digests.declaration_inventory_sha256.clone(),
+            declaration_inventory_sha256: output_digests.proof_auditor_sha256.clone(),
         };
         assert!(
             !proof_ready_stamp_matches(
@@ -4016,7 +4768,7 @@ mod proof_build_tests {
         assert!(
             !proof_ready_stamp_matches(
                 exact_ready
-                    .replace("sable-proof-ready-v2", "sable-proof-ready-v1")
+                    .replace("sable-proof-ready-v3", "sable-proof-ready-v2")
                     .as_bytes(),
                 &current,
                 PROOF_POLICY_VERSION,
