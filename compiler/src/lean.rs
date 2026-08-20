@@ -109,6 +109,144 @@ pub(crate) enum ExpectedDeclarationKind {
     TerminalSentinel,
 }
 
+pub(crate) const DECLARATION_AUDIT_SUBJECT_SCHEMA: &str = "sable-declaration-audit-subject-v1";
+
+/// Exact source-side identity of one generated Lean module. The final source
+/// digest and full typed envelope make cache-hit reconstruction lossless; this
+/// value does not authenticate any `.olean` or grant reuse authority.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DeclarationModuleSubject {
+    pub(crate) module_name: String,
+    pub(crate) generated_source_sha256: String,
+    pub(crate) declaration_envelope: ExpectedDeclarationEnvelope,
+}
+
+/// Canonical source-side subject for the future compiled-declaration auditor.
+/// Dependencies remain in exact emitted import order and retain their complete
+/// declaration envelopes. B1a deliberately omits candidate/dependency `.olean`
+/// digests, replay results, and accepted evidence, so these bytes are neither a
+/// transport request nor cache authority yet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DeclarationAuditSubject {
+    pub(crate) schema: &'static str,
+    pub(crate) proof_environment_id: String,
+    pub(crate) proof_policy: String,
+    pub(crate) candidate: DeclarationModuleSubject,
+    pub(crate) dependencies: Vec<DeclarationModuleSubject>,
+}
+
+impl DeclarationAuditSubject {
+    pub(crate) fn new(
+        proof_environment_id: impl Into<String>,
+        proof_policy: impl Into<String>,
+        candidate: DeclarationModuleSubject,
+        dependencies: Vec<DeclarationModuleSubject>,
+    ) -> Self {
+        Self {
+            schema: DECLARATION_AUDIT_SUBJECT_SCHEMA,
+            proof_environment_id: proof_environment_id.into(),
+            proof_policy: proof_policy.into(),
+            candidate,
+            dependencies,
+        }
+    }
+
+    /// Compact JSON over struct fields and ordered vectors is the single
+    /// canonical serialization. No maps or platform paths enter the subject.
+    pub(crate) fn canonical_json(&self) -> Vec<u8> {
+        let mut json = String::new();
+        json.push_str("{\"schema\":");
+        push_json_string(&mut json, self.schema);
+        json.push_str(",\"proof_environment_id\":");
+        push_json_string(&mut json, &self.proof_environment_id);
+        json.push_str(",\"proof_policy\":");
+        push_json_string(&mut json, &self.proof_policy);
+        json.push_str(",\"candidate\":");
+        self.candidate.push_canonical_json(&mut json);
+        json.push_str(",\"dependencies\":[");
+        for (index, dependency) in self.dependencies.iter().enumerate() {
+            if index != 0 {
+                json.push(',');
+            }
+            dependency.push_canonical_json(&mut json);
+        }
+        json.push_str("]}");
+        json.into_bytes()
+    }
+}
+
+fn push_json_string(output: &mut String, value: &str) {
+    output.push_str(
+        &serde_json::to_string(value).expect("serializing a Rust string to JSON cannot fail"),
+    );
+}
+
+impl DeclarationModuleSubject {
+    fn push_canonical_json(&self, output: &mut String) {
+        output.push_str("{\"module_name\":");
+        push_json_string(output, &self.module_name);
+        output.push_str(",\"generated_source_sha256\":");
+        push_json_string(output, &self.generated_source_sha256);
+        output.push_str(",\"declaration_envelope\":");
+        self.declaration_envelope.push_canonical_json(output);
+        output.push('}');
+    }
+}
+
+impl ExpectedDeclarationEnvelope {
+    fn push_canonical_json(&self, output: &mut String) {
+        output.push_str("{\"roots\":[");
+        for (index, root) in self.roots.iter().enumerate() {
+            if index != 0 {
+                output.push(',');
+            }
+            root.push_canonical_json(output);
+        }
+        output.push_str("]}");
+    }
+}
+
+impl ExpectedDeclarationRoot {
+    fn push_canonical_json(&self, output: &mut String) {
+        output.push_str("{\"name\":");
+        push_json_string(output, &self.name);
+        match &self.kind {
+            ExpectedDeclarationKind::Structure { fields } => {
+                output.push_str(",\"kind\":\"structure\",\"fields\":[");
+                for (index, field) in fields.iter().enumerate() {
+                    if index != 0 {
+                        output.push(',');
+                    }
+                    push_json_string(output, field);
+                }
+                output.push(']');
+            }
+            ExpectedDeclarationKind::Definition {
+                recursive,
+                noncomputable,
+                simp,
+            } => {
+                output.push_str(",\"kind\":\"definition\",\"recursive\":");
+                output.push_str(if *recursive { "true" } else { "false" });
+                output.push_str(",\"noncomputable\":");
+                output.push_str(if *noncomputable { "true" } else { "false" });
+                output.push_str(",\"simp\":");
+                output.push_str(if *simp { "true" } else { "false" });
+            }
+            ExpectedDeclarationKind::Theorem { simp, sable_fact } => {
+                output.push_str(",\"kind\":\"theorem\",\"simp\":");
+                output.push_str(if *simp { "true" } else { "false" });
+                output.push_str(",\"sable_fact\":");
+                output.push_str(if *sable_fact { "true" } else { "false" });
+            }
+            ExpectedDeclarationKind::TerminalSentinel => {
+                output.push_str(",\"kind\":\"terminal_sentinel\"");
+            }
+        }
+        output.push('}');
+    }
+}
+
 impl ExpectedDeclarationEnvelope {
     fn push_structure(&mut self, name: String, fields: Vec<String>) {
         self.roots.push(ExpectedDeclarationRoot {
@@ -152,6 +290,16 @@ pub struct Emitted {
     pub(crate) ingress: Vec<IngressFragment>,
     pub(crate) declaration_envelope: ExpectedDeclarationEnvelope,
     map: Vec<MapEntry>,
+}
+
+impl DeclarationModuleSubject {
+    pub(crate) fn from_emitted(module_name: impl Into<String>, emitted: &Emitted) -> Self {
+        Self {
+            module_name: module_name.into(),
+            generated_source_sha256: crate::sha256::hex(emitted.lean_source.as_bytes()),
+            declaration_envelope: emitted.declaration_envelope.clone(),
+        }
+    }
 }
 
 /// Generated content before its module name is known. The artifact name is
@@ -3102,6 +3250,181 @@ mod proof_build_tests {
         let mut nonterminal = draft_with_source(pre_sentinel).finish(module);
         nonterminal.lean_source.push_str("-- forged suffix\n");
         assert!(require_terminal_sentinel(&nonterminal).is_err());
+    }
+
+    fn declaration_module_fixture(
+        module_name: &str,
+        source_digest: &str,
+    ) -> DeclarationModuleSubject {
+        DeclarationModuleSubject {
+            module_name: module_name.into(),
+            generated_source_sha256: source_digest.into(),
+            declaration_envelope: ExpectedDeclarationEnvelope {
+                roots: vec![
+                    ExpectedDeclarationRoot {
+                        name: format!("{module_name}.Record"),
+                        kind: ExpectedDeclarationKind::Structure {
+                            fields: vec![
+                                format!("{module_name}.Record.left"),
+                                format!("{module_name}.Record.right"),
+                            ],
+                        },
+                    },
+                    ExpectedDeclarationRoot {
+                        name: format!("{module_name}.definition"),
+                        kind: ExpectedDeclarationKind::Definition {
+                            recursive: true,
+                            noncomputable: true,
+                            simp: false,
+                        },
+                    },
+                    ExpectedDeclarationRoot {
+                        name: format!("{module_name}.fact"),
+                        kind: ExpectedDeclarationKind::Theorem {
+                            simp: true,
+                            sable_fact: true,
+                        },
+                    },
+                    ExpectedDeclarationRoot {
+                        name: format!("{module_name}.complete"),
+                        kind: ExpectedDeclarationKind::TerminalSentinel,
+                    },
+                ],
+            },
+        }
+    }
+
+    #[test]
+    fn declaration_audit_subject_has_one_exact_ordered_serialization() {
+        let subject = DeclarationAuditSubject::new(
+            "proof-environment-exact",
+            "proof-policy-exact",
+            declaration_module_fixture("Root", "root-source-sha256"),
+            vec![declaration_module_fixture("Dep", "dep-source-sha256")],
+        );
+        let json = String::from_utf8(subject.canonical_json()).expect("canonical JSON is UTF-8");
+        assert_eq!(
+            json,
+            r#"{"schema":"sable-declaration-audit-subject-v1","proof_environment_id":"proof-environment-exact","proof_policy":"proof-policy-exact","candidate":{"module_name":"Root","generated_source_sha256":"root-source-sha256","declaration_envelope":{"roots":[{"name":"Root.Record","kind":"structure","fields":["Root.Record.left","Root.Record.right"]},{"name":"Root.definition","kind":"definition","recursive":true,"noncomputable":true,"simp":false},{"name":"Root.fact","kind":"theorem","simp":true,"sable_fact":true},{"name":"Root.complete","kind":"terminal_sentinel"}]}},"dependencies":[{"module_name":"Dep","generated_source_sha256":"dep-source-sha256","declaration_envelope":{"roots":[{"name":"Dep.Record","kind":"structure","fields":["Dep.Record.left","Dep.Record.right"]},{"name":"Dep.definition","kind":"definition","recursive":true,"noncomputable":true,"simp":false},{"name":"Dep.fact","kind":"theorem","simp":true,"sable_fact":true},{"name":"Dep.complete","kind":"terminal_sentinel"}]}}]}"#
+        );
+        serde_json::from_str::<serde_json::Value>(&json)
+            .expect("canonical subject remains valid JSON");
+    }
+
+    #[test]
+    fn declaration_audit_subject_escapes_every_string_field() {
+        let mut candidate = declaration_module_fixture("Root", "root-source");
+        candidate.module_name = "Root\"\\\n".into();
+        candidate.declaration_envelope.roots[0].name = "name\"\\\n".into();
+        let subject = DeclarationAuditSubject::new(
+            "proof\nenvironment",
+            "policy\"\\",
+            candidate,
+            vec![declaration_module_fixture("Dep\t", "dep-source")],
+        );
+        let json = subject.canonical_json();
+        let parsed: serde_json::Value =
+            serde_json::from_slice(&json).expect("all subject strings are JSON escaped");
+        assert_eq!(parsed["proof_environment_id"], "proof\nenvironment");
+        assert_eq!(parsed["proof_policy"], "policy\"\\");
+        assert_eq!(parsed["candidate"]["module_name"], "Root\"\\\n");
+        assert_eq!(
+            parsed["candidate"]["declaration_envelope"]["roots"][0]["name"],
+            "name\"\\\n"
+        );
+        assert_eq!(parsed["dependencies"][0]["module_name"], "Dep\t");
+    }
+
+    #[test]
+    fn declaration_dependency_identity_binds_order_source_envelope_and_policy() {
+        let dependency_a = declaration_module_fixture("A", "source-a");
+        let dependency_b = declaration_module_fixture("B", "source-b");
+        let candidate = declaration_module_fixture("Root", "root-source");
+        let canonical = |proof_environment: &str,
+                         proof_policy: &str,
+                         dependencies: Vec<DeclarationModuleSubject>| {
+            DeclarationAuditSubject::new(
+                proof_environment,
+                proof_policy,
+                candidate.clone(),
+                dependencies,
+            )
+            .canonical_json()
+        };
+        let exact = canonical(
+            "proof-environment",
+            "proof-policy",
+            vec![dependency_a.clone(), dependency_b.clone()],
+        );
+        assert_ne!(
+            exact,
+            canonical(
+                "proof-environment",
+                "proof-policy",
+                vec![dependency_b.clone(), dependency_a.clone()]
+            ),
+            "dependency order is part of the future request subject"
+        );
+        let mut changed_source = dependency_a.clone();
+        changed_source.generated_source_sha256 = "changed-source-a".into();
+        assert_ne!(
+            exact,
+            canonical(
+                "proof-environment",
+                "proof-policy",
+                vec![changed_source, dependency_b.clone()]
+            )
+        );
+        let mut changed_attribute = dependency_a.clone();
+        let ExpectedDeclarationKind::Theorem { sable_fact, .. } =
+            &mut changed_attribute.declaration_envelope.roots[2].kind
+        else {
+            panic!("fixture root 2 is a theorem")
+        };
+        *sable_fact = false;
+        assert_ne!(
+            exact,
+            canonical(
+                "proof-environment",
+                "proof-policy",
+                vec![changed_attribute, dependency_b.clone()]
+            )
+        );
+        assert_ne!(
+            exact,
+            canonical(
+                "different-proof-environment",
+                "proof-policy",
+                vec![dependency_a.clone(), dependency_b.clone()]
+            )
+        );
+        assert_ne!(
+            exact,
+            canonical(
+                "proof-environment",
+                "different-proof-policy",
+                vec![dependency_a, dependency_b]
+            )
+        );
+    }
+
+    #[test]
+    fn module_subject_reconstructs_identically_from_deterministic_emission() {
+        let first = draft_with_source("import Sable\n\n").finish("Root_module");
+        let repeated = draft_with_source("import Sable\n\n").finish("Root_module");
+        let first_subject = DeclarationModuleSubject::from_emitted("Root_module", &first);
+        let repeated_subject = DeclarationModuleSubject::from_emitted("Root_module", &repeated);
+        assert_eq!(first_subject, repeated_subject);
+
+        let changed = draft_with_source("import Sable\nopen Sable\n").finish("Root_module");
+        assert_ne!(
+            first_subject,
+            DeclarationModuleSubject::from_emitted("Root_module", &changed)
+        );
+        assert_ne!(
+            repeated_subject,
+            DeclarationModuleSubject::from_emitted("Other_module", &repeated)
+        );
     }
 
     #[test]

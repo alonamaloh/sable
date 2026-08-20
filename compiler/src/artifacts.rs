@@ -22,7 +22,7 @@
 use crate::Options;
 use crate::control::ControlProgram;
 use crate::diag::Diagnostic;
-use crate::lean::{self, Emitted, EmittedNames};
+use crate::lean::{self, DeclarationAuditSubject, DeclarationModuleSubject, Emitted, EmittedNames};
 use crate::modules::{self, ModuleSet};
 use crate::ownership::CheckedOwnershipPlan;
 use crate::span::Span;
@@ -39,6 +39,10 @@ pub struct ModuleArtifact {
     pub lean_name: String,
     /// What its generated file declares.
     pub names: EmittedNames,
+    /// Deterministically reconstructed source identity and full typed
+    /// declaration envelope. This is metadata for a future audit, not proof
+    /// that the cached `.olean` matches either value.
+    pub(crate) declaration_subject: DeclarationModuleSubject,
     /// Path as shown in diagnostics.
     pub display: String,
     /// Canonical source path.
@@ -150,6 +154,24 @@ pub fn from_portable(mods: &ModuleSet, pd: &PortableDiag) -> Diagnostic {
     d
 }
 
+fn ordered_dependency_declarations(
+    artifacts: &[Arc<ModuleArtifact>],
+) -> (Vec<String>, Vec<DeclarationModuleSubject>) {
+    artifacts
+        .iter()
+        .map(|artifact| {
+            debug_assert_eq!(
+                artifact.lean_name, artifact.declaration_subject.module_name,
+                "module artifact declaration identity follows its generated import name"
+            );
+            (
+                artifact.lean_name.clone(),
+                artifact.declaration_subject.clone(),
+            )
+        })
+        .unzip()
+}
+
 /// A module through the front end, vcgen, and per-module emission, with
 /// every imported module's artifact ensured (verified) first.
 pub(crate) struct Prepared {
@@ -165,6 +187,10 @@ pub(crate) struct Prepared {
     pub(crate) ownership: CheckedOwnershipPlan,
     pub(crate) vc: VcResult,
     pub(crate) emitted: Emitted,
+    /// Canonical source-side subject for a future compiled declaration audit,
+    /// including every dependency in exact generated import order. B1a does
+    /// not submit this subject to an auditor or use it for cache acceptance.
+    pub(crate) declaration_audit_subject: DeclarationAuditSubject,
     /// Content-addressed artifact name for this module.
     pub(crate) lean_name: String,
     /// Exact proof environment used to derive `lean_name` and emit this
@@ -278,6 +304,7 @@ fn prepare_with_environment(
                     || !a.inputs.exact_eq(&expected_dependency)
                     || a.proof_fingerprint.as_str() != proof_fingerprint
                     || a.proof_policy.as_str() != proof_environment.policy()
+                    || a.declaration_subject.module_name != a.lean_name
                 {
                     return (
                         mods,
@@ -530,7 +557,7 @@ fn prepare_with_environment(
         }
     }
 
-    let imports: Vec<String> = dep_arts.iter().map(|a| a.lean_name.clone()).collect();
+    let (imports, declaration_dependencies) = ordered_dependency_declarations(&dep_arts);
     let emitted = lean::emit(&vc, &program.discharges, &skip, &imports, &exclude);
     let lean_name = artifact_name(
         path,
@@ -539,6 +566,13 @@ fn prepare_with_environment(
         proof_environment.policy(),
     );
     let emitted = emitted.finish(&lean_name);
+    let declaration_audit_subject = DeclarationAuditSubject::new(
+        proof_fingerprint.clone(),
+        proof_environment.policy(),
+        DeclarationModuleSubject::from_emitted(lean_name.clone(), &emitted),
+        declaration_dependencies,
+    );
+    debug_assert!(!declaration_audit_subject.canonical_json().is_empty());
     let root_path = mods.modules[0].path.clone();
 
     (
@@ -549,6 +583,7 @@ fn prepare_with_environment(
             ownership: checked.ownership,
             vc,
             emitted,
+            declaration_audit_subject,
             lean_name,
             proof_fingerprint,
             proof_environment: proof_environment.clone(),
@@ -1080,6 +1115,7 @@ fn build_artifact(
         return Ok(Arc::new(ModuleArtifact {
             lean_name: prep.lean_name,
             names: prep.emitted.names.clone(),
+            declaration_subject: prep.declaration_audit_subject.candidate.clone(),
             display,
             path: path.to_path_buf(),
             source,
@@ -1225,6 +1261,7 @@ fn build_artifact(
     Ok(Arc::new(ModuleArtifact {
         lean_name: prep.lean_name,
         names: prep.emitted.names.clone(),
+        declaration_subject: prep.declaration_audit_subject.candidate.clone(),
         display,
         path: path.to_path_buf(),
         source,
@@ -1446,14 +1483,53 @@ fn fnv64(seed: u64, bytes: &[u8]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        ArtifactBuildKey, SourceSnapshot, artifact_name, artifact_policy_stamp,
-        artifact_policy_stamp_matches, module_set_fingerprint, prepare, root_generated_path,
+        ArtifactBuildKey, ModuleArtifact, SourceSnapshot, artifact_name, artifact_policy_stamp,
+        artifact_policy_stamp_matches, module_set_fingerprint, ordered_dependency_declarations,
+        prepare, root_generated_path,
     };
     use crate::Options;
-    use crate::lean::PROOF_POLICY_VERSION;
+    use crate::lean::{
+        self, DeclarationAuditSubject, DeclarationModuleSubject, EmittedNames,
+        ExpectedDeclarationKind, PROOF_POLICY_VERSION,
+    };
     use crate::modules::ModuleSet;
+    use crate::span::Span;
+    use crate::vcgen::{MachineManifest, TrustManifest, VcResult};
+    use std::collections::HashSet;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
+
+    fn empty_vc() -> VcResult {
+        VcResult {
+            ghosts: Vec::new(),
+            classes: Vec::new(),
+            records: Vec::new(),
+            clause_wfs: Vec::new(),
+            obligations: Vec::new(),
+            transition_certificates: Vec::new(),
+            argument_schedule_certificates: Vec::new(),
+            trust: TrustManifest::default(),
+            machine: MachineManifest::default(),
+        }
+    }
+
+    fn synthetic_module_artifact(subject: DeclarationModuleSubject) -> Arc<ModuleArtifact> {
+        Arc::new(ModuleArtifact {
+            lean_name: subject.module_name.clone(),
+            names: EmittedNames::default(),
+            declaration_subject: subject,
+            display: "synthetic dependency".into(),
+            path: PathBuf::from("/synthetic.sable"),
+            source: Arc::from(""),
+            proof_fingerprint: "proof-environment".into(),
+            proof_policy: "proof-policy".into(),
+            inputs: SourceSnapshot {
+                modules: Vec::new(),
+                edges: Vec::new(),
+            },
+            warnings: Vec::new(),
+        })
+    }
 
     #[test]
     fn root_generated_paths_bind_content_and_proof_environment() {
@@ -1560,6 +1636,128 @@ mod tests {
             [Path::new("/B.sable"), Path::new("/C.sable")]
         );
         assert_eq!(b.edges, vec![(0, 1)]);
+    }
+
+    #[test]
+    fn declaration_dependencies_follow_import_order_and_reconstruct_exactly() {
+        let recursive_ghost = crate::ast::GhostItem {
+            keyword: "def",
+            unfold: false,
+            fact: false,
+            text: "countdown (n : Nat) : Nat := if n = 0 then 0 else countdown (n - 1)\ntermination_by n\ndecreasing_by omega".into(),
+            span: Span::new(1, 80),
+        };
+        let mut dependency_vc = empty_vc();
+        dependency_vc.ghosts.push(recursive_ghost.clone());
+        let dependency_emitted = lean::emit(
+            &dependency_vc,
+            &[],
+            &HashSet::new(),
+            &[],
+            &EmittedNames::default(),
+        )
+        .finish("Dep_recursive");
+        let dependency_subject =
+            DeclarationModuleSubject::from_emitted("Dep_recursive", &dependency_emitted);
+
+        let other_emitted = lean::emit(
+            &empty_vc(),
+            &[],
+            &HashSet::new(),
+            &[],
+            &EmittedNames::default(),
+        )
+        .finish("Dep_other");
+        let other_subject = DeclarationModuleSubject::from_emitted("Dep_other", &other_emitted);
+        let artifacts = vec![
+            synthetic_module_artifact(other_subject),
+            synthetic_module_artifact(dependency_subject),
+        ];
+        let (imports, dependencies) = ordered_dependency_declarations(&artifacts);
+        assert_eq!(imports, ["Dep_other", "Dep_recursive"]);
+        assert_eq!(
+            dependencies
+                .iter()
+                .map(|dependency| dependency.module_name.as_str())
+                .collect::<Vec<_>>(),
+            imports
+        );
+
+        let mut root_vc = empty_vc();
+        root_vc.ghosts.push(recursive_ghost);
+        root_vc.ghosts.push(crate::ast::GhostItem {
+            keyword: "theorem",
+            unfold: false,
+            fact: true,
+            text: "root_fact : True := True.intro".into(),
+            span: Span::new(81, 120),
+        });
+        let mut exclude = EmittedNames::default();
+        exclude.ghosts.insert("countdown".into());
+        let emit_root =
+            || lean::emit(&root_vc, &[], &HashSet::new(), &imports, &exclude).finish("Root_module");
+        let root_emitted = emit_root();
+        assert_eq!(
+            root_emitted
+                .lean_source
+                .lines()
+                .filter_map(|line| line.strip_prefix("import "))
+                .skip(1)
+                .collect::<Vec<_>>(),
+            imports
+        );
+        let root_subject = DeclarationModuleSubject::from_emitted("Root_module", &root_emitted);
+        assert!(
+            root_subject
+                .declaration_envelope
+                .roots
+                .iter()
+                .all(|root| root.name != "countdown")
+        );
+        assert!(
+            root_subject
+                .declaration_envelope
+                .roots
+                .iter()
+                .any(|root| root.name == "root_fact"),
+            "imported-name exclusion must retain the candidate's local root"
+        );
+        let recursive_dependency = dependencies
+            .iter()
+            .find(|dependency| dependency.module_name == "Dep_recursive")
+            .expect("recursive dependency subject is retained");
+        assert!(
+            recursive_dependency
+                .declaration_envelope
+                .roots
+                .iter()
+                .any(|root| {
+                    root.name == "countdown"
+                        && matches!(
+                            &root.kind,
+                            ExpectedDeclarationKind::Definition {
+                                recursive: true,
+                                noncomputable: true,
+                                simp: false,
+                            }
+                        )
+                })
+        );
+
+        let subject = DeclarationAuditSubject::new(
+            "proof-environment",
+            "proof-policy",
+            root_subject,
+            dependencies.clone(),
+        );
+        let repeated_root = emit_root();
+        let repeated = DeclarationAuditSubject::new(
+            "proof-environment",
+            "proof-policy",
+            DeclarationModuleSubject::from_emitted("Root_module", &repeated_root),
+            dependencies,
+        );
+        assert_eq!(subject.canonical_json(), repeated.canonical_json());
     }
 
     #[test]
