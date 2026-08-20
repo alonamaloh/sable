@@ -220,6 +220,13 @@ certificates should retire trust only where Lean receives an independently
 meaningful carrier; generator-authored assumptions must not be renamed as
 proofs.
 
+Before step 3 or any later language slice begins, land one useful Core tranche
+rather than only an ADR or data-structure skeleton. It must carry a real,
+nontrivial existing control/effect/cleanup path from the checked program into
+at least VC generation and the interpreter, replace their reconstruction of
+that path, reconcile exactly with the checker authority, and have fail-closed
+mutation and negative tests. Later slices may expand the Core incrementally.
+
 ### 3. Make ordinary values unsurprising
 
 First address asymmetries users encounter in routine code: integers, Booleans,
@@ -245,6 +252,12 @@ or stale proof state across nested calls, branches, loops, returns, replacement,
 and traps. An owner-capable map or another independent owner-bearing container
 would be a useful second client after `OwnerVec<T>`.
 
+No ownership-sensitive cell may open until the independent effect-sequence
+generator described below is operational for the interactions that slice
+selects. It may land alongside the first useful Core tranche, but admission
+waits for generated legal and illegal sequences that do not reuse the
+compiler's retained-plan oracle.
+
 ### 5. Exercise generic composition
 
 Let forcing libraries choose the next language surface. Likely clients include
@@ -257,9 +270,10 @@ Generic proof reuse must be authorized only for the domain it proves. Owner
 specializations should be checked independently where required, and clients
 should not rely on declaration-specific compiler exceptions.
 
-### 6. Reach a stable-language checkpoint
+### 6. Reach a stable-language and release checkpoint
 
-Before reopening native-backend work:
+Complete this full checkpoint before any release tag. It is also a prerequisite
+for reopening native-backend expansion:
 
 - the selected stabilization matrix is complete;
 - several substantial programs verify and run without backend-driven source
@@ -269,13 +283,16 @@ Before reopening native-backend work:
 - common failures have actionable source-level diagnostics;
 - proof iteration is tolerable under the supported low-concurrency workflow;
 - mutation, effect-sequence, differential, and adversarial evidence remains
-  effective; and
+  effective;
+- an independent review by someone who did not participate in the design or
+  implementation is complete, its report is published, and every finding is
+  fixed or explicitly bounded; and
 - several consecutive slices have not required redesigning evaluation order,
   ownership transfer, cleanup, or generic identity.
 
 This is not a “zero bugs for N days” gate. Findings should be encouraged,
-recorded, minimized, and dispositioned. Before a tagged release, seek review
-from someone who did not participate in the design.
+recorded, minimized, and dispositioned. Internal agent or participant review is
+valuable but does not satisfy the independent-review release gate.
 
 ## Cross-cutting work
 
