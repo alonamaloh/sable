@@ -1,0 +1,76 @@
+{
+  "schema_version": 2,
+  "audited_base_revision": "2ad556d7ec49504141bed3e2a7dacb188639978d",
+  "audited_date": "2026-08-20",
+  "native_optimization": "-O2",
+  "hosted_runtime_sha256": "daf7db88e646d997af151fe6cdf8b3fd3f4ae58be8562b8700e3168acae7fb7c",
+  "workloads": {
+    "quicksort": {
+      "expected_status": "blocked",
+      "title_fragment": "recursive calls are outside the first LLVM subset",
+      "detail_fragment": "`quicksort_range` participates in a recursive call cycle",
+      "closure": "The exact verified quicksort closure is recursive; the native gate rejects recursive call cycles before code generation.",
+      "source_sha256": {
+        "verified_subject": "5007f021d6162e7ec21c22eee6567c38186cd0812d855b9a4048d8d8a2f1c24d",
+        "sable": "d03f7938bd95ceb5d6e97dae0f6b3ffc78f108373102522e55801e6d9a1326fb",
+        "c": "d613f69e8381cdd89825e8c354e8197c2526bcddd9c5bd7e4074f5d7347f6422"
+      }
+    },
+    "merge": {
+      "expected_status": "blocked",
+      "title_fragment": "construct is outside the current LLVM backend subset",
+      "detail_fragment": "function parameter type `&[i32]` has no LLVM value representation",
+      "closure": "The exact merge kernel passes borrowed i32 arrays; the native ABI currently admits borrowed u32 and bool arrays only.",
+      "source_sha256": {
+        "verified_subject": "686670cad91e0cecb11702df44c03fc2d3e7053d4bfa37ef20dcd638e0d5120b",
+        "sable": "b9d91b1b72f1db670782488f532123322349ca0a93f5ce7c7ecc101145db296f",
+        "c": "43e791966251e0ccdde4da6d5e1216a5b36f611be16449f97b308a6988742056"
+      }
+    },
+    "hashmap": {
+      "expected_status": "blocked",
+      "title_fragment": "class is outside the exact scalar-owner LLVM subset",
+      "detail_fragment": "class local initializer uses `HashMap_i32_u64`",
+      "closure": "The exact map is a monomorphized generic class with owned array fields, outside the private concrete integer-field scalar-owner class subset.",
+      "source_sha256": {
+        "verified_subject": "8e9d88b37e93ecba9f875e4facf1d89fa39a7f4e1f879595925c989041315c0e",
+        "sable": "ec3644121fbd56b7ba9d3825efa62d43c2ee4f803100359f1613a87ca98c39fe",
+        "c": "d8d5a1b38201c930132ac6f7eeaf5dbd15936cb107a83058ae2ae4aeccf5055b"
+      }
+    },
+    "lomuto_partition_u32": {
+      "expected_status": "admitted",
+      "scope": "Exact non-recursive Lomuto partition kernel over admitted u32 arrays; excludes recursive quicksort.",
+      "comparison_eligibility": "optimization_trivialized",
+      "optimized_ir_shape_profile": "lomuto_partition_u32",
+      "noncomparable_reason": "Clang -O2 precomputes the fixed-input partition and output oracle in both emitted Sable LLVM and C, so the surviving loop measures allocation, constant stores, release, and counting rather than the partition algorithm.",
+      "source_sha256": {
+        "verified_subject": "586ccde78ffbbd5e1bb2e076c527cf433493df0f702eaebb523668815c586a7f",
+        "sable": "586ccde78ffbbd5e1bb2e076c527cf433493df0f702eaebb523668815c586a7f",
+        "c": "2535d9239e114f3f417cda90061f8db10e0f8cf9f47e80563466acf4765a8973"
+      }
+    },
+    "merge_u32": {
+      "expected_status": "admitted",
+      "scope": "Full merge control/data algorithm over admitted u32 arrays; excludes the canonical borrowed i32 ABI.",
+      "comparison_eligibility": "comparable",
+      "optimized_ir_shape_profile": "merge_u32",
+      "source_sha256": {
+        "verified_subject": "4646620e752a61520b9400eb0fbb8e9da26ec9c503df723a22cd9de06e89b90d",
+        "sable": "4646620e752a61520b9400eb0fbb8e9da26ec9c503df723a22cd9de06e89b90d",
+        "c": "3ee11726e8c68963ca156b521058fcd69e62d192affa482e38a0ede4e2bab49d"
+      }
+    },
+    "linear_probe_u32": {
+      "expected_status": "admitted",
+      "scope": "Fixed-capacity local-u32-array probing algorithm; excludes the canonical generic class and u64-value representation.",
+      "comparison_eligibility": "comparable",
+      "optimized_ir_shape_profile": "linear_probe_u32",
+      "source_sha256": {
+        "verified_subject": "6e2f92372377939c27ded96d1dc69e70e6e5b8287ed532801748f25630d48841",
+        "sable": "6e2f92372377939c27ded96d1dc69e70e6e5b8287ed532801748f25630d48841",
+        "c": "c2b0ba57989c462cbe51011a04bbf669c33569f80edc836afe0ca5e2c5890a14"
+      }
+    }
+  }
+}

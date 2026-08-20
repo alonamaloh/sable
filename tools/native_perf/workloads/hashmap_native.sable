@@ -1,0 +1,24 @@
+// Native-admission wrapper for the exact verified generic hash-map workload.
+
+use hashmap;
+
+fn perf_hashmap_entry() -> i32 {
+    mut u64 iteration = 0;
+    /// invariant iteration ≤ 262144
+    /// variant 262144 - iteration
+    while (iteration < 262144) {
+        var mut map = HashMap<i32, u64>::with_capacity(8);
+        map.insert(1, 100);
+        map.insert(9, 900);
+        map.insert(17, 1700);
+        map.insert(9, 901);
+        option<u64> found = map.get(9);
+        option<u64> collision = map.get(17);
+        option<u64> missing = map.get(25);
+        if (!found.is_some || found.value != 901 || !collision.is_some || collision.value != 1700 || missing.is_some || map.size() != 3) {
+            return 1;
+        }
+        iteration = iteration + 1;
+    }
+    return 42;
+}

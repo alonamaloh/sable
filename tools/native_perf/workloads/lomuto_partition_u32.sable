@@ -1,0 +1,44 @@
+// Native benchmark slice: the exact Lomuto partition kernel used by quicksort,
+// over the backend's admitted u32 array representation. This is not a full
+// quicksort benchmark; the canonical recursive workload remains closure-only.
+
+/// pre lo < hi
+/// pre hi ≤ values.len
+fn perf_partition(&mut [u32] values, u64 lo, u64 hi) -> u64 {
+    u64 pivot_index = hi - 1;
+    u32 pivot = values[pivot_index];
+    mut u64 next = lo;
+    mut u64 scan = lo;
+    /// invariant lo ≤ next ∧ next ≤ scan
+    /// invariant scan ≤ pivot_index
+    /// invariant pivot_index < values.len
+    /// variant pivot_index - scan
+    while (scan < pivot_index) {
+        if (values[scan] < pivot) {
+            u32 temporary = values[next];
+            values[next] = values[scan];
+            values[scan] = temporary;
+            next = next + 1;
+        }
+        scan = scan + 1;
+    }
+    u32 final_temporary = values[next];
+    values[next] = values[pivot_index];
+    values[pivot_index] = final_temporary;
+    return next;
+}
+
+fn perf_lomuto_partition_u32_entry() -> i32 {
+    mut u64 iteration = 0;
+    /// invariant iteration ≤ 262144
+    /// variant 262144 - iteration
+    while (iteration < 262144) {
+        mut [u32] values = [5, 3, 8, 1, 9, 2, 7, 3, 0, 6];
+        u64 pivot = perf_partition(&mut values, 0, 10);
+        if (pivot != 6 || values[0] != 5 || values[1] != 3 || values[2] != 1 || values[3] != 2 || values[4] != 3 || values[5] != 0 || values[6] != 6 || values[7] != 9 || values[8] != 8 || values[9] != 7) {
+            return 1;
+        }
+        iteration = iteration + 1;
+    }
+    return 42;
+}
