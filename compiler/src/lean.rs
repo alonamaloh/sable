@@ -14,9 +14,9 @@ use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::sync::Arc;
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 enum MapTarget {
     Clause {
@@ -77,7 +77,50 @@ pub struct Emitted {
     pub lean_source: String,
     /// What this file declares (after exclusion filtering).
     pub names: EmittedNames,
+    /// Exact user-derived Lean fragments whose parser boundaries must be
+    /// authenticated before this document may be submitted to Lean.
+    pub(crate) ingress: Vec<IngressFragment>,
     map: Vec<MapEntry>,
+}
+
+#[derive(Clone)]
+pub(crate) struct IngressFragment {
+    category: &'static str,
+    text: String,
+    expected_kind: &'static str,
+    expected_name: String,
+    pub(crate) span: Span,
+    pub(crate) description: String,
+}
+
+impl IngressFragment {
+    fn term(text: impl Into<String>, span: Span, description: impl Into<String>) -> Self {
+        Self {
+            category: "term",
+            text: text.into(),
+            expected_kind: "",
+            expected_name: String::new(),
+            span,
+            description: description.into(),
+        }
+    }
+
+    fn command(
+        text: impl Into<String>,
+        expected_kind: &'static str,
+        expected_name: impl Into<String>,
+        span: Span,
+        description: impl Into<String>,
+    ) -> Self {
+        Self {
+            category: "command",
+            text: text.into(),
+            expected_kind,
+            expected_name: expected_name.into(),
+            span,
+            description: description.into(),
+        }
+    }
 }
 
 struct Emitter {
@@ -112,6 +155,7 @@ pub fn emit(
     };
     let mut map = Vec::new();
     let mut names = EmittedNames::default();
+    let mut ingress = Vec::new();
 
     e.push("import Sable");
     for i in imports {
@@ -141,18 +185,27 @@ pub fn emit(
     if !vc.trust.externs.is_empty() {
         e.push("-- trusted boundary: audited extern contracts");
         for (id, reason, name) in &vc.trust.externs {
-            e.push(&format!("--   {id} ({name}): {reason}"));
+            e.push(&format!(
+                "--   audit-id-utf8:{} extern-name-utf8:{} reason-utf8:{}",
+                comment_hex(id),
+                comment_hex(name),
+                comment_hex(reason),
+            ));
         }
     }
     if !vc.machine.profiles.is_empty() {
         e.push("-- formal machine profiles (kernel-checked, not trusted axioms)");
         for (id, hash) in &vc.machine.profiles {
-            e.push(&format!("--   {id} {hash}"));
+            e.push(&format!(
+                "--   profile-id-utf8:{} semantics-hash-utf8:{}",
+                comment_hex(id),
+                comment_hex(hash),
+            ));
         }
         if !vc.machine.intrinsics.is_empty() {
             e.push(&format!(
-                "--   intrinsics: {}",
-                vc.machine.intrinsics.join(", ")
+                "--   intrinsics-utf8:{}",
+                comment_hex(&vc.machine.intrinsics.join("\0"))
             ));
         }
     }
@@ -167,6 +220,23 @@ pub fn emit(
         let first = e.line + 1;
         e.push(&format!("structure {lean_name} where"));
         for field in &r.fields {
+            ingress.push(IngressFragment::term(
+                field.lean_ty.clone(),
+                r.span,
+                format!("record `{}` field `{}` type", r.name, field.name),
+            ));
+            ingress.push(IngressFragment::term(
+                field.layout.clone(),
+                r.span,
+                format!("record `{}` field `{}` layout", r.name, field.name),
+            ));
+            if let Some(wf) = &field.wf {
+                ingress.push(IngressFragment::term(
+                    wf.clone(),
+                    r.span,
+                    format!("record `{}` field `{}` well-formedness", r.name, field.name),
+                ));
+            }
             e.push(&format!("  {} : {}", field.name, field.lean_ty));
         }
         e.push("");
@@ -283,6 +353,11 @@ pub fn emit(
             crate::vcgen::lean_class_name(&c.name)
         ));
         for (fname, fty) in &c.fields {
+            ingress.push(IngressFragment::term(
+                fty.clone(),
+                c.span,
+                format!("class `{}` field `{fname}` type", c.name),
+            ));
             e.push(&format!("  {fname} : {fty}"));
         }
         e.push("");
@@ -301,7 +376,7 @@ pub fn emit(
         if exclude.ghosts.contains(&head) {
             continue;
         }
-        names.ghosts.insert(head);
+        names.ghosts.insert(head.clone());
         let first = e.line + 1;
         // Non-recursive ghost defs get @[simp] so contracts naming them
         // unfold under the portfolio; recursive ones would loop and are
@@ -317,7 +392,19 @@ pub fn emit(
         if g.fact {
             attr.push_str("@[sable_fact] ");
         }
-        e.push(&format!("{attr}{} {}", g.keyword, g.text));
+        let command = format!("{attr}{} {}", g.keyword, g.text);
+        ingress.push(IngressFragment::command(
+            command.clone(),
+            if g.keyword == "def" {
+                "definition"
+            } else {
+                "theorem"
+            },
+            head.clone(),
+            g.span,
+            format!("ghost `{}` declaration `{head}`", g.keyword),
+        ));
+        e.push(&command);
         e.push("");
         map.push(MapEntry {
             first_line: first,
@@ -334,6 +421,24 @@ pub fn emit(
             continue;
         }
         names.wfs.insert(wf.def_name.clone());
+        for (_, ty) in &wf.binders {
+            ingress.push(IngressFragment::term(
+                ty.clone(),
+                wf.span,
+                format!("{} binder type", wf.desc),
+            ));
+        }
+        ingress.push(IngressFragment::term(
+            wf.result_ty,
+            wf.span,
+            format!("{} result type", wf.desc),
+        ));
+        let wrapped_text = format!("({})", wf.text);
+        ingress.push(IngressFragment::term(
+            wrapped_text.clone(),
+            wf.span,
+            wf.desc.clone(),
+        ));
         let first = e.line + 1;
         e.push(&format!(
             "def {} {} : {} :=",
@@ -341,7 +446,7 @@ pub fn emit(
             binder_list(&wf.binders),
             wf.result_ty
         ));
-        e.push(&format!("  ({})", wf.text));
+        e.push(&format!("  {wrapped_text}"));
         e.push("");
         map.push(MapEntry {
             first_line: first,
@@ -358,6 +463,30 @@ pub fn emit(
             continue;
         }
         names.certificates.insert(certificate.thm_name.clone());
+        for (_, ty) in &certificate.binders {
+            ingress.push(IngressFragment::term(
+                ty.clone(),
+                certificate.span(),
+                format!("certificate `{}` binder type", certificate.name),
+            ));
+        }
+        for (_, proposition) in &certificate.hyps {
+            ingress.push(IngressFragment::term(
+                proposition.clone(),
+                certificate.span(),
+                format!("certificate `{}` hypothesis", certificate.name),
+            ));
+        }
+        ingress.push(IngressFragment::term(
+            certificate.lean_goal(),
+            certificate.span(),
+            format!("certificate `{}` goal", certificate.name),
+        ));
+        ingress.push(IngressFragment::term(
+            certificate.lean_proof(),
+            certificate.span(),
+            format!("certificate `{}` proof", certificate.name),
+        ));
         let first = e.line + 1;
         e.push(&format!(
             "/-- `{}` — kernel-checked {} transition for `{}` -/",
@@ -391,6 +520,16 @@ pub fn emit(
             continue;
         }
         names.certificates.insert(certificate.thm_name.clone());
+        ingress.push(IngressFragment::term(
+            certificate.lean_goal(),
+            certificate.span,
+            format!("argument-schedule certificate `{}` goal", certificate.name),
+        ));
+        ingress.push(IngressFragment::term(
+            certificate.lean_proof(),
+            certificate.span,
+            format!("argument-schedule certificate `{}` proof", certificate.name),
+        ));
         let first = e.line + 1;
         e.push(&format!(
             "/-- `{}` — kernel-checked {} for {} -/",
@@ -422,6 +561,38 @@ pub fn emit(
         names.thms.insert(ob.thm_name.clone());
         names.obligations.insert(ob.name.clone());
         let discharge = discharges.iter().find(|d| d.name == ob.name);
+        for (_, ty) in &ob.binders {
+            ingress.push(IngressFragment::term(
+                ty.clone(),
+                ob.span,
+                format!("obligation `{}` binder type", ob.name),
+            ));
+        }
+        for (_, proposition) in &ob.hyps {
+            ingress.push(IngressFragment::term(
+                proposition.clone(),
+                ob.span,
+                format!("obligation `{}` hypothesis", ob.name),
+            ));
+        }
+        ingress.push(IngressFragment::term(
+            ob.goal.clone(),
+            ob.span,
+            format!("obligation `{}` goal", ob.name),
+        ));
+        if let Some(discharge) = discharge {
+            let mut proof = String::from("by\n");
+            for line in discharge.script.lines() {
+                proof.push_str("  ");
+                proof.push_str(line);
+                proof.push('\n');
+            }
+            ingress.push(IngressFragment::term(
+                proof,
+                discharge.span,
+                format!("discharge of `{}`", ob.name),
+            ));
+        }
         let first = e.line + 1;
         e.push(&format!(
             "/-- `{}` — {} -/",
@@ -463,16 +634,19 @@ pub fn emit(
     Emitted {
         lean_source: e.buf,
         names,
+        ingress,
         map,
     }
 }
 
-/// Head name of a ghost `def`/`theorem` (the first identifier of its
-/// verbatim text).
+/// Head name of a ghost `def`/`theorem` in Sable's deliberately narrow Lean
+/// declaration-id spelling: ASCII identifier characters plus apostrophes.
+/// The trusted parser independently checks the same identity before Lean sees
+/// the generated document.
 pub fn ghost_head_name(text: &str) -> String {
     text.trim_start()
         .chars()
-        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+        .take_while(|c| c.is_ascii_alphanumeric() || matches!(*c, '_' | '\''))
         .collect()
 }
 
@@ -494,7 +668,19 @@ fn ghost_recursive(text: &str) -> bool {
 }
 
 fn doc_safe(s: &str) -> String {
-    s.replace("-/", "- /")
+    s.replace("/-", "/ -").replace("-/", "- /")
+}
+
+/// Encode arbitrary UTF-8 metadata into an ASCII-only, single-line comment
+/// payload. The bytes remain exact inputs to content addressing without
+/// allowing decoded string escapes to terminate the generated comment.
+fn comment_hex(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len() * 2);
+    for byte in value.as_bytes() {
+        use std::fmt::Write as _;
+        write!(&mut encoded, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    encoded
 }
 
 /// Locate the repo root: the nearest ancestor containing `lean/lean-toolchain`.
@@ -524,6 +710,10 @@ pub struct LeanMessage {
 /// warning outside Sable's one compiler-owned, structured exception.
 pub const UNEXPECTED_LEAN_WARNING_DIAGNOSTIC: &str = "proof.unexpected_lean_warning";
 
+/// Stable diagnostic emitted when one user-derived Lean splice is not exactly
+/// one permitted command/term under the pinned trusted parser.
+pub const INVALID_LEAN_INGRESS_DIAGNOSTIC: &str = "proof.invalid_lean_ingress";
+
 /// The generated-artifact directory (`import`able compiled modules) —
 /// on `LEAN_PATH` for every check, whether or not it exists yet.
 pub fn modules_dir(repo_root: &Path) -> PathBuf {
@@ -533,7 +723,7 @@ pub fn modules_dir(repo_root: &Path) -> PathBuf {
 /// Exact repository-local inputs that can affect a generated proof. The FNV
 /// identifier is only a compact directory/name tag; every reuse also compares
 /// this complete map, so a hash collision fails closed.
-pub(crate) const PROOF_POLICY_VERSION: &str = "reject-unrecognized-lean-warnings-v2";
+pub(crate) const PROOF_POLICY_VERSION: &str = "confine-generated-lean-ingress-v3";
 const PROOF_ENVIRONMENT_ID_PREFIX: &str = "proof-env-v4-fnv64:";
 
 #[derive(Clone)]
@@ -645,7 +835,7 @@ impl ProofEnvironment {
     pub fn ensure_built(&self, repo_root: &Path) -> Result<PathBuf, String> {
         self.materialize_source(repo_root)?;
         let environment_dir = proof_environment_dir(repo_root, &self.id);
-        let _lock = ProofBuildLock::acquire(&environment_dir.join("build.lock"))?;
+        let _lock = AdvisoryLock::acquire(&environment_dir.join("build.lock"), "proof-build")?;
         self.validate_snapshot(&environment_dir.join("source"), "published source snapshot")?;
 
         let built = environment_dir.join("built");
@@ -673,10 +863,11 @@ impl ProofEnvironment {
         write_proof_policy_marker(&built, &self.policy)?;
         self.validate_snapshot(&built, "unbuilt proof workspace")?;
 
+        let _process_lock = ProofProcessLock::acquire(repo_root)?;
         build_proof_environment_serial(&built, &self.files)?;
         self.validate_snapshot(&built, "completed proof build")?;
-        require_sable_olean(&built)?;
-        publish_ready(&built, &ready, &self.id, &self.policy)?;
+        let output_digests = proof_build_output_digests(&built, &self.files)?;
+        publish_ready(&built, &ready, &self.id, &self.policy, &output_digests)?;
         self.validate_built(&built)?;
         Ok(built)
     }
@@ -696,17 +887,18 @@ impl ProofEnvironment {
                 ready.display()
             ));
         }
-        let actual = std::fs::read_to_string(&ready)
+        let actual = std::fs::read(&ready)
             .map_err(|error| format!("cannot read proof readiness {}: {error}", ready.display()))?;
-        if !proof_ready_stamp_matches(actual.as_bytes(), &self.id, &self.policy) {
+        let output_digests = proof_build_output_digests(built, &self.files)?;
+        if !proof_ready_stamp_matches(&actual, &self.id, &self.policy, &output_digests) {
             return Err(format!(
-                "proof readiness {} does not exactly match environment {} and verification policy `{}`",
+                "proof readiness {} does not exactly match environment {}, verification policy `{}`, and the SHA-256 identities of its trusted outputs",
                 ready.display(),
                 self.id,
                 self.policy,
             ));
         }
-        require_sable_olean(built)
+        Ok(())
     }
 
     fn validate_snapshot(&self, root: &Path, description: &str) -> Result<(), String> {
@@ -723,7 +915,13 @@ impl ProofEnvironment {
 }
 
 const PROOF_POLICY_MARKER_FILE: &str = ".sable-verification-policy";
-const PROOF_READY_STAMP_VERSION: &str = "sable-proof-ready-v1";
+const PROOF_READY_STAMP_VERSION: &str = "sable-proof-ready-v2";
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ProofBuildOutputDigests {
+    local_olean_sha256: BTreeMap<String, String>,
+    proof_auditor_sha256: String,
+}
 
 fn proof_policy_marker(proof_policy: &str) -> String {
     format!("sable-verification-policy:{proof_policy}\n")
@@ -782,15 +980,36 @@ fn validate_proof_policy_marker(
     }
 }
 
-fn proof_ready_stamp(id: &str, proof_policy: &str) -> String {
-    format!(
-        "{PROOF_READY_STAMP_VERSION}\nproof-environment:{id}\n{}",
-        proof_policy_marker(proof_policy)
-    )
+fn proof_ready_stamp(
+    id: &str,
+    proof_policy: &str,
+    output_digests: &ProofBuildOutputDigests,
+) -> String {
+    let mut stamp = format!(
+        "{PROOF_READY_STAMP_VERSION}\nproof-environment:{id}\n{}local-olean-count:{}\n",
+        proof_policy_marker(proof_policy),
+        output_digests.local_olean_sha256.len(),
+    );
+    for (path, digest) in &output_digests.local_olean_sha256 {
+        stamp.push_str(&format!(
+            "local-olean-path-utf8:{}\nlocal-olean-sha256:{digest}\n",
+            comment_hex(path),
+        ));
+    }
+    stamp.push_str(&format!(
+        "proof-auditor-sha256:{}\n",
+        output_digests.proof_auditor_sha256,
+    ));
+    stamp
 }
 
-fn proof_ready_stamp_matches(actual: &[u8], id: &str, proof_policy: &str) -> bool {
-    actual == proof_ready_stamp(id, proof_policy).as_bytes()
+fn proof_ready_stamp_matches(
+    actual: &[u8],
+    id: &str,
+    proof_policy: &str,
+    output_digests: &ProofBuildOutputDigests,
+) -> bool {
+    actual == proof_ready_stamp(id, proof_policy, output_digests).as_bytes()
 }
 
 fn proof_environment_id(files: &BTreeMap<String, Vec<u8>>, proof_policy: &str) -> String {
@@ -809,17 +1028,43 @@ fn proof_environment_id(files: &BTreeMap<String, Vec<u8>>, proof_policy: &str) -
 
 const SERIAL_LAKE_TOOLCHAIN: &str = "leanprover/lean4:v4.32.2";
 const SERIAL_LAKE_VERSION: &str = "Lake version 5.0.0-src+f3b06c7 (Lean version 4.32.2)";
+const PROOF_TOOL_OVERRIDES: [&str; 23] = [
+    "ELAN_TOOLCHAIN",
+    "LEAN_PATH",
+    "LEAN_SYSROOT",
+    "LEAN_SRC_PATH",
+    "LEAN_GITHASH",
+    "LEAN",
+    "LAKE",
+    "LAKE_HOME",
+    "LAKE_OVERRIDE_LEAN",
+    "LAKE_CACHE_KEY",
+    "LAKE_CACHE_ARTIFACT_ENDPOINT",
+    "LAKE_CACHE_REVISION_ENDPOINT",
+    "LAKE_CACHE_SERVICE",
+    "LAKE_CACHE_DIR",
+    "LAKE_PKG_URL_MAP",
+    "RESERVOIR_API_BASE_URL",
+    "RESERVOIR_API_URL",
+    "LEAN_CC",
+    "LEAN_AR",
+    "CC",
+    "AR",
+    "CXX",
+    "LD",
+];
 
 /// Build the captured local Lean library with Lake's asynchronous jobs forced
 /// inline by the audited Lean 4.32 runtime and one import worker. An absent task
 /// manager is the only hard scheduler bound: positive task-worker counts may be
-/// exceeded to avoid deadlock. The one explicit package target therefore owns
-/// at most one Lean compiler child at a time.
+/// exceeded to avoid deadlock. The two explicit repository targets build in one
+/// serialized Lake workload with at most one Lean compiler runtime at a time.
 fn build_proof_environment_serial(
     built: &Path,
     files: &BTreeMap<String, Vec<u8>>,
 ) -> Result<(), String> {
     require_serial_lake_toolchain(files)?;
+    require_closed_lake_manifest(files)?;
     let lean_dir = built.join("lean");
     require_serial_lake_version(&lean_dir)?;
     let output = serial_lake_build_command(&lean_dir)
@@ -909,13 +1154,53 @@ fn require_serial_lake_toolchain(files: &BTreeMap<String, Vec<u8>>) -> Result<()
     }
 }
 
+fn require_closed_lake_manifest(files: &BTreeMap<String, Vec<u8>>) -> Result<(), String> {
+    let Some(bytes) = files.get("lean/lake-manifest.json") else {
+        return Err("proof build requires captured `lean/lake-manifest.json` bytes".into());
+    };
+    let manifest: serde_json::Value = serde_json::from_slice(bytes)
+        .map_err(|error| format!("captured `lean/lake-manifest.json` is invalid: {error}"))?;
+    let object = manifest.as_object().ok_or_else(|| {
+        "captured `lean/lake-manifest.json` must be one exact JSON object".to_owned()
+    })?;
+    let expected = serde_json::json!({
+        "version": "1.2.0",
+        "packagesDir": ".lake/packages",
+        "packages": [],
+        "name": "sable",
+        "lakeDir": ".lake",
+        "fixedToolchain": false,
+    });
+    if object.len() == 6 && manifest == expected {
+        Ok(())
+    } else {
+        Err(
+            "proof builds admit exactly the current dependency-free Lake manifest; package dependencies or manifest layout changes require a reviewed proof-policy update"
+                .into(),
+        )
+    }
+}
+
 fn serial_lake_command(lean_dir: &Path) -> Command {
     let mut command = Command::new("lake");
+    sanitize_proof_child(&mut command);
     command
+        // Lake 5 otherwise reads local artifact caches by default using a
+        // compact trace. Proof outputs must be rebuilt from captured sources.
+        .env("LAKE_ARTIFACT_CACHE", "false")
+        .env("LAKE_RESTORE_ARTIFACTS", "false")
+        .env("LAKE_NO_CACHE", "true")
+        .env("LAKE_CONFIG", lean_dir.join("sable-lake-config.toml"))
         .env("LEAN_NUM_THREADS", "0")
         .env("LEAN_IMPORT_WORKERS", "1")
         .current_dir(lean_dir);
     command
+}
+
+fn sanitize_proof_child(command: &mut Command) {
+    for name in PROOF_TOOL_OVERRIDES {
+        command.env_remove(name);
+    }
 }
 
 fn serial_lake_version_command(lean_dir: &Path) -> Command {
@@ -926,11 +1211,29 @@ fn serial_lake_version_command(lean_dir: &Path) -> Command {
 
 fn serial_lake_build_command(lean_dir: &Path) -> Command {
     let mut command = serial_lake_command(lean_dir);
-    command.args(["--quiet", "build", "Sable"]);
+    command.args(["--quiet", "build", "Sable", "sable-proof-audit"]);
     command
 }
 
-fn publish_ready(built: &Path, ready: &Path, id: &str, proof_policy: &str) -> Result<(), String> {
+fn serial_lean_command(lean_dir: &Path) -> Command {
+    let mut command = serial_lake_command(lean_dir);
+    command.args(["env", "lean", "--json"]);
+    command
+}
+
+fn serial_proof_auditor_command(lean_dir: &Path, auditor: &Path) -> Command {
+    let mut command = serial_lake_command(lean_dir);
+    command.args(["env"]).arg(auditor);
+    command
+}
+
+fn publish_ready(
+    built: &Path,
+    ready: &Path,
+    id: &str,
+    proof_policy: &str,
+    output_digests: &ProofBuildOutputDigests,
+) -> Result<(), String> {
     let temporary = built.join(format!(
         ".READY.tmp.{}.{}",
         std::process::id(),
@@ -941,7 +1244,7 @@ fn publish_ready(built: &Path, ready: &Path, id: &str, proof_policy: &str) -> Re
         .create_new(true)
         .open(&temporary)
         .and_then(|mut file| {
-            file.write_all(proof_ready_stamp(id, proof_policy).as_bytes())?;
+            file.write_all(proof_ready_stamp(id, proof_policy, output_digests).as_bytes())?;
             file.sync_all()
         })
         .and_then(|()| std::fs::rename(&temporary, ready));
@@ -1070,6 +1373,7 @@ fn capture_proof_files(repo_root: &Path) -> Result<BTreeMap<String, Vec<u8>>, St
         "lean/lean-toolchain",
         "lean/lakefile.toml",
         "lean/lake-manifest.json",
+        "lean/sable-lake-config.toml",
         "lean/Sable.lean",
     ] {
         capture_proof_file(repo_root, Path::new(relative), &mut files)?;
@@ -1221,18 +1525,199 @@ fn remove_unready_built(environment_dir: &Path, built: &Path) -> Result<(), Stri
     })
 }
 
-fn require_sable_olean(built: &Path) -> Result<(), String> {
-    let olean = built.join("lean/.lake/build/lib/lean/Sable.olean");
-    let metadata = std::fs::symlink_metadata(&olean)
-        .map_err(|error| format!("proof build is missing {}: {error}", olean.display()))?;
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
-        Err(format!(
-            "proof build output {} is not a regular file",
-            olean.display()
-        ))
-    } else {
-        Ok(())
+fn expected_local_olean_paths(
+    files: &BTreeMap<String, Vec<u8>>,
+) -> Result<std::collections::BTreeSet<String>, String> {
+    for required in ["lean/Sable.lean", "lean/SableProofAudit.lean"] {
+        if !files.contains_key(required) {
+            return Err(format!(
+                "proof environment is missing trusted output root `{required}`"
+            ));
+        }
     }
+    for label in files.keys().filter(|label| label.ends_with(".lean")) {
+        if label != "lean/Sable.lean"
+            && label != "lean/SableProofAudit.lean"
+            && !label.starts_with("lean/Sable/")
+        {
+            return Err(format!(
+                "proof environment contains unsupported Lean source root `{label}`; the trusted output layout is exactly `Sable.lean`, `SableProofAudit.lean`, and `Sable/**`"
+            ));
+        }
+    }
+    let expected = files
+        .keys()
+        .filter(|label| {
+            label.as_str() == "lean/Sable.lean"
+                || label.as_str() == "lean/SableProofAudit.lean"
+                || label.starts_with("lean/Sable/")
+        })
+        .filter_map(|label| {
+            label
+                .strip_prefix("lean/")
+                .and_then(|label| label.strip_suffix(".lean"))
+                .map(|label| format!("{label}.olean"))
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    if expected.is_empty() {
+        Err("proof environment derives no trusted local `.olean` outputs".into())
+    } else {
+        Ok(expected)
+    }
+}
+
+fn collect_local_olean_digests(
+    root: &Path,
+    relative: &Path,
+    output: &mut BTreeMap<String, String>,
+) -> Result<(), String> {
+    let directory = root.join(relative);
+    let metadata = std::fs::symlink_metadata(&directory).map_err(|error| {
+        format!(
+            "cannot inspect local proof-output directory {}: {error}",
+            directory.display()
+        )
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(format!(
+            "local proof-output directory {} is not a local directory",
+            directory.display()
+        ));
+    }
+    let mut entries = std::fs::read_dir(&directory)
+        .map_err(|error| {
+            format!(
+                "cannot enumerate local proof outputs in {}: {error}",
+                directory.display()
+            )
+        })?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| {
+            format!(
+                "cannot enumerate an entry in local proof-output directory {}: {error}",
+                directory.display()
+            )
+        })?;
+    entries.sort_by_key(std::fs::DirEntry::file_name);
+    for entry in entries {
+        let child_relative = relative.join(entry.file_name());
+        let path = entry.path();
+        let metadata = std::fs::symlink_metadata(&path)
+            .map_err(|error| format!("cannot inspect proof output {}: {error}", path.display()))?;
+        if metadata.file_type().is_symlink() {
+            return Err(format!(
+                "local proof output {} is a symlink",
+                path.display()
+            ));
+        }
+        let file_name = child_relative
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| format!("proof output path {} is not UTF-8", path.display()))?;
+        if unsupported_proof_output_name(file_name) {
+            return Err(format!(
+                "unsupported module-system/IR proof output {} would broaden the authenticated proof workspace",
+                path.display()
+            ));
+        }
+        if child_relative
+            .extension()
+            .is_some_and(|extension| extension == "olean")
+        {
+            if !metadata.is_file() {
+                return Err(format!(
+                    "local `.olean` proof output {} is not a regular file",
+                    path.display()
+                ));
+            }
+            let label = child_relative
+                .to_str()
+                .ok_or_else(|| format!("proof output path {} is not UTF-8", path.display()))?
+                .replace(std::path::MAIN_SEPARATOR, "/");
+            let bytes = std::fs::read(&path).map_err(|error| {
+                format!("cannot hash local proof output {}: {error}", path.display())
+            })?;
+            let metadata_after = std::fs::symlink_metadata(&path).map_err(|error| {
+                format!(
+                    "cannot recheck local proof output {}: {error}",
+                    path.display()
+                )
+            })?;
+            if metadata_after.file_type().is_symlink() || !metadata_after.is_file() {
+                return Err(format!(
+                    "local proof output {} changed kind while being hashed",
+                    path.display()
+                ));
+            }
+            output.insert(label, crate::sha256::hex(&bytes));
+        } else if metadata.is_dir() {
+            collect_local_olean_digests(root, &child_relative, output)?;
+        }
+    }
+    Ok(())
+}
+
+fn unsupported_proof_output_name(file_name: &str) -> bool {
+    file_name.ends_with(".olean.server")
+        || file_name.ends_with(".olean.private")
+        || file_name.ends_with(".ir")
+}
+
+fn proof_build_output_digests(
+    built: &Path,
+    files: &BTreeMap<String, Vec<u8>>,
+) -> Result<ProofBuildOutputDigests, String> {
+    let expected = expected_local_olean_paths(files)?;
+    let olean_root = built.join("lean/.lake/build/lib/lean");
+    let mut local_olean_sha256 = BTreeMap::new();
+    collect_local_olean_digests(&olean_root, Path::new(""), &mut local_olean_sha256)?;
+    let actual = local_olean_sha256.keys().cloned().collect();
+    if actual != expected {
+        let missing = expected.difference(&actual).cloned().collect::<Vec<_>>();
+        let unexpected = actual.difference(&expected).cloned().collect::<Vec<_>>();
+        return Err(format!(
+            "local proof outputs do not exactly match captured Lean sources; missing={missing:?}, unexpected={unexpected:?}"
+        ));
+    }
+    let proof_auditor = proof_auditor_path(built);
+    let metadata = std::fs::symlink_metadata(&proof_auditor).map_err(|error| {
+        format!(
+            "proof build is missing {}: {error}",
+            proof_auditor.display()
+        )
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(format!(
+            "proof build output {} is not a regular file",
+            proof_auditor.display()
+        ));
+    }
+    let proof_auditor_bytes = std::fs::read(&proof_auditor).map_err(|error| {
+        format!(
+            "cannot hash trusted proof build output {}: {error}",
+            proof_auditor.display()
+        )
+    })?;
+    let metadata_after = std::fs::symlink_metadata(&proof_auditor).map_err(|error| {
+        format!(
+            "cannot recheck trusted proof build output {}: {error}",
+            proof_auditor.display()
+        )
+    })?;
+    if metadata_after.file_type().is_symlink() || !metadata_after.is_file() {
+        return Err(format!(
+            "proof build output {} changed kind while being hashed",
+            proof_auditor.display()
+        ));
+    }
+    Ok(ProofBuildOutputDigests {
+        local_olean_sha256,
+        proof_auditor_sha256: crate::sha256::hex(&proof_auditor_bytes),
+    })
+}
+
+fn proof_auditor_path(built: &Path) -> PathBuf {
+    built.join("lean/.lake/build/bin/sable-proof-audit")
 }
 
 fn fingerprint_bytes(mut hash: u64, bytes: &[u8]) -> u64 {
@@ -1243,14 +1728,14 @@ fn fingerprint_bytes(mut hash: u64, bytes: &[u8]) -> u64 {
     hash
 }
 
-struct ProofBuildLock(File);
+struct AdvisoryLock(File);
 
-impl ProofBuildLock {
-    fn acquire(path: &Path) -> Result<Self, String> {
+impl AdvisoryLock {
+    fn acquire(path: &Path, description: &str) -> Result<Self, String> {
         if let Ok(metadata) = std::fs::symlink_metadata(path) {
             if metadata.file_type().is_symlink() || !metadata.is_file() {
                 return Err(format!(
-                    "proof-build lock {} must be a local regular file",
+                    "{description} lock {} must be a local regular file",
                     path.display()
                 ));
             }
@@ -1260,13 +1745,15 @@ impl ProofBuildLock {
             .write(true)
             .create(true)
             .open(path)
-            .map_err(|error| format!("cannot open proof-build lock {}: {error}", path.display()))?;
+            .map_err(|error| {
+                format!("cannot open {description} lock {}: {error}", path.display())
+            })?;
         // This crate's daemon already requires Unix sockets. `flock` keeps a
         // crashed process from leaving a permanent lock-directory tombstone.
         let result = unsafe { process_flock(file.as_raw_fd(), LOCK_EXCLUSIVE) };
         if result != 0 {
             return Err(format!(
-                "cannot lock proof-build lock {}: {}",
+                "cannot lock {description} lock {}: {}",
                 path.display(),
                 std::io::Error::last_os_error()
             ));
@@ -1275,10 +1762,38 @@ impl ProofBuildLock {
     }
 }
 
-impl Drop for ProofBuildLock {
+impl Drop for AdvisoryLock {
     fn drop(&mut self) {
         let _ = unsafe { process_flock(self.0.as_raw_fd(), LOCK_UNLOCK) };
     }
+}
+
+/// Serialize every owned Lake/Lean/auditor child both between threads in this
+/// compiler process and between compiler processes using the same repository.
+/// `flock` alone is process-scoped on supported Unix hosts, so the mutex must
+/// always be acquired first and held for the full child lifetime.
+struct ProofProcessLock {
+    _thread: MutexGuard<'static, ()>,
+    _process: AdvisoryLock,
+}
+
+static PROOF_PROCESS_MUTEX: Mutex<()> = Mutex::new(());
+
+impl ProofProcessLock {
+    fn acquire(repo_root: &Path) -> Result<Self, String> {
+        let thread = PROOF_PROCESS_MUTEX
+            .lock()
+            .map_err(|_| "in-process proof-process lock is poisoned".to_owned())?;
+        let process = AdvisoryLock::acquire(&proof_process_lock_path(repo_root), "proof-process")?;
+        Ok(Self {
+            _thread: thread,
+            _process: process,
+        })
+    }
+}
+
+fn proof_process_lock_path(repo_root: &Path) -> PathBuf {
+    repo_root.join(".sable-out").join("proof-process.lock")
 }
 
 const LOCK_EXCLUSIVE: std::os::raw::c_int = 2;
@@ -1299,20 +1814,292 @@ pub fn lean_search_path(
     environment: &ProofEnvironment,
 ) -> Result<String, String> {
     let built = environment.ensure_built(repo_root)?;
-    let out = Command::new("lake")
+    let lean_dir = built.join("lean");
+    let _process_lock = ProofProcessLock::acquire(repo_root)?;
+    environment.validate_built(&built)?;
+    // READY authenticates cached outputs, not the current PATH lookup. Couple
+    // every cached Lake workload to the pinned version under the same lock.
+    require_serial_lake_version(&lean_dir)?;
+    let out = serial_lake_command(&lean_dir)
+        // Lake otherwise prepends an ambient LEAN_PATH, which could make an
+        // unauthenticated module shadow the content-addressed proof build.
+        .env_remove("LEAN_PATH")
         .args(["env", "printenv", "LEAN_PATH"])
-        .current_dir(built.join("lean"))
         .output()
         .map_err(|err| format!("failed to run `lake env`: {err}"))?;
     if !out.status.success() {
         return Err(format!(
-            "`lake env printenv LEAN_PATH` failed:\n{}",
+            "`lake env printenv LEAN_PATH` failed with {}: stdout={:?}, stderr={:?}",
+            out.status,
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr),
+        ));
+    }
+    if !out.stderr.is_empty() {
+        return Err(format!(
+            "`lake env printenv LEAN_PATH` emitted unexpected stderr: {:?}",
             String::from_utf8_lossy(&out.stderr)
         ));
     }
+    let stdout = std::str::from_utf8(&out.stdout)
+        .map_err(|error| format!("`lake env` LEAN_PATH is not UTF-8: {error}"))?;
+    let Some(base) = stdout.strip_suffix('\n') else {
+        return Err("`lake env` LEAN_PATH must be exactly one newline-terminated line".into());
+    };
+    if base.is_empty() || base.contains(['\n', '\r']) {
+        return Err("`lake env` LEAN_PATH must be exactly one nonempty line".into());
+    }
     environment.validate_built(&built)?;
-    let base = String::from_utf8_lossy(&out.stdout).trim().to_string();
     Ok(format!("{base}:{}", modules_dir(repo_root).display()))
+}
+
+#[derive(Debug)]
+pub(crate) struct IngressAuditFailure {
+    pub(crate) span: Span,
+    pub(crate) description: String,
+    pub(crate) message: String,
+}
+
+fn ingress_transport_failure(emitted: &Emitted, message: impl Into<String>) -> IngressAuditFailure {
+    let (span, description) = emitted.ingress.first().map_or(
+        (Span::new(0, 0), "generated Lean document".to_owned()),
+        |fragment| (fragment.span, fragment.description.clone()),
+    );
+    IngressAuditFailure {
+        span,
+        description,
+        message: message.into(),
+    }
+}
+
+/// Authenticate every compiler-recorded user-derived parser boundary using
+/// the content-hashed trusted auditor. Candidate generated modules are not
+/// imported by this mode; the auditor loads extensions only from `Sable`.
+pub(crate) fn audit_ingress(
+    repo_root: &Path,
+    environment: &ProofEnvironment,
+    emitted: &Emitted,
+) -> Result<(), IngressAuditFailure> {
+    let request = serde_json::json!({
+        "schema": "sable-proof-ingress-request-v1",
+        "fragments": emitted.ingress.iter().map(|fragment| serde_json::json!({
+            "category": fragment.category,
+            "text": &fragment.text,
+            "expected_kind": fragment.expected_kind,
+            "expected_name": &fragment.expected_name,
+        })).collect::<Vec<_>>(),
+    });
+    let request = serde_json::to_vec(&request).map_err(|error| {
+        ingress_transport_failure(
+            emitted,
+            format!("cannot encode the exact proof-ingress request: {error}"),
+        )
+    })?;
+    let built = environment
+        .ensure_built(repo_root)
+        .map_err(|message| ingress_transport_failure(emitted, message))?;
+    environment
+        .validate_built(&built)
+        .map_err(|message| ingress_transport_failure(emitted, message))?;
+    let auditor = proof_auditor_path(&built);
+    let metadata = std::fs::symlink_metadata(&auditor).map_err(|error| {
+        ingress_transport_failure(
+            emitted,
+            format!(
+                "cannot inspect proof auditor {}: {error}",
+                auditor.display()
+            ),
+        )
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(ingress_transport_failure(
+            emitted,
+            format!("proof auditor {} is not a regular file", auditor.display()),
+        ));
+    }
+    let _process_lock = ProofProcessLock::acquire(repo_root)
+        .map_err(|message| ingress_transport_failure(emitted, message))?;
+    environment
+        .validate_built(&built)
+        .map_err(|message| ingress_transport_failure(emitted, message))?;
+    let lean_dir = built.join("lean");
+    require_serial_lake_version(&lean_dir)
+        .map_err(|message| ingress_transport_failure(emitted, message))?;
+    let mut command = serial_proof_auditor_command(&lean_dir, &auditor);
+    let mut child = command
+        // Lake prepends the authenticated workspace search path. The only
+        // inherited addition is Sable's content-addressed generated modules.
+        .env("LEAN_PATH", modules_dir(repo_root))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| {
+            ingress_transport_failure(
+                emitted,
+                format!("failed to run proof-ingress auditor: {error}"),
+            )
+        })?;
+    let write_result = child
+        .stdin
+        .take()
+        .ok_or_else(|| "proof-ingress auditor stdin pipe is unavailable".to_owned())
+        .and_then(|mut stdin| {
+            stdin
+                .write_all(&request)
+                .map_err(|error| format!("cannot write proof-ingress request: {error}"))
+        });
+    if let Err(message) = write_result {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(ingress_transport_failure(emitted, message));
+    }
+    let output = child.wait_with_output().map_err(|error| {
+        ingress_transport_failure(
+            emitted,
+            format!("cannot wait for proof-ingress auditor: {error}"),
+        )
+    })?;
+    environment
+        .validate_built(&built)
+        .map_err(|message| ingress_transport_failure(emitted, message))?;
+    parse_ingress_audit_output(
+        emitted,
+        output.status.success(),
+        &output.stdout,
+        &output.stderr,
+    )
+}
+
+fn parse_ingress_audit_output(
+    emitted: &Emitted,
+    status_success: bool,
+    stdout: &[u8],
+    stderr: &[u8],
+) -> Result<(), IngressAuditFailure> {
+    let stdout = std::str::from_utf8(stdout).map_err(|error| {
+        ingress_transport_failure(
+            emitted,
+            format!("proof auditor stdout is not UTF-8: {error}"),
+        )
+    })?;
+    let stderr = std::str::from_utf8(stderr).map_err(|error| {
+        ingress_transport_failure(
+            emitted,
+            format!("proof auditor stderr is not UTF-8: {error}"),
+        )
+    })?;
+    if !status_success || !stderr.is_empty() {
+        return Err(ingress_transport_failure(
+            emitted,
+            format!(
+                "proof auditor transport failed: status_success={status_success}, stdout={stdout:?}, stderr={stderr:?}"
+            ),
+        ));
+    }
+    let Some(line) = stdout.strip_suffix('\n') else {
+        return Err(ingress_transport_failure(
+            emitted,
+            "proof auditor stdout must be exactly one newline-terminated JSON result",
+        ));
+    };
+    if line.is_empty() || line.contains('\n') || line.contains('\r') {
+        return Err(ingress_transport_failure(
+            emitted,
+            "proof auditor stdout must contain exactly one JSON line",
+        ));
+    }
+    let value: serde_json::Value = serde_json::from_str(line).map_err(|error| {
+        ingress_transport_failure(
+            emitted,
+            format!("proof auditor result is not valid JSON: {error}"),
+        )
+    })?;
+    let object = value.as_object().ok_or_else(|| {
+        ingress_transport_failure(emitted, "proof auditor result must be a JSON object")
+    })?;
+    if object.get("schema").and_then(serde_json::Value::as_str)
+        != Some("sable-proof-ingress-result-v1")
+    {
+        return Err(ingress_transport_failure(
+            emitted,
+            "proof auditor result has the wrong or missing schema",
+        ));
+    }
+    let accepted = object
+        .get("accepted")
+        .and_then(serde_json::Value::as_bool)
+        .ok_or_else(|| {
+            ingress_transport_failure(
+                emitted,
+                "proof auditor result lacks a Boolean `accepted` field",
+            )
+        })?;
+    if accepted {
+        if object.len() == 2 {
+            return Ok(());
+        }
+        return Err(ingress_transport_failure(
+            emitted,
+            "accepted proof auditor result contains unknown fields",
+        ));
+    }
+    let failure_kind = object
+        .get("failure_kind")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            ingress_transport_failure(
+                emitted,
+                "rejected proof auditor result lacks `failure_kind`",
+            )
+        })?;
+    let message = object
+        .get("message")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            ingress_transport_failure(emitted, "rejected proof auditor result lacks `message`")
+        })?;
+    if failure_kind == "fragment" {
+        if object.len() != 5 {
+            return Err(ingress_transport_failure(
+                emitted,
+                "fragment rejection has missing or unknown fields",
+            ));
+        }
+        let index = object
+            .get("index")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|index| usize::try_from(index).ok())
+            .filter(|index| *index < emitted.ingress.len())
+            .ok_or_else(|| {
+                ingress_transport_failure(
+                    emitted,
+                    "fragment rejection has an invalid or out-of-range index",
+                )
+            })?;
+        let fragment = &emitted.ingress[index];
+        return Err(IngressAuditFailure {
+            span: fragment.span,
+            description: fragment.description.clone(),
+            message: message.to_owned(),
+        });
+    }
+    if object.len() != 4 {
+        return Err(ingress_transport_failure(
+            emitted,
+            "auditor/request rejection has missing or unknown fields",
+        ));
+    }
+    if !matches!(failure_kind, "transport" | "request" | "auditor") {
+        return Err(ingress_transport_failure(
+            emitted,
+            "proof auditor result has an unsupported `failure_kind`",
+        ));
+    }
+    Err(ingress_transport_failure(
+        emitted,
+        format!("proof auditor rejected its {failure_kind} boundary: {message}"),
+    ))
 }
 
 /// Check a generated file against an immutable proof build. With `olean_out`,
@@ -1328,16 +2115,19 @@ pub fn run_lean(
     let lean_dir = built.join("lean");
     require_generated_source(lean_file, expected_source, "before Lean checking")?;
 
-    let mut cmd = Command::new("lean");
-    cmd.arg("--json")
-        .env("LEAN_PATH", lean_search_path(repo_root, environment)?)
-        .current_dir(&lean_dir);
+    let mut cmd = serial_lean_command(&lean_dir);
+    // `lake env` prepends the authenticated proof workspace; generated
+    // dependency modules are the only inherited addition.
+    cmd.env("LEAN_PATH", modules_dir(repo_root));
     if let Some(olean) = olean_out {
         cmd.arg("--root")
             .arg(modules_dir(repo_root))
             .arg("-o")
             .arg(olean);
     }
+    let _process_lock = ProofProcessLock::acquire(repo_root)?;
+    environment.validate_built(&built)?;
+    require_serial_lake_version(&lean_dir)?;
     let output = cmd
         .arg(lean_file)
         .output()
@@ -1877,6 +2667,7 @@ mod warning_policy_tests {
         let emitted = Emitted {
             lean_source: String::new(),
             names: EmittedNames::default(),
+            ingress: Vec::new(),
             map: vec![MapEntry {
                 first_line: 7,
                 last_line: 9,
@@ -1911,6 +2702,7 @@ mod warning_policy_tests {
         let emitted = Emitted {
             lean_source: String::new(),
             names: EmittedNames::default(),
+            ingress: Vec::new(),
             map: vec![MapEntry {
                 first_line: 7,
                 last_line: 9,
@@ -1964,17 +2756,248 @@ mod proof_build_tests {
     use super::*;
     use std::ffi::OsStr;
 
+    struct TempProofTree(PathBuf);
+
+    impl Drop for TempProofTree {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn emitted_with_ingress() -> Emitted {
+        Emitted {
+            lean_source: String::new(),
+            names: EmittedNames::default(),
+            ingress: vec![
+                IngressFragment::term("True", Span::new(2, 3), "first fragment"),
+                IngressFragment::term("False", Span::new(7, 11), "second fragment"),
+            ],
+            map: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn comment_metadata_is_byte_exact_ascii_on_one_line() {
+        assert_eq!(comment_hex("safe"), "73616665");
+        assert_eq!(
+            comment_hex("line\ncarriage\rnull\0unit\u{1f}é"),
+            "6c696e650a63617272696167650d6e756c6c00756e69741fc3a9"
+        );
+        for byte in comment_hex("\n\r\0\u{1f}").bytes() {
+            assert!(byte.is_ascii_hexdigit());
+        }
+    }
+
+    #[test]
+    fn generated_doc_metadata_cannot_change_comment_nesting() {
+        let safe = doc_safe("source /- nested -/ then -/ escaped /- again");
+        assert!(!safe.contains("/-"));
+        assert!(!safe.contains("-/"));
+        assert_eq!(safe, "source / - nested - / then - / escaped / - again");
+    }
+
+    #[test]
+    fn ghost_identity_keeps_lean_apostrophes() {
+        assert_eq!(
+            ghost_head_name("emod_nonneg' (x m : Int) : True := True.intro"),
+            "emod_nonneg'"
+        );
+        assert_eq!(
+            ghost_head_name("  ordinary_name : Nat := 0"),
+            "ordinary_name"
+        );
+    }
+
+    #[test]
+    fn ingress_auditor_transport_accepts_only_the_exact_result_schema() {
+        let emitted = emitted_with_ingress();
+        let accepted = b"{\"schema\":\"sable-proof-ingress-result-v1\",\"accepted\":true}\n";
+        parse_ingress_audit_output(&emitted, true, accepted, b"")
+            .expect("the exact accepted result passes");
+
+        for stdout in [
+            b"{\"schema\":\"sable-proof-ingress-result-v1\",\"accepted\":true}".as_slice(),
+            b"{\"schema\":\"sable-proof-ingress-result-v1\",\"accepted\":true}\r\n".as_slice(),
+            b"{\"schema\":\"sable-proof-ingress-result-v1\",\"accepted\":true,\"extra\":0}\n"
+                .as_slice(),
+            b"ok\n".as_slice(),
+        ] {
+            assert!(parse_ingress_audit_output(&emitted, true, stdout, b"").is_err());
+        }
+        assert!(parse_ingress_audit_output(&emitted, false, accepted, b"").is_err());
+        assert!(parse_ingress_audit_output(&emitted, true, accepted, b"warning\n").is_err());
+        let forged_kind = b"{\"schema\":\"sable-proof-ingress-result-v1\",\"accepted\":false,\"failure_kind\":\"forged\",\"message\":\"accepted by loose parser\"}\n";
+        assert!(parse_ingress_audit_output(&emitted, true, forged_kind, b"").is_err());
+    }
+
+    #[test]
+    fn dependency_and_module_system_outputs_require_a_policy_review() {
+        let exact_manifest = include_bytes!("../../lean/lake-manifest.json").to_vec();
+        let exact = BTreeMap::from([("lean/lake-manifest.json".into(), exact_manifest)]);
+        require_closed_lake_manifest(&exact)
+            .expect("the captured dependency-free manifest is the admitted workspace");
+
+        for manifest in [
+            serde_json::json!({
+                "version": "1.2.0",
+                "packagesDir": ".lake/packages",
+                "packages": [{"name": "unreviewed"}],
+                "name": "sable",
+                "lakeDir": ".lake",
+                "fixedToolchain": false,
+            }),
+            serde_json::json!({
+                "version": "1.2.0",
+                "packagesDir": ".lake/packages",
+                "packages": [],
+                "name": "sable",
+                "lakeDir": ".lake",
+                "fixedToolchain": false,
+                "unknown": true,
+            }),
+        ] {
+            let files = BTreeMap::from([(
+                "lean/lake-manifest.json".into(),
+                serde_json::to_vec(&manifest).expect("test manifest serializes"),
+            )]);
+            assert!(require_closed_lake_manifest(&files).is_err());
+        }
+        assert!(require_closed_lake_manifest(&BTreeMap::new()).is_err());
+
+        for rejected in [
+            "Sable.olean.server",
+            "Sable.olean.private",
+            "Sable.ir",
+            "nested.ir",
+        ] {
+            assert!(unsupported_proof_output_name(rejected));
+        }
+        for admitted in ["Sable.olean", "Sable.ilean", "Sable.c", "Sable.o"] {
+            assert!(!unsupported_proof_output_name(admitted));
+        }
+    }
+
+    #[test]
+    fn proof_output_digest_walk_requires_the_exact_regular_output_set() {
+        let built = unique_directory(&std::env::temp_dir(), "sable-proof-output-test")
+            .expect("create isolated proof-output tree");
+        let _cleanup = TempProofTree(built.clone());
+        let olean_root = built.join("lean/.lake/build/lib/lean");
+        let auditor = proof_auditor_path(&built);
+        std::fs::create_dir_all(olean_root.join("Sable"))
+            .expect("create nested proof-output directory");
+        std::fs::create_dir_all(auditor.parent().expect("auditor has a parent"))
+            .expect("create auditor output directory");
+        std::fs::write(olean_root.join("Sable.olean"), b"root olean").expect("write root olean");
+        std::fs::write(
+            olean_root.join("SableProofAudit.olean"),
+            b"auditor library olean",
+        )
+        .expect("write auditor library olean");
+        std::fs::write(olean_root.join("Sable/Fixture.olean"), b"fixture olean")
+            .expect("write nested olean");
+        std::fs::write(&auditor, b"native auditor").expect("write native auditor");
+
+        let files = BTreeMap::from([
+            ("lean/Sable.lean".into(), b"import Sable.Fixture".to_vec()),
+            ("lean/SableProofAudit.lean".into(), b"import Sable".to_vec()),
+            (
+                "lean/Sable/Fixture.lean".into(),
+                b"def fixture := 0".to_vec(),
+            ),
+        ]);
+        let exact = proof_build_output_digests(&built, &files)
+            .expect("the exact regular output set is accepted");
+        assert_eq!(
+            exact.local_olean_sha256.keys().cloned().collect::<Vec<_>>(),
+            [
+                "Sable.olean",
+                "Sable/Fixture.olean",
+                "SableProofAudit.olean"
+            ]
+        );
+
+        std::fs::remove_file(olean_root.join("Sable/Fixture.olean"))
+            .expect("remove expected nested olean");
+        assert!(
+            proof_build_output_digests(&built, &files)
+                .expect_err("a missing local olean fails closed")
+                .contains("missing")
+        );
+        std::fs::write(olean_root.join("Sable/Fixture.olean"), b"fixture olean")
+            .expect("restore expected nested olean");
+
+        std::fs::write(olean_root.join("Unexpected.olean"), b"unexpected")
+            .expect("write unexpected local olean");
+        assert!(
+            proof_build_output_digests(&built, &files)
+                .expect_err("an unexpected local olean fails closed")
+                .contains("unexpected")
+        );
+        std::fs::remove_file(olean_root.join("Unexpected.olean"))
+            .expect("remove unexpected local olean");
+
+        std::fs::write(olean_root.join("Sable.ir"), b"unsupported ir")
+            .expect("write unsupported IR output");
+        assert!(
+            proof_build_output_digests(&built, &files)
+                .expect_err("an unsupported module-system output fails closed")
+                .contains("unsupported module-system/IR proof output")
+        );
+        std::fs::remove_file(olean_root.join("Sable.ir")).expect("remove unsupported IR output");
+
+        std::fs::remove_file(olean_root.join("Sable.olean")).expect("remove regular root olean");
+        std::fs::create_dir(olean_root.join("Sable.olean"))
+            .expect("replace root olean with a directory");
+        assert!(
+            proof_build_output_digests(&built, &files)
+                .expect_err("a nonregular olean fails closed")
+                .contains("not a regular file")
+        );
+    }
+
+    #[test]
+    fn ingress_auditor_rejection_maps_only_an_authenticated_fragment_index() {
+        let emitted = emitted_with_ingress();
+        let rejection = b"{\"schema\":\"sable-proof-ingress-result-v1\",\"accepted\":false,\"failure_kind\":\"fragment\",\"message\":\"escaped parser boundary\",\"index\":1}\n";
+        let failure = parse_ingress_audit_output(&emitted, true, rejection, b"")
+            .expect_err("fragment rejection fails closed");
+        assert_eq!(failure.span, Span::new(7, 11));
+        assert_eq!(failure.description, "second fragment");
+        assert_eq!(failure.message, "escaped parser boundary");
+
+        let out_of_range = b"{\"schema\":\"sable-proof-ingress-result-v1\",\"accepted\":false,\"failure_kind\":\"fragment\",\"message\":\"forged\",\"index\":2}\n";
+        let failure = parse_ingress_audit_output(&emitted, true, out_of_range, b"")
+            .expect_err("an out-of-range diagnostic index fails as transport evidence");
+        assert_eq!(failure.span, Span::new(2, 3));
+        assert_eq!(failure.description, "first fragment");
+    }
+
     fn assert_serial_lake_command_base(command: &Command, lean_dir: &Path) {
         assert_eq!(command.get_program(), OsStr::new("lake"));
         assert_eq!(command.get_current_dir(), Some(lean_dir));
         let envs = command.get_envs().collect::<Vec<_>>();
-        assert_eq!(envs.len(), 2);
         assert!(envs.contains(&(OsStr::new("LEAN_IMPORT_WORKERS"), Some(OsStr::new("1")))));
         assert!(envs.contains(&(OsStr::new("LEAN_NUM_THREADS"), Some(OsStr::new("0")))));
+        assert!(envs.contains(&(OsStr::new("LAKE_ARTIFACT_CACHE"), Some(OsStr::new("false")))));
+        assert!(envs.contains(&(
+            OsStr::new("LAKE_RESTORE_ARTIFACTS"),
+            Some(OsStr::new("false"))
+        )));
+        assert!(envs.contains(&(OsStr::new("LAKE_NO_CACHE"), Some(OsStr::new("true")))));
+        let lake_config = lean_dir.join("sable-lake-config.toml");
+        assert!(envs.contains(&(OsStr::new("LAKE_CONFIG"), Some(lake_config.as_os_str()),)));
+        for name in PROOF_TOOL_OVERRIDES {
+            assert!(
+                envs.contains(&(OsStr::new(name), None)),
+                "proof workload command must remove ambient override {name}"
+            );
+        }
+        assert_eq!(envs.len(), PROOF_TOOL_OVERRIDES.len() + 6);
     }
 
     #[test]
-    fn serial_lake_commands_pin_one_environment_and_one_explicit_target() {
+    fn fresh_and_cached_workload_commands_pin_one_environment_and_trusted_targets() {
         let lean_dir = Path::new("proof-environment/lean");
         let version = serial_lake_version_command(lean_dir);
         assert_serial_lake_command_base(&version, lean_dir);
@@ -1987,10 +3010,28 @@ mod proof_build_tests {
         assert_serial_lake_command_base(&build, lean_dir);
         assert_eq!(
             build.get_args().collect::<Vec<_>>(),
-            ["--quiet", "build", "Sable"]
+            ["--quiet", "build", "Sable", "sable-proof-audit"]
                 .iter()
                 .map(OsStr::new)
                 .collect::<Vec<_>>()
+        );
+
+        let lean = serial_lean_command(lean_dir);
+        assert_serial_lake_command_base(&lean, lean_dir);
+        assert_eq!(
+            lean.get_args().collect::<Vec<_>>(),
+            ["env", "lean", "--json"]
+                .iter()
+                .map(OsStr::new)
+                .collect::<Vec<_>>()
+        );
+
+        let auditor_path = Path::new("proof-environment/lean/.lake/build/bin/sable-proof-audit");
+        let auditor = serial_proof_auditor_command(lean_dir, auditor_path);
+        assert_serial_lake_command_base(&auditor, lean_dir);
+        assert_eq!(
+            auditor.get_args().collect::<Vec<_>>(),
+            [OsStr::new("env"), auditor_path.as_os_str()]
         );
     }
 
@@ -2110,26 +3151,87 @@ mod proof_build_tests {
             !proof_policy_marker_matches(None, PROOF_POLICY_VERSION),
             "a published source snapshot with no exact policy marker fails closed"
         );
+        let output_digests = ProofBuildOutputDigests {
+            local_olean_sha256: BTreeMap::from([
+                (
+                    "Sable.olean".into(),
+                    crate::sha256::hex(b"exact Sable.olean"),
+                ),
+                (
+                    "SableProofAudit.olean".into(),
+                    crate::sha256::hex(b"exact auditor olean"),
+                ),
+            ]),
+            proof_auditor_sha256: crate::sha256::hex(b"exact proof auditor"),
+        };
+        let exact_ready = proof_ready_stamp(&current, PROOF_POLICY_VERSION, &output_digests);
         assert!(proof_ready_stamp_matches(
-            proof_ready_stamp(&current, PROOF_POLICY_VERSION).as_bytes(),
+            exact_ready.as_bytes(),
             &current,
             PROOF_POLICY_VERSION,
+            &output_digests,
         ));
         assert!(
             !proof_ready_stamp_matches(
                 format!("{current}\n").as_bytes(),
                 &current,
                 PROOF_POLICY_VERSION,
+                &output_digests,
             ),
             "legacy existence-only READY evidence must not be reusable"
         );
         assert!(
             !proof_ready_stamp_matches(
-                proof_ready_stamp(&current, "accept-lean-warnings-legacy").as_bytes(),
+                proof_ready_stamp(&current, "accept-lean-warnings-legacy", &output_digests,)
+                    .as_bytes(),
                 &current,
                 PROOF_POLICY_VERSION,
+                &output_digests,
             ),
             "even an id collision cannot hide an exact policy mismatch"
+        );
+        let swapped = ProofBuildOutputDigests {
+            local_olean_sha256: BTreeMap::from([
+                (
+                    "Sable.olean".into(),
+                    output_digests.proof_auditor_sha256.clone(),
+                ),
+                (
+                    "SableProofAudit.olean".into(),
+                    output_digests.local_olean_sha256["Sable.olean"].clone(),
+                ),
+            ]),
+            proof_auditor_sha256: output_digests.local_olean_sha256["SableProofAudit.olean"]
+                .clone(),
+        };
+        assert!(
+            !proof_ready_stamp_matches(
+                exact_ready.as_bytes(),
+                &current,
+                PROOF_POLICY_VERSION,
+                &swapped,
+            ),
+            "READY binds each trusted output to its role, not just a digest set"
+        );
+        assert!(
+            !proof_ready_stamp_matches(
+                exact_ready
+                    .replace("sable-proof-ready-v2", "sable-proof-ready-v1")
+                    .as_bytes(),
+                &current,
+                PROOF_POLICY_VERSION,
+                &output_digests,
+            ),
+            "old READY schemas fail closed"
+        );
+        assert!(
+            !proof_ready_stamp_matches(
+                format!("{exact_ready}unknown-field:forged\n").as_bytes(),
+                &current,
+                PROOF_POLICY_VERSION,
+                &output_digests,
+            ),
+            "unknown or duplicate READY data fails the exact-byte comparison"
         );
     }
 

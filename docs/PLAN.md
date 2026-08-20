@@ -40,42 +40,47 @@ dependency in that environment had been accounted for. Until this boundary is
 sealed, existing Stage 1 results remain useful compiler/proof evidence but do
 not qualify for the `fully verified` label or support a release claim.
 
-The repair is an outcome gate, not a token blacklist. Two fail-safe tranches
-are active: generated-only and Lean-accepted-but-unaudited results carry
-distinct assurance states, and every unrecognized Lean warning now fails root,
+The repair is an outcome gate, not a token blacklist. Three fail-safe tranches
+are active. Generated-only and Lean-accepted-but-unaudited results carry
+distinct assurance states, and every unrecognized Lean warning fails root,
 imported-module, and proof-environment verification before an artifact can be
-published. Proof-policy identity is exact in published environments, READY,
-in-flight builds, artifact names, and `.ok` stamps; authoritative acceptance
-uses strict batch transport. This rejects ordinary `sorry`, `admit`, and
-default-warning direct `sorryAx`, but warning suppression and injected axioms
-remain live witnesses. No current path can emit `fully verified`. The remaining
-gate is the complete audit below:
+published. A separate trusted parser executable now authenticates every
+user-derived Lean term at end of input and every ghost as exactly one permitted
+`def` or `theorem` with its expected head; comment metadata is single-line
+encoded. This closes continuation commands such as `axiom`, `set_option`, and
+`#exit`, as well as clause/comment escape routes, before generated source is
+submitted to Lean. Proof-policy identity is exact in published environments,
+artifacts, and stamps; proof-environment READY additionally binds the exact
+sorted local `.olean` set and parser-auditor executable by SHA-256.
 
-1. Inventory every route by which `.sable` text reaches Lean: clauses,
-   discharges, ghost definitions, theorems, facts, imported artifacts, and
-   generated certificates.
-2. Parse each user ghost item as exactly one permitted declaration. Its
-   elaborated environment delta may contain only that declaration and
-   deterministic elaborator-generated auxiliaries attributable to it—never an
-   extra source-authored axiom, command, option, namespace, macro, or sibling
-   declaration.
-3. Audit the complete transitive axiom dependencies of every accepted user
+No current path can emit `fully verified`. Lean's declaration-level warning
+remains fatal even when a syntactically permitted theorem locally suppresses
+`warn.sorry`, but source confinement does not authenticate the compiled
+declaration body or its transitive dependencies. The remaining gate is the
+compiled declaration and dependency audit below:
+
+1. Audit each generated module's exact compiled declaration envelope. It may
+   contain only compiler-authored roots and a narrow, pinned set of structural
+   elaborator auxiliaries attributable to those roots—never an extra axiom,
+   unsafe declaration, public sibling, or unused private declaration.
+2. Audit the complete transitive axiom dependencies of every accepted user
    theorem, obligation, discharge, fact, and certificate. `sorryAx` is
    forbidden everywhere, including approved model modules; source `sorry` and
    `admit` are therefore always fatal. An unavailable or incomplete audit must
    fail verification or produce a clearly lesser status, never `fully
    verified`.
-4. Maintain the active fail-closed warning gate. Any non-fatal diagnostic must
+3. Maintain the active source-confinement and fail-closed warning gates. Any
+   parser-auditor failure is fatal, and any non-fatal Lean diagnostic must
    remain a structured, compiler-owned exception rather than an arbitrary
    warning substring.
-5. Extend the active policy-bound cache identities and stamps with the final
+4. Extend the active policy-bound cache identities and stamps with the final
    proof-trust manifest so an old or poisoned entry cannot bypass the complete
    audit.
-6. Add root, imported-module, fact, discharge, environment-delta, warning, and
+5. Add root, imported-module, fact, discharge, environment-delta, warning, and
    cache-reuse adversarial regressions for `sorry`, `admit`, direct and
    continuation-line `axiom`, extra declarations, `set_option`, and indirect
    dependency on a poisoned theorem.
-7. Record the incident and its exposure window, invalidate affected artifact
+6. Record the incident and its exposure window, invalidate affected artifact
    versions, and rerun the corpus, mutation suite, and proof baselines under
    the sealed boundary.
 

@@ -1,0 +1,3 @@
+# Intentionally empty trusted system configuration for Sable proof workloads.
+# Production commands point LAKE_CONFIG here so user-global Lake configuration
+# cannot enable an unauthenticated cache or redirect a proof build.

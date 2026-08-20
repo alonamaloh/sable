@@ -40,10 +40,13 @@ verifies today. Fold the `///` lines and it reads as plain C with a contract.
 
 > **Known release block (2026-08-20):** Sable now rejects ordinary `sorry`,
 > `admit`, default-warning direct `sorryAx`, and every other unrecognized Lean
-> warning before publishing proof evidence. User-controlled proof text can still suppress
-> `warn.sorry` around `sorryAx` or inject an unreported axiom, so accepted work
-> continues to print `status: Lean accepted; proof dependencies unaudited`
-> instead of `fully verified`. Until
+> warning before publishing proof evidence. It also parses every user-derived
+> Lean fragment to end of input in a separate trusted executable, so a ghost or
+> clause cannot append `axiom`, `set_option`, `#exit`, or another sibling
+> command. Lean's declaration-level warning remains fatal even when a theorem
+> body locally suppresses `warn.sorry`, but compiled declaration bodies and
+> transitive axiom dependencies are not yet audited. Accepted work therefore continues to print `status: Lean
+> accepted; proof dependencies unaudited` instead of `fully verified`. Until
 > [plan priority zero](docs/PLAN.md#priority-zero-seal-proof-ingress) completes
 > the transitive audit, no release should claim axiom-clean verification.
 
@@ -89,7 +92,7 @@ requires Clang.
 # from the repository root
 export LEAN_NUM_THREADS=0 LEAN_IMPORT_WORKERS=1
 test ! -e .sable-out/daemon.sock && test ! -L .sable-out/daemon.sock
-(cd lean && lake --quiet build Sable)
+(cd lean && lake --quiet build Sable sable-proof-audit)
 CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 \
   cargo build --locked --release -j1 --manifest-path compiler/Cargo.toml
 compiler/target/release/sable doctor

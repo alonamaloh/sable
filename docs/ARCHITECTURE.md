@@ -4,10 +4,13 @@ One sentence: **the Rust compiler owns the program language; Lean owns the proof
 
 > **Known proof-ingress release block:** ordinary `sorry`, `admit`,
 > default-warning direct `sorryAx`, and all other unrecognized Lean warnings
-> now fail verification.
-> User-controlled Lean can still suppress `warn.sorry` around `sorryAx` or
-> introduce an unreported axiom. Accepted work therefore reports Lean
-> acceptance with unaudited proof dependencies rather than `fully verified`.
+> now fail verification. A separate trusted parser also confines every
+> user-derived term to one end-of-input parse and every ghost to one expected
+> `def` or `theorem`, closing sibling-command and comment-escape injection.
+> Lean's declaration-level warning remains fatal even if the theorem body
+> locally suppresses `warn.sorry`; compiled declarations and their transitive dependencies remain
+> unaudited. Accepted work therefore reports Lean acceptance with unaudited
+> proof dependencies rather than `fully verified`.
 > The architecture below describes the intended sealed pipeline, but Lean
 > acceptance alone is not yet an authenticated axiom-clean result.
 > [Plan priority zero](PLAN.md#priority-zero-seal-proof-ingress) defines the
@@ -140,17 +143,32 @@ emit (compiler/src/lean.rs)           one Lean theorem per obligation, plus fixe
   │                                   records a source map: lean lines → obligation or
   │                                   internal transition certificate
   │                                   (name, .sable span, goal text, context)
+  │
+  │  ingress audit                    content-hashed `sable-proof-audit` imports only
+  │                                   the trusted Sable parser environment; every raw
+  │                                   term must consume EOF, every ghost must be exactly
+  │                                   one expected def/theorem, and arbitrary comment
+  │                                   metadata is delimiter-safe/single-line encoded;
+  │                                   the candidate generated module is not imported
   ▼
 check                                 capture one immutable ProofEnvironment before
   ▼                                   VC/profile work; publish its exact Lean source
   │                                   under .sable-out/proof-envs/<id>/source and
   │                                   build once, under a per-id lock, with the audited
   │                                   Lean runtime task manager disabled so one explicit
-  │                                   Lake target owns at most one compiler child;
+  │                                   Lake build target owns at most one Lean runtime;
+  │                                   a process mutex plus repository lock serializes
+  │                                   Lake queries, parser auditors, and Lean checks
+  │                                   (a lake-env wrapper may coexist with its one
+  │                                   Lean runtime; Lean runtimes never overlap);
   │                                   PATH/elan resolution remains trusted, while an exact
   │                                   Lake/Lean version preflight rejects accidental drift;
-  │                                   exact source/build policy markers and a
-  │                                   policy-bound READY are written last;
+  │                                   Lake artifact/package caches are forced off and an
+  │                                   empty captured system config blocks user cache policy;
+  │                                   ambient LEAN_PATH is cleared before deriving the
+  │                                   exact workspace path; source/build policy markers
+  │                                   and a READY binding the exact sorted local .olean
+  │                                   set plus auditor executable by SHA-256 are last;
   │                                   strict batch Lean authenticates UTF-8,
   │                                   JSON fields/severities, silent stderr, and
   │                                   every warning before a stamp can publish;
@@ -164,7 +182,7 @@ diagnose (compiler/src/diag.rs)       lean JSON messages → source map lookup �
 
 Generated Lean goes to `.sable-out/` (gitignored): immutable content-addressed roots under `.sable-out/roots/`, one artifact per imported module under `.sable-out/modules/` (`<stem>_<hash>.{lean,olean,ok}`, ADR 0018), and immutable proof environments under `.sable-out/proof-envs/`. Reuse is fail-closed rather than an existence test: generated `.lean` bytes must match exactly; `.ok` must contain the exact verification-policy stamp; and the artifact must carry the same proof-environment id, exact policy, canonical Sable paths, source bytes, resolved import edges, and order. Those facts are checked after dependency preparation, around Lean checking, and before publication or root stamping. The in-process cache coalesces only identical builds currently in flight and keys the exact policy separately from compact hashes; completed results are not retained. Immutable publication also compares the winner's bytes, so an FNV collision is an error rather than evidence reuse.
 
-The versioned `proof-env-v4-fnv64:<hash>` tag covers the exact warning policy, `lean-toolchain`, `lakefile.toml`, `lake-manifest.json`, and every repository-local `.lean` file under `lean/`. Exact byte maps and exact policy markers in the published source, built workspace, and READY stamp—not the compact FNV tag alone—authorize reuse. Generated content separately records machine-profile ids and hashes, used machine intrinsics, and audited extern ids. `uart-poll-v1`'s displayed profile hash is computed from the immutable snapshot over the recursive local Lean import closure rooted at `Sable/MMIO.lean` and `Sable/SVMUart.lean`, plus `lean-toolchain` and `lakefile.toml`. Thus profile identity states the device-semantics dependency, while the broader proof-environment identity pins everything Lean actually reads.
+The versioned `proof-env-v4-fnv64:<hash>` tag covers the exact ingress/warning policy, `lean-toolchain`, `lakefile.toml`, the dependency-free `lake-manifest.json`, the empty trusted `sable-lake-config.toml` system configuration, and every repository-local `.lean` file under `lean/`. Exact byte maps and exact policy markers in the published source and built workspace—not the compact FNV tag alone—authorize reuse. READY is published last and additionally binds the exact enforced-layout local `.olean` set and `sable-proof-audit` executable by SHA-256; each proof process validates it before and after use. Lake artifact/package caches are disabled, cache endpoints and compiler overrides are removed, and the pinned Lean installation's native-tool defaults are used. Command lookup, that native C toolchain, the host filesystem, and a same-user process able to swap and restore bytes between those checks remain trusted host boundaries; this is corruption/stale-evidence detection, not protection from a hostile account. Generated content separately records machine-profile ids and hashes, used machine intrinsics, and audited extern ids. `uart-poll-v1`'s displayed profile hash is computed from the immutable snapshot over the recursive local Lean import closure rooted at `Sable/MMIO.lean` and `Sable/SVMUart.lean`, plus `lean-toolchain` and `lakefile.toml`. Thus profile identity states the device-semantics dependency, while the broader proof-environment identity pins everything Lean is intended to read.
 
 ## Native lowering boundary (through the closed N5 `Integer` closure)
 

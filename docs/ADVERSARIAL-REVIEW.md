@@ -125,7 +125,8 @@ test ! -e .sable-out/daemon.sock && test ! -L .sable-out/daemon.sock
 Build the complete Lean prelude and formal machine definitions:
 
 ```sh
-(cd lean && LEAN_NUM_THREADS=0 LEAN_IMPORT_WORKERS=1 lake --quiet build Sable)
+(cd lean && LEAN_NUM_THREADS=0 LEAN_IMPORT_WORKERS=1 \
+  lake --quiet build Sable sable-proof-audit)
 ```
 
 Run the pairwise ownership interaction oracles:

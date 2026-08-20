@@ -22,6 +22,8 @@ pub mod parser;
 mod place;
 pub mod profile;
 pub mod scan;
+#[doc(hidden)]
+pub mod sha256;
 mod shape_admission;
 pub mod span;
 pub mod speceval;
@@ -632,6 +634,15 @@ fn verify_prepared(
     mods: &modules::ModuleSet,
     mut prep: artifacts::Prepared,
 ) -> Result<VerifiedProgram, Vec<Diagnostic>> {
+    if let Err(failure) = lean::audit_ingress(repo_root, &prep.proof_environment, &prep.emitted) {
+        return Err(vec![Diagnostic {
+            name: lean::INVALID_LEAN_INGRESS_DIAGNOSTIC.into(),
+            title: format!("{} is not one confined Lean fragment", failure.description),
+            span: failure.span,
+            label: "this proof text could change the generated declaration boundary".into(),
+            notes: vec![("lean parser".into(), failure.message)],
+        }]);
+    }
     // Root documents are immutable and content-addressed. Concurrent checks
     // of the same basename or different source versions cannot overwrite the
     // exact bytes this verification is about to send to Lean.

@@ -172,6 +172,23 @@ fn assert_failed_closed(output: Output, context: &str) {
     assert!(!stderr.contains("fully verified"));
 }
 
+fn assert_ingress_failed_closed(output: Output, context: &str) {
+    let stdout = String::from_utf8(output.stdout).expect("Sable stdout is UTF-8");
+    let stderr = String::from_utf8(output.stderr).expect("Sable stderr is UTF-8");
+    assert!(
+        !output.status.success(),
+        "{context} unexpectedly passed:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("is not one confined Lean fragment")
+            && stderr.contains("this proof text could change the generated declaration boundary"),
+        "{context} did not surface the stable ingress gate:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(!stdout.contains("status:"));
+    assert!(!stdout.contains("fully verified"));
+    assert!(!stderr.contains("fully verified"));
+}
+
 #[test]
 fn emit_only_reports_generated_only_assurance() {
     let source = temp_source(
@@ -233,7 +250,7 @@ fn subject() -> u64 {
     );
     assert_eq!(
         fs::read(&published[0]).expect("read root verification stamp"),
-        b"sable-verification-policy:reject-unrecognized-lean-warnings-v2\n"
+        b"sable-verification-policy:confine-generated-lean-ingress-v3\n"
     );
 }
 
@@ -355,9 +372,65 @@ fn root() {{
 }
 
 #[test]
-fn unreported_axiom_remains_accepted_only_at_the_provisional_boundary() {
-    let output = check_source(
-        "injected-axiom",
+fn imported_continuation_axiom_fails_closed_on_fresh_and_repeated_checks() {
+    let tree = temp_module_tree("imported-continuation-axiom", &[]);
+    let dependency_module = tree
+        .0
+        .file_name()
+        .expect("temporary module tree has a name")
+        .to_string_lossy()
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    let dependency = tree.0.join(format!("{dependency_module}.sable"));
+    fs::write(
+        &dependency,
+        r#"
+/// theorem harmless : True := by exact True.intro
+/// axiom fabricated : False
+
+pub fn available() {
+}
+"#,
+    )
+    .expect("write imported continuation-axiom dependency");
+    let root = tree.0.join("root.sable");
+    fs::write(
+        &root,
+        format!(
+            r#"
+use {dependency_module};
+
+fn root() {{
+}}
+"#,
+        ),
+    )
+    .expect("write imported continuation-axiom root");
+    let before = final_artifacts_for(&dependency);
+    for attempt in ["fresh", "repeated"] {
+        assert_ingress_failed_closed(
+            check_path(&root, Some(&tree.0)),
+            &format!("{attempt} imported continuation `axiom` witness"),
+        );
+        assert_no_new_final_artifacts(
+            &dependency,
+            &before,
+            &format!("{attempt} imported continuation `axiom` witness"),
+        );
+    }
+}
+
+#[test]
+fn continuation_axiom_is_rejected_by_the_exact_command_boundary() {
+    let source = temp_source(
+        "injected-axiom-no-final-artifact",
         r#"
 /// theorem harmless : True := by exact True.intro
 /// axiom fabricated : False
@@ -371,25 +444,15 @@ fn subject() -> u64 {
 ///   exact False.elim fabricated
 "#,
     );
-    let stdout = String::from_utf8(output.stdout).expect("Sable stdout is UTF-8");
-    let stderr = String::from_utf8(output.stderr).expect("Sable stderr is UTF-8");
-    assert!(
-        output.status.success(),
-        "the next-tranche axiom witness changed behavior unexpectedly:\nstdout:\n{stdout}\nstderr:\n{stderr}"
-    );
-    assert!(!stdout.contains("fully verified"));
-    assert!(!stderr.contains("fully verified"));
-    let statuses: Vec<&str> = stdout
-        .lines()
-        .filter(|line| line.starts_with("status:"))
-        .collect();
-    assert_eq!(statuses, [UNAUDITED_PROOF_STATUS]);
+    let before = final_artifacts_for(&source.0);
+    assert_ingress_failed_closed(check_path(&source.0, None), "continuation `axiom` witness");
+    assert_no_new_final_artifacts(&source.0, &before, "continuation `axiom` witness");
 }
 
 #[test]
-fn option_suppressed_sorry_ax_remains_only_provisional_until_envelope_audit() {
-    let output = check_source(
-        "suppressed-sorry-ax",
+fn option_command_cannot_precede_a_second_ghost_declaration() {
+    let source = temp_source(
+        "suppressed-sorry-ax-two-commands",
         r#"
 /// theorem harmless : True := by exact True.intro
 /// set_option warn.sorry false in theorem fabricated : False := sorryAx False false
@@ -403,17 +466,122 @@ fn subject() -> u64 {
 ///   exact False.elim fabricated
 "#,
     );
-    let stdout = String::from_utf8(output.stdout).expect("Sable stdout is UTF-8");
-    let stderr = String::from_utf8(output.stderr).expect("Sable stderr is UTF-8");
-    assert!(
-        output.status.success(),
-        "the warning-suppressed next-tranche witness changed behavior unexpectedly:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    let before = final_artifacts_for(&source.0);
+    assert_ingress_failed_closed(
+        check_path(&source.0, None),
+        "continuation `set_option` witness",
     );
-    assert!(!stdout.contains("fully verified"));
-    assert!(!stderr.contains("fully verified"));
-    let statuses: Vec<&str> = stdout
-        .lines()
-        .filter(|line| line.starts_with("status:"))
-        .collect();
-    assert_eq!(statuses, [UNAUDITED_PROOF_STATUS]);
+    assert_no_new_final_artifacts(&source.0, &before, "continuation `set_option` witness");
+}
+
+#[test]
+fn exit_command_cannot_truncate_the_generated_declaration_sequence() {
+    let source = temp_source(
+        "exit-command-no-final-artifact",
+        r#"
+/// theorem harmless : True := by exact True.intro
+/// #exit
+
+/// post result = 0
+fn subject() -> u64 {
+    return 0;
+}
+"#,
+    );
+    let before = final_artifacts_for(&source.0);
+    assert_ingress_failed_closed(check_path(&source.0, None), "continuation `#exit` witness");
+    assert_no_new_final_artifacts(&source.0, &before, "continuation `#exit` witness");
+}
+
+#[test]
+fn clause_continuation_cannot_escape_its_term_boundary() {
+    let source = temp_source(
+        "clause-command-no-final-artifact",
+        r#"
+/// post True)
+/// axiom fabricated : False
+fn subject() {
+}
+"#,
+    );
+    let before = final_artifacts_for(&source.0);
+    assert_ingress_failed_closed(
+        check_path(&source.0, None),
+        "clause continuation command witness",
+    );
+    assert_no_new_final_artifacts(&source.0, &before, "clause continuation command witness");
+}
+
+#[test]
+fn discharge_continuation_cannot_escape_its_term_boundary() {
+    let source = temp_source(
+        "discharge-command-no-final-artifact",
+        r#"
+/// post result = 1
+fn subject() -> u64 {
+    return 0;
+}
+
+/// discharge subject.post.result_1 by
+///   exact False.elim fabricated
+/// axiom fabricated : False
+"#,
+    );
+    let before = final_artifacts_for(&source.0);
+    assert_ingress_failed_closed(
+        check_path(&source.0, None),
+        "discharge continuation command witness",
+    );
+    assert_no_new_final_artifacts(&source.0, &before, "discharge continuation command witness");
+}
+
+#[test]
+fn ghost_definition_deriving_clause_is_rejected() {
+    let source = temp_source(
+        "ghost-deriving-no-final-artifact",
+        r#"
+/// def derived_value : Nat := 0 deriving Repr
+
+/// post result = 0
+fn subject() -> u64 {
+    return 0;
+}
+"#,
+    );
+    let before = final_artifacts_for(&source.0);
+    assert_ingress_failed_closed(
+        check_path(&source.0, None),
+        "ghost definition `deriving` witness",
+    );
+    assert_no_new_final_artifacts(&source.0, &before, "ghost definition `deriving` witness");
+}
+
+#[test]
+fn single_theorem_sorry_ax_cannot_hide_the_declaration_warning() {
+    let source = temp_source(
+        "single-command-suppressed-sorry-ax",
+        r#"
+/// theorem fabricated : False := by
+///   set_option warn.sorry false in
+///     exact sorryAx False false
+
+/// post result = 1
+fn subject() -> u64 {
+    return 0;
+}
+
+/// discharge subject.post.result_1 by
+///   exact False.elim fabricated
+"#,
+    );
+    let before = final_artifacts_for(&source.0);
+    assert_failed_closed(
+        check_path(&source.0, None),
+        "single-theorem warning-suppression witness",
+    );
+    assert_no_new_final_artifacts(
+        &source.0,
+        &before,
+        "single-theorem warning-suppression witness",
+    );
 }

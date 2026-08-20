@@ -1,4 +1,4 @@
-//! Proof-timing protocol v2.
+//! Proof-timing protocol v3.
 //!
 //! This ignored test records end-to-end verification wall time for the closed
 //! positive corpus. It is engineering instrumentation, not a deterministic
@@ -9,7 +9,7 @@
 //!
 //! See `tools/proof_timing/README.md` for the exact preparation and commands.
 
-use sable::{Options, ProofAssurance, verify_file_batch_structured};
+use sable::{Options, ProofAssurance, sha256, verify_file_batch_structured};
 use serde_json::{Map, Value, json};
 use std::collections::BTreeSet;
 use std::ffi::OsStr;
@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-const SCHEMA: &str = "sable-proof-timing-v2";
+const SCHEMA: &str = "sable-proof-timing-v3";
 const COMPILED_CARGO_PROFILE: &str = env!("SABLE_COMPILED_CARGO_PROFILE");
 const COMPILED_CARGO_PROFILE_FAMILY: &str = env!("SABLE_COMPILED_CARGO_PROFILE_FAMILY");
 const COMPILED_GIT_REVISION: &str = env!("SABLE_COMPILED_GIT_REVISION");
@@ -32,6 +32,31 @@ const COMPILED_CARGO_VERSION: &str = env!("SABLE_COMPILED_CARGO_VERSION");
 const COMPILED_PROTOCOL_SOURCE: &[u8] = include_bytes!("proof_timing.rs");
 const EXPECTED_MEASURED_SUBJECTS: usize = 126;
 const EXPECTED_EXCLUDED_SUBJECTS: usize = 1;
+const PROOF_TOOL_OVERRIDES: [&str; 23] = [
+    "ELAN_TOOLCHAIN",
+    "LEAN_PATH",
+    "LEAN_SYSROOT",
+    "LEAN_SRC_PATH",
+    "LEAN_GITHASH",
+    "LEAN",
+    "LAKE",
+    "LAKE_HOME",
+    "LAKE_OVERRIDE_LEAN",
+    "LAKE_CACHE_KEY",
+    "LAKE_CACHE_ARTIFACT_ENDPOINT",
+    "LAKE_CACHE_REVISION_ENDPOINT",
+    "LAKE_CACHE_SERVICE",
+    "LAKE_CACHE_DIR",
+    "LAKE_PKG_URL_MAP",
+    "RESERVOIR_API_BASE_URL",
+    "RESERVOIR_API_URL",
+    "LEAN_CC",
+    "LEAN_AR",
+    "CC",
+    "AR",
+    "CXX",
+    "LD",
+];
 const EXCLUDED_BOUNDARY_SUBJECTS: [(&str, &str, &str); 1] = [(
     "corpus/verifies/defer_assume_demo.sable",
     "escape-hatch demonstration intentionally contains one defer and one assume",
@@ -128,7 +153,7 @@ struct CacheManifest {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ProofBuildFileIdentity {
-    path: &'static str,
+    path: String,
     bytes: u64,
     modified_unix_ns: u64,
     device: Option<u64>,
@@ -154,15 +179,19 @@ struct ProofBuildIdentity {
     manifest_sha256: String,
     ready: ProofBuildFileIdentity,
     sable_olean: ProofBuildFileIdentity,
+    local_oleans: Vec<ProofBuildFileIdentity>,
+    proof_auditor: ProofBuildFileIdentity,
 }
 
 impl ProofBuildIdentity {
     fn to_json(&self) -> Value {
         json!({
             "manifest_sha256": self.manifest_sha256,
-            "manifest_kind": "READY content/size/mtime plus Sable.olean size/mtime; Unix reports also bind device/inode",
+            "manifest_kind": "READY plus the exact sorted local .olean set and proof-ingress auditor; content SHA-256, size, and mtime are bound for every file; Unix reports also bind device/inode",
             "ready": self.ready.to_json(),
             "sable_olean": self.sable_olean.to_json(),
+            "local_oleans": self.local_oleans.iter().map(ProofBuildFileIdentity::to_json).collect::<Vec<_>>(),
+            "proof_auditor": self.proof_auditor.to_json(),
         })
     }
 }
@@ -277,7 +306,7 @@ fn subject_manifest(root: &Path) -> Result<SubjectManifest, String> {
             .find(|(excluded, _, _)| *excluded == relative);
         let exclusion_reason = exclusion.map(|(_, reason, _)| *reason);
         let exclusion_expected_sha256 = exclusion.map(|(_, _, sha256)| *sha256);
-        let content_sha256 = sha256_hex(&content);
+        let content_sha256 = sha256::hex(&content);
         if let Some(expected) = exclusion_expected_sha256 {
             if content_sha256 != expected {
                 return Err(format!(
@@ -323,7 +352,7 @@ fn subject_manifest(root: &Path) -> Result<SubjectManifest, String> {
     let manifest = SubjectManifest {
         included_paths,
         entries,
-        manifest_sha256: sha256_hex(&framed),
+        manifest_sha256: sha256::hex(&framed),
     };
     if manifest.included_count() != EXPECTED_MEASURED_SUBJECTS
         || manifest.excluded_count() != EXPECTED_EXCLUDED_SUBJECTS
@@ -431,7 +460,7 @@ fn cache_directory_manifest(root: &Path, relative: &str) -> Result<CacheDirector
         entries,
         regular_files,
         total_file_bytes,
-        manifest_sha256: sha256_hex(&framed),
+        manifest_sha256: sha256::hex(&framed),
     })
 }
 
@@ -443,7 +472,7 @@ fn cache_manifest(root: &Path) -> Result<CacheManifest, String> {
     frame(&mut framed, roots.manifest_sha256.as_bytes());
     frame(&mut framed, modules.manifest_sha256.as_bytes());
     Ok(CacheManifest {
-        manifest_sha256: sha256_hex(&framed),
+        manifest_sha256: sha256::hex(&framed),
         roots,
         modules,
     })
@@ -455,7 +484,36 @@ fn command_output_in(
     arguments: &[&str],
     allow_empty: bool,
 ) -> Result<String, String> {
-    let output = Command::new(program)
+    command_output_in_with_removed_environment(
+        directory,
+        program,
+        arguments,
+        allow_empty,
+        &[],
+        false,
+    )
+}
+
+fn command_output_in_with_removed_environment(
+    directory: &Path,
+    program: &str,
+    arguments: &[&str],
+    allow_empty: bool,
+    removed_environment: &[&str],
+    configure_proof_tool: bool,
+) -> Result<String, String> {
+    let mut command = Command::new(program);
+    for name in removed_environment {
+        command.env_remove(name);
+    }
+    if configure_proof_tool {
+        command
+            .env("LAKE_ARTIFACT_CACHE", "false")
+            .env("LAKE_RESTORE_ARTIFACTS", "false")
+            .env("LAKE_NO_CACHE", "true")
+            .env("LAKE_CONFIG", directory.join("sable-lake-config.toml"));
+    }
+    let output = command
         .args(arguments)
         .current_dir(directory)
         .output()
@@ -608,12 +666,34 @@ fn relevant_environment() -> Result<Value, String> {
         "CARGO_PROFILE_RELEASE_OPT_LEVEL",
         "CARGO_PROFILE_RELEASE_PANIC",
         "ELAN_TOOLCHAIN",
+        "LAKE",
+        "LAKE_HOME",
+        "LAKE_OVERRIDE_LEAN",
+        "LAKE_ARTIFACT_CACHE",
+        "LAKE_RESTORE_ARTIFACTS",
+        "LAKE_NO_CACHE",
+        "LAKE_CONFIG",
+        "LAKE_CACHE_KEY",
+        "LAKE_CACHE_ARTIFACT_ENDPOINT",
+        "LAKE_CACHE_REVISION_ENDPOINT",
+        "LAKE_CACHE_SERVICE",
+        "LAKE_CACHE_DIR",
+        "LAKE_PKG_URL_MAP",
+        "RESERVOIR_API_BASE_URL",
+        "RESERVOIR_API_URL",
+        "LEAN",
+        "LEAN_CC",
+        "LEAN_AR",
         "LEAN_GITHASH",
         "LEAN_IMPORT_WORKERS",
         "LEAN_NUM_THREADS",
         "LEAN_PATH",
         "LEAN_SRC_PATH",
         "LEAN_SYSROOT",
+        "CC",
+        "AR",
+        "CXX",
+        "LD",
         "RUSTFLAGS",
         "SABLE_GRIND_HEARTBEATS",
         "SABLE_TEST_JOBS",
@@ -662,7 +742,7 @@ fn metadata_device_inode(_: &fs::Metadata) -> (Option<u64>, Option<u64>) {
 
 fn proof_build_file_identity(
     path: &Path,
-    relative: &'static str,
+    relative: impl Into<String>,
     hash_content: bool,
 ) -> Result<ProofBuildFileIdentity, String> {
     let metadata = fs::symlink_metadata(path).map_err(|error| {
@@ -688,7 +768,7 @@ fn proof_build_file_identity(
     );
     let (device, inode) = metadata_device_inode(&metadata);
     let content_sha256 = if hash_content {
-        Some(sha256_hex(&fs::read(path).map_err(|error| {
+        Some(sha256::hex(&fs::read(path).map_err(|error| {
             format!(
                 "cannot read proof-build identity file {}: {error}",
                 path.display()
@@ -698,7 +778,7 @@ fn proof_build_file_identity(
         None
     };
     Ok(ProofBuildFileIdentity {
-        path: relative,
+        path: relative.into(),
         bytes: metadata.len(),
         modified_unix_ns,
         device,
@@ -707,17 +787,99 @@ fn proof_build_file_identity(
     })
 }
 
+fn collect_proof_build_oleans(
+    root: &Path,
+    relative: &Path,
+    output: &mut Vec<ProofBuildFileIdentity>,
+) -> Result<(), String> {
+    let directory = root.join(relative);
+    let metadata = fs::symlink_metadata(&directory).map_err(|error| {
+        format!(
+            "cannot inspect proof-build olean directory {}: {error}",
+            directory.display()
+        )
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(format!(
+            "proof-build olean directory {} is not a local directory",
+            directory.display()
+        ));
+    }
+    let mut entries = fs::read_dir(&directory)
+        .map_err(|error| {
+            format!(
+                "cannot enumerate proof-build oleans in {}: {error}",
+                directory.display()
+            )
+        })?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| {
+            format!(
+                "cannot enumerate an entry in proof-build olean directory {}: {error}",
+                directory.display()
+            )
+        })?;
+    entries.sort_by_key(fs::DirEntry::file_name);
+    for entry in entries {
+        let child_relative = relative.join(entry.file_name());
+        let path = entry.path();
+        let metadata = fs::symlink_metadata(&path).map_err(|error| {
+            format!(
+                "cannot inspect proof-build output {}: {error}",
+                path.display()
+            )
+        })?;
+        if metadata.file_type().is_symlink() {
+            return Err(format!(
+                "proof-build output {} is a symlink",
+                path.display()
+            ));
+        }
+        if child_relative
+            .extension()
+            .is_some_and(|extension| extension == "olean")
+        {
+            if !metadata.is_file() {
+                return Err(format!(
+                    "proof-build `.olean` output {} is not a regular file",
+                    path.display()
+                ));
+            }
+            let label = child_relative
+                .to_str()
+                .ok_or_else(|| format!("proof-build output path {} is not UTF-8", path.display()))?
+                .replace(std::path::MAIN_SEPARATOR, "/");
+            output.push(proof_build_file_identity(&path, label, true)?);
+        } else if metadata.is_dir() {
+            collect_proof_build_oleans(root, &child_relative, output)?;
+        }
+    }
+    Ok(())
+}
+
 fn proof_build_identity(root: &Path, id: &str) -> Result<ProofBuildIdentity, String> {
     let built = proof_environment_built_dir(root, id);
     let ready = proof_build_file_identity(&built.join("READY"), "READY", true)?;
-    let sable_olean = proof_build_file_identity(
-        &built.join("lean/.lake/build/lib/lean/Sable.olean"),
-        "lean/.lake/build/lib/lean/Sable.olean",
-        false,
+    let olean_root = built.join("lean/.lake/build/lib/lean");
+    let mut local_oleans = Vec::new();
+    collect_proof_build_oleans(&olean_root, Path::new(""), &mut local_oleans)?;
+    local_oleans.sort_by(|left, right| left.path.cmp(&right.path));
+    let sable_olean = local_oleans
+        .iter()
+        .find(|entry| entry.path == "Sable.olean")
+        .cloned()
+        .ok_or_else(|| "proof-build identity is missing `Sable.olean`".to_owned())?;
+    let proof_auditor = proof_build_file_identity(
+        &built.join("lean/.lake/build/bin/sable-proof-audit"),
+        "lean/.lake/build/bin/sable-proof-audit",
+        true,
     )?;
     let mut framed = Vec::new();
-    frame(&mut framed, b"sable-proof-timing-proof-build-identity-v2");
-    for entry in [&ready, &sable_olean] {
+    frame(&mut framed, b"sable-proof-timing-proof-build-identity-v3");
+    for entry in std::iter::once(&ready)
+        .chain(local_oleans.iter())
+        .chain(std::iter::once(&proof_auditor))
+    {
         frame(&mut framed, entry.path.as_bytes());
         frame(&mut framed, &entry.bytes.to_le_bytes());
         frame(&mut framed, &entry.modified_unix_ns.to_le_bytes());
@@ -742,9 +904,11 @@ fn proof_build_identity(root: &Path, id: &str) -> Result<ProofBuildIdentity, Str
         );
     }
     Ok(ProofBuildIdentity {
-        manifest_sha256: sha256_hex(&framed),
+        manifest_sha256: sha256::hex(&framed),
         ready,
         sable_olean,
+        local_oleans,
+        proof_auditor,
     })
 }
 
@@ -869,12 +1033,21 @@ fn toolchain_provenance(root: &Path) -> Result<Value, String> {
         "rustc": command_output_in(root, "rustc", &["--version", "--verbose"], false)?,
         "cargo_short": command_output_in(root, "cargo", &["--version"], false)?,
         "cargo": command_output_in(root, "cargo", &["--version", "--verbose"], false)?,
-        "lake": command_output_in(&root.join("lean"), "lake", &["--version"], false)?,
-        "lean": command_output_in(
+        "lake": command_output_in_with_removed_environment(
+            &root.join("lean"),
+            "lake",
+            &["--version"],
+            false,
+            &PROOF_TOOL_OVERRIDES,
+            true,
+        )?,
+        "lean": command_output_in_with_removed_environment(
             &root.join("lean"),
             "lake",
             &["env", "lean", "--version"],
             false,
+            &PROOF_TOOL_OVERRIDES,
+            true,
         )?,
     }))
 }
@@ -975,7 +1148,7 @@ fn validate_cold_parent(
         }
     }
     if mismatches.is_empty() {
-        Ok(sha256_hex(&bytes))
+        Ok(sha256::hex(&bytes))
     } else {
         Err(format!(
             "warm-artifacts parent {} does not match the required successful cold-report provenance and metadata:\n{}",
@@ -1021,116 +1194,6 @@ fn write_new_report(path: &Path, report: &Value) -> Result<(), String> {
         .map_err(|error| format!("cannot sync report {}: {error}", path.display()))
 }
 
-fn sha256_hex(input: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let digest = sha256(input);
-    let mut output = String::with_capacity(digest.len() * 2);
-    for byte in digest {
-        output.push(char::from(HEX[usize::from(byte >> 4)]));
-        output.push(char::from(HEX[usize::from(byte & 0x0f)]));
-    }
-    output
-}
-
-fn sha256(input: &[u8]) -> [u8; 32] {
-    const INITIAL: [u32; 8] = [
-        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
-        0x5be0cd19,
-    ];
-    const ROUND: [u32; 64] = [
-        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
-        0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
-        0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f,
-        0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
-        0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc,
-        0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
-        0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116,
-        0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
-        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
-        0xc67178f2,
-    ];
-
-    let bit_len = u64::try_from(input.len())
-        .expect("SHA-256 input length fits u64")
-        .checked_mul(8)
-        .expect("SHA-256 bit length fits u64");
-    let mut message = Vec::with_capacity(input.len().saturating_add(72));
-    message.extend_from_slice(input);
-    message.push(0x80);
-    while message.len() % 64 != 56 {
-        message.push(0);
-    }
-    message.extend_from_slice(&bit_len.to_be_bytes());
-
-    let mut state = INITIAL;
-    for block in message.chunks_exact(64) {
-        let mut words = [0u32; 64];
-        for (index, chunk) in block.chunks_exact(4).enumerate() {
-            words[index] = u32::from_be_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
-        }
-        for index in 16..64 {
-            let s0 = words[index - 15].rotate_right(7)
-                ^ words[index - 15].rotate_right(18)
-                ^ (words[index - 15] >> 3);
-            let s1 = words[index - 2].rotate_right(17)
-                ^ words[index - 2].rotate_right(19)
-                ^ (words[index - 2] >> 10);
-            words[index] = words[index - 16]
-                .wrapping_add(s0)
-                .wrapping_add(words[index - 7])
-                .wrapping_add(s1);
-        }
-
-        let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut h] = state;
-        for index in 0..64 {
-            let big_s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
-            let choice = (e & f) ^ ((!e) & g);
-            let temp1 = h
-                .wrapping_add(big_s1)
-                .wrapping_add(choice)
-                .wrapping_add(ROUND[index])
-                .wrapping_add(words[index]);
-            let big_s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
-            let majority = (a & b) ^ (a & c) ^ (b & c);
-            let temp2 = big_s0.wrapping_add(majority);
-
-            h = g;
-            g = f;
-            f = e;
-            e = d.wrapping_add(temp1);
-            d = c;
-            c = b;
-            b = a;
-            a = temp1.wrapping_add(temp2);
-        }
-        for (slot, value) in state.iter_mut().zip([a, b, c, d, e, f, g, h].into_iter()) {
-            *slot = slot.wrapping_add(value);
-        }
-    }
-
-    let mut digest = [0u8; 32];
-    for (chunk, word) in digest.chunks_exact_mut(4).zip(state) {
-        chunk.copy_from_slice(&word.to_be_bytes());
-    }
-    digest
-}
-
-#[test]
-fn sha256_matches_published_vectors() {
-    assert_eq!(
-        sha256_hex(b""),
-        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-    );
-    assert_eq!(
-        sha256_hex(b"abc"),
-        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
-    );
-    assert_eq!(
-        sha256_hex(b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"),
-        "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1"
-    );
-}
-
 #[test]
 fn executable_profile_uses_the_exact_cargo_output_directory() {
     assert_eq!(
@@ -1155,7 +1218,7 @@ fn executable_profile_uses_the_exact_cargo_output_directory() {
 fn compiled_protocol_source_matches_the_checked_out_harness() {
     let on_disk = fs::read(repo_root().join("compiler/tests/proof_timing.rs"))
         .expect("proof-timing source is readable");
-    assert_eq!(sha256_hex(COMPILED_PROTOCOL_SOURCE), sha256_hex(&on_disk));
+    assert_eq!(sha256::hex(COMPILED_PROTOCOL_SOURCE), sha256::hex(&on_disk));
 }
 
 #[test]
@@ -1232,24 +1295,26 @@ fn record_verifying_corpus_proof_times() {
     let profile = COMPILED_CARGO_PROFILE;
     let grind_heartbeats = optional_utf8_environment("SABLE_GRIND_HEARTBEATS")
         .expect("grind-heartbeat environment is valid UTF-8");
-    let ambient_lean_overrides = [
-        "ELAN_TOOLCHAIN",
-        "LEAN_GITHASH",
-        "LEAN_PATH",
-        "LEAN_SRC_PATH",
-        "LEAN_SYSROOT",
-    ]
-    .map(|name| {
-        (
-            name,
-            optional_utf8_environment(name)
-                .unwrap_or_else(|error| panic!("cannot inspect {name}: {error}")),
-        )
-    });
+    let ambient_lean_overrides = PROOF_TOOL_OVERRIDES
+        .into_iter()
+        .chain([
+            "LAKE_ARTIFACT_CACHE",
+            "LAKE_RESTORE_ARTIFACTS",
+            "LAKE_NO_CACHE",
+            "LAKE_CONFIG",
+        ])
+        .map(|name| {
+            (
+                name,
+                optional_utf8_environment(name)
+                    .unwrap_or_else(|error| panic!("cannot inspect {name}: {error}")),
+            )
+        })
+        .collect::<Vec<_>>();
     let start_git = git_state(&root).expect("cannot capture starting Git state");
     let compiled_git_dirty = compiled_git_dirty().expect("compile-time Git marker is valid");
-    let compiled_protocol_source_sha256 = sha256_hex(COMPILED_PROTOCOL_SOURCE);
-    let protocol_source_sha256 = sha256_hex(
+    let compiled_protocol_source_sha256 = sha256::hex(COMPILED_PROTOCOL_SOURCE);
+    let protocol_source_sha256 = sha256::hex(
         &fs::read(root.join("compiler/tests/proof_timing.rs"))
             .expect("proof-timing protocol source is readable"),
     );
@@ -1371,13 +1436,13 @@ fn record_verifying_corpus_proof_times() {
         .to_str()
         .expect("current test executable path is UTF-8")
         .to_owned();
-    let executable_sha256 = sha256_hex(&fs::read(&executable).unwrap_or_else(|error| {
+    let executable_sha256 = sha256::hex(&fs::read(&executable).unwrap_or_else(|error| {
         panic!(
             "cannot read test executable {}: {error}",
             executable.display()
         )
     }));
-    let cargo_lock_sha256 = sha256_hex(
+    let cargo_lock_sha256 = sha256::hex(
         &fs::read(root.join("compiler/Cargo.lock")).expect("compiler/Cargo.lock is readable"),
     );
     let machine =
@@ -1682,7 +1747,7 @@ fn record_verifying_corpus_proof_times() {
             "claim": if !failures.is_empty() {
                 "failed run; no baseline or smoke evidence claim"
             } else if evidence_tier == "baseline" {
-                "comparable verification-wall baseline under protocol v2; not axiom-clean assurance or a release gate"
+                "comparable verification-wall baseline under protocol v3; not axiom-clean assurance or a release gate"
             } else {
                 "custom smoke only; not a comparable verification-wall baseline"
             },
@@ -1716,23 +1781,25 @@ fn record_verifying_corpus_proof_times() {
         "environment": environment,
         "invocation": invocation,
         "protocol": {
-            "version": 2,
+            "version": 3,
             "profile": profile,
             "profile_family": COMPILED_CARGO_PROFILE_FAMILY,
             "profile_identity": "exact Cargo output profile directory captured from OUT_DIR at compile time and cross-checked against the running test executable path",
             "debug_assertions": cfg!(debug_assertions),
             "cache_mode": cache_mode,
-            "checker": "batch Lean only (daemon bypassed; serialized root and missing-import processes)",
-            "metric": "end-to-end verification API wall time, including front end, VC generation, Lean emission/check, and artifact publication",
+            "checker": "batch ingress-auditor plus Lean (daemon bypassed; serialized auditor/check pairs for roots and missing imports)",
+            "metric": "end-to-end verification API wall time, including front end, VC generation, Lean emission, ingress audit, Lean check, and artifact publication",
             "clock": "std::time::Instant monotonic elapsed nanoseconds",
             "subject_order": "lexicographic repository-relative path",
             "subject_concurrency": 1,
             "subject_serialization": "one lexicographic Rust loop; no subject worker pool",
+            "proof_workload_concurrency": 1,
+            "proof_workload_process_shape": "one serialized proof workload; a lake env wrapper may overlap only the single Lean auditor/check runtime it launches",
             "external_lean_process_concurrency": 1,
             "proof_assurance": ProofAssurance::LeanAcceptedDependenciesUnaudited.summary(),
             "proof_assurance_limit": "Lean acceptance is timed and recorded; this protocol does not authenticate an axiom-clean dependency closure",
-            "lean_task_manager": "disabled by required LEAN_NUM_THREADS=0 inherited by direct run_lean",
-            "lean_import_workers": "exactly one by required LEAN_IMPORT_WORKERS=1 inherited by direct run_lean",
+            "lean_task_manager": "disabled by required LEAN_NUM_THREADS=0 inherited by each serialized ingress-auditor/Lean runtime",
+            "lean_import_workers": "exactly one by required LEAN_IMPORT_WORKERS=1 inherited by each serialized ingress-auditor/Lean runtime",
             "orchestration_conventions": "SABLE_TEST_JOBS=1 pins the supported outer verification pool; the serial timing loop does not consume it",
             "expected_measured_subjects": EXPECTED_MEASURED_SUBJECTS,
             "expected_excluded_subjects": EXPECTED_EXCLUDED_SUBJECTS,
@@ -1775,7 +1842,7 @@ fn record_verifying_corpus_proof_times() {
     });
     write_new_report(&output_path, &report).expect("cannot write proof-timing report");
     println!(
-        "proof timing v2: {} subjects, {} ns verification wall, median {} ns, p95 {} ns, max {} ns -> {}",
+        "proof timing v3: {} subjects, {} ns verification wall, median {} ns, p95 {} ns, max {} ns -> {}",
         durations.len(),
         verification_wall_total_ns,
         percentile(&durations, 50, 100),

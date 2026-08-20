@@ -1,4 +1,4 @@
-# Proof-timing protocol v2
+# Proof-timing protocol v3
 
 This protocol records reproducible **end-to-end verification wall time** for
 Sable's closed positive corpus. It is observational engineering instrumentation,
@@ -38,8 +38,9 @@ defers, and zero assumes.
 
 Each subject's `verification_wall_ns` is the monotonic wall time around
 `verify_file_batch_structured`: source/import loading, checking, VC generation,
-Lean generation and process execution, and artifact publication are all inside
-the interval. It is not a kernel-only proof time. The summary distinguishes:
+Lean generation, proof-ingress auditor and Lean process execution, and artifact
+publication are all inside the interval. It is not a kernel-only proof time.
+The summary distinguishes:
 
 - `verification_wall_subject_sum_ns`, the sum of those 126 API intervals; and
 - `verification_wall_total_ns`, one interval around the serialized subject
@@ -65,7 +66,10 @@ proof environment, no `.sable-out/daemon.sock`, existing local
 `.sable-out/roots` and `.sable-out/modules` directories, and a new absolute
 report path outside the checkout. A baseline also requires the test-only
 `SABLE_GRIND_HEARTBEATS` override and ambient `ELAN_TOOLCHAIN`, `LEAN_PATH`,
-`LEAN_SYSROOT`, `LEAN_SRC_PATH`, and `LEAN_GITHASH` overrides to be unset. The
+`LEAN_SYSROOT`, `LEAN_SRC_PATH`, `LEAN_GITHASH`, `LEAN`, `LAKE`, `LAKE_HOME`,
+and `LAKE_OVERRIDE_LEAN` overrides to be unset. Lake cache/config/key/endpoint,
+Reservoir/package-map, and `LEAN_CC`/`LEAN_AR`/`CC`/`AR`/`CXX`/`LD` overrides
+must likewise be unset. The
 timing API bypasses the daemon even if one is started later; the socket checks
 make that ambient-state error visible too. Directory-entry, metadata, symlink,
 and UTF-8 errors are fatal.
@@ -92,21 +96,30 @@ but cannot produce baseline evidence.
 
 Subject serialization comes from the runner's one lexicographic Rust loop, not
 from either `SABLE_*_JOBS` variable. Those two variables are pinned
-orchestration conventions for the surrounding test/corpus tooling; direct
-`run_lean` does not consume them. Every direct batch process inherits
-`LEAN_NUM_THREADS=0`, disabling Lean's internal task manager, and
-`LEAN_IMPORT_WORKERS=1`, fixing the otherwise hardware-dependent import-worker
-count and stripe order. The concurrency claim is therefore exactly one
-external Lean process at a time, with task-manager workers disabled inside it
-and a single import worker.
+orchestration conventions for the surrounding test/corpus tooling. A shared
+in-process mutex plus repository advisory lock serializes compiler-owned proof
+launches, including Lake environment queries, proof-ingress auditors, and
+direct Lean checks. A short-lived `lake env` wrapper may coexist with the one
+Lean executable it launches; the bound is one Lean compiler/auditor runtime,
+not one operating-system process. Every Lean-based child inherits
+`LEAN_NUM_THREADS=0`,
+disabling Lean's internal task manager, and `LEAN_IMPORT_WORKERS=1`, fixing the
+otherwise hardware-dependent import-worker count and stripe order. The claim
+is therefore at most one compiler-owned Lean proof runtime at a time for this
+process and repository, with task-manager workers disabled and a single import
+worker inside it.
 
 Toolchain provenance records version output and the relevant ambient Lean/elan
 variables. Command lookup through `PATH` and elan's binary-resolution
 implementation remain trusted environment boundaries: reports do not
-authenticate resolved tool executable paths or their bytes. Requiring
-`ELAN_TOOLCHAIN` and Lean path/sysroot/source/hash overrides to be unset for a
-baseline lets the checked-in `lean/lean-toolchain` and Lake workspace drive the
-ordinary selection without claiming more than the recorded version strings.
+authenticate resolved tool executable paths or their bytes. Requiring the full
+recorded Lean/Lake/native-tool override set to be unset for a baseline, and
+removing that same set from provenance and measured proof children, lets the
+checked-in `lean/lean-toolchain`, trusted empty Lake system configuration, and
+Lake workspace drive ordinary selection without claiming more than the
+recorded version strings. Every proof Lake process also forces artifact-cache
+and restore off, disables package cache use, and supplies no system-cache
+configuration.
 
 `cold-roots` means:
 
@@ -118,16 +131,19 @@ ordinary selection without claiming more than the recorded version strings.
 This is a cold generated-artifact start, not a cold operating-system page
 cache and not a Lean-prelude build measurement. Imported artifacts become warm
 as the lexicographically ordered series progresses. The runner records and
-compares a proof-build identity at both ends: `READY` content, size, and mtime,
-plus `Sable.olean` size and mtime, and device/inode on Unix. A changed identity
-invalidates the series so a same-source-id proof-environment rebuild cannot be
-silently included in measured verification time.
+compares a proof-build identity at both ends: `READY`, the exact sorted local
+`.olean` set, and the proof-ingress auditor executable, with content SHA-256,
+size, and mtime for each and device/inode on Unix. `Sable.olean` remains
+separately named in the JSON for compatibility but is also a member of that
+complete set. A changed identity invalidates the series so a same-source-id
+proof-environment rebuild or trusted-output mutation cannot be silently
+included in measured verification time.
 
 For the prescribed paired procedure, `warm-artifacts` means:
 
 - the operator starts it next, without an intervening build, edit, clean,
   daemon, or cache change;
-- `SABLE_PROOF_TIMING_COLD_REPORT` selects a successful v2 cold report whose
+- `SABLE_PROOF_TIMING_COLD_REPORT` selects a successful v3 cold report whose
   bytes are hashed into the warm report;
 - its proof-build identity equals the selected cold report's ending identity;
 - its starting cache metadata manifest equals the selected cold report's
@@ -139,14 +155,18 @@ The warm runner hashes the cold report bytes, validates its fields, and
 requires the same successful evidence tier, full Git revision, subject
 manifest, proof environment, release test executable, Cargo lockfile, protocol
 source, machine, toolchains, environment, invocation, proof-build identity,
-and cold-end cache metadata manifest. Roots are still re-proved in fresh batch
-Lean processes. “Warm” refers to generated artifacts available for reuse,
-never a daemon or retained in-process checker.
+and cold-end cache metadata manifest. Roots are still source-confined by fresh
+proof-ingress auditor processes and re-proved in fresh batch Lean processes.
+“Warm” refers to generated artifacts available for reuse, never a daemon or
+retained in-process checker.
 
-Cache manifests intentionally hash sorted relative path, entry kind, and file
-size without reading artifact contents. Reading every `.olean` before the warm
-series would itself manufacture a page-cache advantage. Artifact names and
-the compiler's reuse validation retain their normal content-addressed checks.
+Generated-cache manifests intentionally hash sorted relative path, entry kind,
+and file size without reading artifact contents. Reading every generated
+`.sable-out/modules/*.olean` only before the warm series would itself
+manufacture a page-cache advantage. The immutable proof-environment `.olean`
+set is intentionally content-hashed in both cold and warm preflights as part of
+the full proof-build identity. Generated artifact names and the compiler's reuse
+validation retain their normal content-addressed checks.
 The subject content manifest necessarily reads every measured source before
 both series, so neither mode claims cold source-file I/O.
 
@@ -173,7 +193,12 @@ git status --short
 git rev-parse HEAD
 test ! -e .sable-out/daemon.sock && test ! -L .sable-out/daemon.sock
 unset SABLE_GRIND_HEARTBEATS ELAN_TOOLCHAIN LEAN_PATH LEAN_SYSROOT
-unset LEAN_SRC_PATH LEAN_GITHASH
+unset LEAN_SRC_PATH LEAN_GITHASH LEAN LAKE LAKE_HOME LAKE_OVERRIDE_LEAN
+unset LAKE_ARTIFACT_CACHE LAKE_RESTORE_ARTIFACTS LAKE_NO_CACHE LAKE_CACHE_DIR
+unset LAKE_CONFIG LAKE_CACHE_KEY LAKE_CACHE_SERVICE
+unset LAKE_CACHE_ARTIFACT_ENDPOINT LAKE_CACHE_REVISION_ENDPOINT
+unset LAKE_PKG_URL_MAP RESERVOIR_API_BASE_URL RESERVOIR_API_URL
+unset LEAN_CC LEAN_AR CC AR CXX LD
 
 CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 LEAN_NUM_THREADS=0 \
 LEAN_IMPORT_WORKERS=1 \
@@ -243,7 +268,7 @@ reuse the exact cold executable. If Cargo recompiles anything before the warm
 test starts, abort the pair and prepare a new cold run.
 
 The final status command must also print nothing. Both JSON documents must say
-`schema = sable-proof-timing-v2`, `status = ok`, and
+`schema = sable-proof-timing-v3`, `status = ok`, and
 `evidence.tier = baseline`. The warm report records the cold report's absolute
 path and SHA-256. The original generated caches remain recoverable under
 `$SABLE_TIMING_CACHE_BACKUP`; do not restore them until the warm run and any
@@ -261,14 +286,15 @@ grind-heartbeat override are recorded as additional smoke reasons.
 
 ## Report and comparability
 
-The v2 document records:
+The v3 document records:
 
 - status and evidence tier;
 - start/end nanosecond timestamps;
 - exact start/end Git revisions, cleanliness, and porcelain status;
 - the sorted subject content manifest and per-file SHA-256;
-- immutable proof-environment, proof-build, root-artifact, test-executable,
-  Cargo lockfile, and protocol-source identities;
+- immutable proof-environment, full local proof-output/auditor build,
+  root-artifact, test-executable, Cargo lockfile, and protocol-source
+  identities;
 - machine label, host, kernel, architecture, CPU model, logical CPUs, Rust,
   Cargo, Lake, Lean, authenticated Cargo output-profile identity, recorded
   profile family, debug-assertion state, and relevant build environment;
@@ -295,8 +321,11 @@ one run into a performance guarantee.
 
 ## Recorded baselines
 
-The immutable [baseline index](baselines/index.json) is the authority for
-committed pairs and their report hashes. The first v2 pair measures revision
+The immutable [baseline index](baselines/index.json) remains the authority for
+committed historical pairs and their report hashes. Its current v2 pair
+predates the per-document proof-ingress auditor and v3 full proof-build
+identity, so it is historical evidence and is not comparable with a v3 series.
+The v2 files and index remain untouched. That pair measures revision
 `25ebc21e71fb7827bf50bd39432e00fd9754c234` on
 `alvaros-m2-air-arm64`: 126/126 subjects verified with zero warnings, defers,
 assumptions, or failures. Cold-roots took 313.915 seconds and the linked
