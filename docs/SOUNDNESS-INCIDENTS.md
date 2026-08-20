@@ -3,7 +3,7 @@
 This is the audit ledger for defects at Sable's semantic boundaries. It is a
 record of evidence, not a claim that every compiler bug is a soundness bug and
 not a substitute for the future source-to-SVM soundness theorem. The snapshot
-below covers repository history through `a2d0adc` on 2026-08-20.
+below covers repository history through `9af008e` on 2026-08-20.
 
 ## Method
 
@@ -70,7 +70,7 @@ and ten pre-merge or pre-admission near misses.
 | VF-07 | Confirmed verified-false | `b0f6851`, 2026-08-17 | yes | fail-open havoc dispatch |
 | VF-08 | Confirmed verified-false | `1dd9b40` / `c63300c`, 2026-08-18 | yes | borrow plus move in one call |
 | VF-09 | Confirmed verified-false | `4b4f93d`, 2026-08-20 | yes at `7957ad0`; no tagged release | pending-loan argument timing |
-| VF-10 | Confirmed verified-false; strongest-status mitigation only | confirmed on `77bdf49`; status mitigation `a2d0adc`, 2026-08-20; ingress open | yes at `77bdf49`; no tagged release | unauthenticated proof ingress |
+| VF-10 | Confirmed verified-false; partial ingress mitigation | confirmed on `77bdf49`; status mitigation `a2d0adc`; warning/cache mitigation `9af008e`, 2026-08-20; declaration/axiom ingress open | yes at `77bdf49`; no tagged release | unauthenticated proof ingress |
 | AI-01 | Accepted-invalid | `fa92e12`, 2026-08-11 | yes | borrow-after-move |
 | AI-02 | Accepted-invalid/model mismatch | `842d1af`, 2026-08-16 | yes | owner visible during exposure |
 | AI-03 | Accepted-invalid | `a7969ec` / `c46ba94` / `3251c23`, 2026-08-12 | yes | incomplete per-place ownership state |
@@ -336,16 +336,23 @@ harness; neither result is rewritten here as an incident.
   warnings fatal alone would not close the incident.
 - **Mitigation and remaining exposure:** `a2d0adc` removes the strongest status
   globally and reports `Lean accepted; proof dependencies unaudited` through
-  an explicit assurance boundary. This contains the claim but does not fix
-  ingress: both witnesses remain accepted, the axiom closure remains
-  unauthenticated, and release remains blocked.
+  an explicit assurance boundary. `9af008e` then rejects ordinary `sorry`,
+  `admit`, default-warning `sorryAx`, malformed Lean diagnostic transport, and
+  every other unrecognized Lean warning before root or imported proof evidence
+  can publish. It also binds that warning policy exactly into proof snapshots,
+  READY, artifact identities, in-flight builds, and `.ok` stamps. This closes
+  the warning/cache route, but not the incident: a continuation can suppress
+  `warn.sorry` around `sorryAx` or inject a warning-free axiom, the axiom closure
+  remains unauthenticated, and release remains blocked.
 - **Regression and discovery:**
-  [`proof_ingress.rs`](../compiler/tests/proof_ingress.rs) runs both witnesses
-  under bounded batch Lean and requires the exact provisional status. When
-  ingress is sealed, this regression must instead require their exact rejection
-  diagnostic. The supplied source-level review identified the routes;
-  repository-local reproduction promoted the finding to confirmed
-  verified-false.
+  [`proof_ingress.rs`](../compiler/tests/proof_ingress.rs) runs bounded batch
+  witnesses for root and imported `sorry`, `admit`, direct `sorryAx`, warning
+  suppression, and an injected axiom. The warning-producing forms must now
+  fail with the named diagnostic and leave no final proof artifact; the two
+  warning-free forms must remain visibly provisional until the declaration and
+  transitive-axiom audits reject or account for them. The supplied source-level
+  review identified the routes; repository-local reproduction promoted the
+  finding to confirmed verified-false.
 - **Certificate coverage now:** none. Existing certificates are declarations
   in the same environment and do not authenticate its axiom closure. Closure
   requires exact permitted declaration deltas, a transitive axiom audit, and
@@ -849,9 +856,10 @@ independently of plan-consumer correctness.
 
 VF-10 is a different trust-boundary failure from the ownership cluster:
 accepted Lean declarations received Sable's strongest status without an
-authenticated axiom closure. The global status downgrade contains the claim
-but leaves ingress open, so this remains an unresolved release-blocking
-incident rather than evidence of a completed fix.
+authenticated axiom closure. The global status downgrade contains the claim,
+and the warning/cache gate closes one concrete ingress route, but declaration
+injection and the axiom closure remain open. This is still an unresolved
+release-blocking incident rather than evidence of a completed fix.
 
 This ledger is the baseline for trend claims. A future confirmed incident
 should be added with a minimized witness and regression; mitigation and fix
