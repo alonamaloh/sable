@@ -12494,7 +12494,8 @@ fn slot_roundtrip(u64 value) -> u64 {
             &attempted_skip,
             &[],
             &crate::lean::EmittedNames::default(),
-        );
+        )
+        .finish("SableGeneratedVcgenTest");
         assert!(emitted.lean_source.contains("Sable.SlotPutWriteback"));
         assert!(emitted.lean_source.contains("Sable.SlotTakeWriteback"));
         assert_eq!(generated.argument_schedule_certificates.len(), 3);
@@ -12643,7 +12644,8 @@ class SlotHolder {
             &HashSet::new(),
             &[],
             &crate::lean::EmittedNames::default(),
-        );
+        )
+        .finish("SableGeneratedVcgenTest");
         assert!(emitted.lean_source.contains(&method.thm_name));
 
         let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -12697,7 +12699,8 @@ class SlotHolder {
             &HashSet::new(),
             &[],
             &crate::lean::EmittedNames::default(),
-        );
+        )
+        .finish("SableGeneratedVcgenTest");
 
         let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
@@ -13186,7 +13189,8 @@ class FieldReplacement {
             &HashSet::new(),
             &[],
             &crate::lean::EmittedNames::default(),
-        );
+        )
+        .finish("SableGeneratedVcgenTest");
         let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .expect("compiler crate has a repository parent");
@@ -15829,7 +15833,8 @@ pub fn branch_join(u64 n, bool choose) {
             &HashSet::new(),
             &[],
             &crate::lean::EmittedNames::default(),
-        );
+        )
+        .finish("SableGeneratedVcgenTest");
         assert_eq!(result.argument_schedule_certificates.len(), 1);
         assert_eq!(emitted.names.certificates.len(), 3);
         assert!(
@@ -16215,7 +16220,8 @@ pub fn same_member_subject() {
             &attempted_skip,
             &[],
             &crate::lean::EmittedNames::default(),
-        );
+        )
+        .finish("SableGeneratedVcgenTest");
         assert!(emitted.lean_source.contains("Sable.ArrayCallHavoc"));
         assert!(emitted.lean_source.contains("by exact ⟨rfl,"));
         assert_eq!(result.argument_schedule_certificates.len(), 1);
@@ -16262,7 +16268,8 @@ pub fn same_member_subject() {
             &HashSet::new(),
             &[],
             &crate::lean::EmittedNames::default(),
-        );
+        )
+        .finish("SableGeneratedVcgenTest");
 
         let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()

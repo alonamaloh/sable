@@ -3,14 +3,15 @@ import Sable
 
 open Lean
 
-private def requestSchema := "sable-proof-ingress-request-v1"
-private def resultSchema := "sable-proof-ingress-result-v1"
+private def requestSchema := "sable-proof-ingress-request-v2"
+private def resultSchema := "sable-proof-ingress-result-v2"
 
 private structure Fragment where
   category : String
   text : String
   expectedKind : String
   expectedName : String
+  expectedModifiers : String
 
 private abbrev RawJsonObject := Std.TreeMap.Raw String Json compare
 
@@ -24,12 +25,14 @@ private def exactObject (json : Json) (fields : Array String) : Except String Ra
   return object
 
 private def parseFragment (json : Json) : Except String Fragment := do
-  discard <| exactObject json #["category", "text", "expected_kind", "expected_name"]
+  discard <| exactObject json
+    #["category", "text", "expected_kind", "expected_name", "expected_modifiers"]
   return {
     category := ← json.getObjVal? "category" >>= Json.getStr?
     text := ← json.getObjVal? "text" >>= Json.getStr?
     expectedKind := ← json.getObjVal? "expected_kind" >>= Json.getStr?
     expectedName := ← json.getObjVal? "expected_name" >>= Json.getStr?
+    expectedModifiers := ← json.getObjVal? "expected_modifiers" >>= Json.getStr?
   }
 
 private def parseRequest (input : String) : Except String (Array Fragment) := do
@@ -41,12 +44,24 @@ private def parseRequest (input : String) : Except String (Array Fragment) := do
   let fragmentsJson ← json.getObjVal? "fragments" >>= Json.getArr?
   fragmentsJson.mapM parseFragment
 
+private def rejectExecutableElaborationSyntax (stx : Syntax) : Except String Unit := do
+  for child in stx.topDown do
+    if child.isOfKind ``Parser.Term.byElab then
+      throw "`by_elab` is not permitted in generated proof fragments"
+    if child.isOfKind ``Parser.Tactic.runTac then
+      throw "`run_tac` is not permitted in generated proof fragments"
+
 private def validateCommand
     (environment : Environment)
     (fragment : Fragment) : Except String Unit := do
   let stx ← Parser.runParserCategory environment `command fragment.text
+  rejectExecutableElaborationSyntax stx
   unless stx.isOfKind ``Parser.Command.declaration do
     throw s!"expected one declaration command, got syntax kind '{stx.getKind}'"
+  let some actualModifiers := stx[0].reprint
+    | throw "cannot reproduce the declaration's exact modifier syntax"
+  unless actualModifiers == fragment.expectedModifiers do
+    throw s!"expected declaration modifiers '{fragment.expectedModifiers}', got '{actualModifiers}'"
   let declaration := stx[1]
   let expectedSyntaxKind ← match fragment.expectedKind with
     | "definition" => pure ``Parser.Command.definition
@@ -57,6 +72,12 @@ private def validateCommand
   let (actualName, _) := Elab.expandDeclIdCore declaration[1]
   unless actualName.toString == fragment.expectedName do
     throw s!"expected declaration '{fragment.expectedName}', got '{actualName}'"
+  unless declaration[3].isOfKind ``Parser.Command.declValSimple do
+    throw "ghost declarations must use one simple `:=` value"
+  -- Termination/decreasing suffixes remain available for recursive ghost
+  -- definitions, but nested `where` declarations could manufacture siblings.
+  unless declaration[3][3].isNone do
+    throw "ghost declarations may not contain `where` declarations"
   -- A source-authored `deriving` clause can manufacture sibling declarations.
   -- Sable ghost definitions do not expose that feature; any auxiliaries must
   -- instead be attributable to elaborating the one confined declaration.
@@ -69,9 +90,11 @@ private def validateFragment
   match fragment.category with
   | "command" => validateCommand environment fragment
   | "term" =>
-      unless fragment.expectedKind.isEmpty && fragment.expectedName.isEmpty do
+      unless fragment.expectedKind.isEmpty && fragment.expectedName.isEmpty &&
+          fragment.expectedModifiers.isEmpty do
         throw "term fragments must not carry declaration expectations"
-      discard <| Parser.runParserCategory environment `term fragment.text
+      let stx ← Parser.runParserCategory environment `term fragment.text
+      rejectExecutableElaborationSyntax stx
   | other => throw s!"unsupported fragment category '{other}'"
 
 private def accepted : Json := Json.mkObj [

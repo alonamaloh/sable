@@ -250,7 +250,45 @@ fn subject() -> u64 {
     );
     assert_eq!(
         fs::read(&published[0]).expect("read root verification stamp"),
-        b"sable-verification-policy:confine-generated-lean-ingress-v3\n"
+        b"sable-verification-policy:confine-generated-lean-ingress-v4\n"
+    );
+}
+
+#[test]
+fn owned_ghost_modifiers_and_recursive_suffix_pass_the_ingress_gate() {
+    let source = temp_source(
+        "owned-ghost-modifiers",
+        r#"
+/// def identity (x : int) : int := x
+/// def pw (n : int) : int := if 0 < n then 2 * pw (n - 1) else 1
+/// termination_by n.toNat
+/// decreasing_by omega
+
+/// post result = 0
+fn subject() -> u64 {
+    return 0;
+}
+"#,
+    );
+    let before = final_artifacts_for(&source.0);
+    let output = check_path(&source.0, None);
+    let stdout = String::from_utf8(output.stdout).expect("Sable stdout is UTF-8");
+    let stderr = String::from_utf8(output.stderr).expect("Sable stderr is UTF-8");
+    assert!(
+        output.status.success(),
+        "owned ghost modifiers did not pass:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(stdout.lines().any(|line| line == UNAUDITED_PROOF_STATUS));
+    assert!(!stdout.contains("fully verified"));
+    assert!(!stderr.contains("fully verified"));
+    let published = final_artifacts_for(&source.0)
+        .difference(&before)
+        .cloned()
+        .collect::<Vec<_>>();
+    assert_eq!(published.len(), 1, "{published:#?}");
+    assert_eq!(
+        published[0].extension().and_then(|value| value.to_str()),
+        Some("ok")
     );
 }
 
@@ -554,6 +592,91 @@ fn subject() -> u64 {
         "ghost definition `deriving` witness",
     );
     assert_no_new_final_artifacts(&source.0, &before, "ghost definition `deriving` witness");
+}
+
+#[test]
+fn ghost_definition_equations_are_rejected() {
+    let source = temp_source(
+        "ghost-equations-no-final-artifact",
+        r#"
+/// def piecewise : Nat → Nat
+///   | 0 => 0
+///   | n + 1 => n
+
+/// post result = 0
+fn subject() -> u64 {
+    return 0;
+}
+"#,
+    );
+    let before = final_artifacts_for(&source.0);
+    assert_ingress_failed_closed(
+        check_path(&source.0, None),
+        "ghost definition equation witness",
+    );
+    assert_no_new_final_artifacts(&source.0, &before, "ghost definition equation witness");
+}
+
+#[test]
+fn ghost_definition_where_declarations_are_rejected() {
+    let source = temp_source(
+        "ghost-where-no-final-artifact",
+        r#"
+/// def outer : Nat := inner where
+///   inner : Nat := 0
+
+/// post result = 0
+fn subject() -> u64 {
+    return 0;
+}
+"#,
+    );
+    let before = final_artifacts_for(&source.0);
+    assert_ingress_failed_closed(
+        check_path(&source.0, None),
+        "ghost definition `where` witness",
+    );
+    assert_no_new_final_artifacts(&source.0, &before, "ghost definition `where` witness");
+}
+
+#[test]
+fn by_elab_is_rejected_at_any_nested_term_position() {
+    let source = temp_source(
+        "ghost-by-elab-no-final-artifact",
+        r#"
+/// theorem elaborator_escape : True := by_elab
+///   return mkConst ``True.intro
+
+/// post result = 0
+fn subject() -> u64 {
+    return 0;
+}
+"#,
+    );
+    let before = final_artifacts_for(&source.0);
+    assert_ingress_failed_closed(check_path(&source.0, None), "nested `by_elab` witness");
+    assert_no_new_final_artifacts(&source.0, &before, "nested `by_elab` witness");
+}
+
+#[test]
+fn run_tac_is_rejected_at_any_nested_tactic_position() {
+    let source = temp_source(
+        "ghost-run-tac-no-final-artifact",
+        r#"
+/// theorem tactic_escape : True := by
+///   run_tac
+///     pure ()
+///   exact True.intro
+
+/// post result = 0
+fn subject() -> u64 {
+    return 0;
+}
+"#,
+    );
+    let before = final_artifacts_for(&source.0);
+    assert_ingress_failed_closed(check_path(&source.0, None), "nested `run_tac` witness");
+    assert_no_new_final_artifacts(&source.0, &before, "nested `run_tac` witness");
 }
 
 #[test]

@@ -534,10 +534,11 @@ fn prepare_with_environment(
     let emitted = lean::emit(&vc, &program.discharges, &skip, &imports, &exclude);
     let lean_name = artifact_name(
         path,
-        &emitted.lean_source,
+        emitted.lean_source(),
         &proof_fingerprint,
         proof_environment.policy(),
     );
+    let emitted = emitted.finish(&lean_name);
     let root_path = mods.modules[0].path.clone();
 
     (
@@ -1400,10 +1401,11 @@ fn temp_nonce() -> u64 {
     NEXT.fetch_add(1, Ordering::Relaxed)
 }
 
-/// `<stem>_<hash>` — the content-addressed Lean module name. The hash
-/// seeds with the prelude (sources, toolchain pin, lakefile), so a
-/// prelude change invalidates every artifact; dep artifacts are pinned
-/// transitively through the `import` lines inside `content`.
+/// `<stem>_<hash>` — the content-addressed Lean module name. `content` is
+/// the generated source before the module-named terminal sentinel is appended,
+/// which avoids a name/source hash cycle. The hash seeds with the prelude
+/// (sources, toolchain pin, lakefile), so a prelude change invalidates every
+/// artifact; dependency artifacts are pinned transitively through imports.
 fn artifact_name(
     path: &Path,
     content: &str,

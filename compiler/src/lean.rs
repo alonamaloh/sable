@@ -73,6 +73,76 @@ impl EmittedNames {
     }
 }
 
+/// Ordered compiler-authored declaration roots expected from one generated
+/// module. This is deliberately separate from [`EmittedNames`]: the latter is
+/// import-subtraction metadata, while this carrier preserves declaration kind,
+/// source order, and the structural roots needed by the compiled-envelope
+/// auditor in the next tranche. Recording it grants no cache authority: B0
+/// does not yet compare these roots or their bodies with a candidate `.olean`.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct ExpectedDeclarationEnvelope {
+    pub(crate) roots: Vec<ExpectedDeclarationRoot>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ExpectedDeclarationRoot {
+    pub(crate) name: String,
+    pub(crate) kind: ExpectedDeclarationKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ExpectedDeclarationKind {
+    Structure {
+        fields: Vec<String>,
+    },
+    Definition {
+        recursive: bool,
+        noncomputable: bool,
+        simp: bool,
+    },
+    Theorem {
+        simp: bool,
+        sable_fact: bool,
+    },
+    /// Compiler-authored final command. It is an identity/inventory canary,
+    /// not an attestation that cached declaration bodies came from source.
+    TerminalSentinel,
+}
+
+impl ExpectedDeclarationEnvelope {
+    fn push_structure(&mut self, name: String, fields: Vec<String>) {
+        self.roots.push(ExpectedDeclarationRoot {
+            name,
+            kind: ExpectedDeclarationKind::Structure { fields },
+        });
+    }
+
+    fn push_proof_definition(&mut self, name: String, recursive: bool, simp: bool) {
+        self.roots.push(ExpectedDeclarationRoot {
+            name,
+            kind: ExpectedDeclarationKind::Definition {
+                recursive,
+                noncomputable: true,
+                simp,
+            },
+        });
+    }
+
+    fn push_theorem(&mut self, name: String, simp: bool, sable_fact: bool) {
+        self.roots.push(ExpectedDeclarationRoot {
+            name,
+            kind: ExpectedDeclarationKind::Theorem { simp, sable_fact },
+        });
+    }
+
+    fn push_terminal_sentinel(&mut self, name: String) {
+        self.roots.push(ExpectedDeclarationRoot {
+            name,
+            kind: ExpectedDeclarationKind::TerminalSentinel,
+        });
+    }
+}
+
 pub struct Emitted {
     pub lean_source: String,
     /// What this file declares (after exclusion filtering).
@@ -80,8 +150,65 @@ pub struct Emitted {
     /// Exact user-derived Lean fragments whose parser boundaries must be
     /// authenticated before this document may be submitted to Lean.
     pub(crate) ingress: Vec<IngressFragment>,
+    pub(crate) declaration_envelope: ExpectedDeclarationEnvelope,
     map: Vec<MapEntry>,
 }
+
+/// Generated content before its module name is known. The artifact name is
+/// derived from these bytes; [`EmittedDraft::finish`] then appends the unique
+/// terminal sentinel without introducing a source/name hash cycle.
+pub struct EmittedDraft {
+    lean_source: String,
+    names: EmittedNames,
+    ingress: Vec<IngressFragment>,
+    declaration_envelope: ExpectedDeclarationEnvelope,
+    map: Vec<MapEntry>,
+}
+
+impl EmittedDraft {
+    pub fn lean_source(&self) -> &str {
+        &self.lean_source
+    }
+
+    pub fn finish(mut self, module_name: &str) -> Emitted {
+        let sentinel = terminal_sentinel_name(module_name, &self.lean_source);
+        debug_assert!(self.lean_source.ends_with('\n'));
+        self.lean_source
+            .push_str(&format!("theorem {sentinel} : True := True.intro\n"));
+        self.declaration_envelope.push_terminal_sentinel(sentinel);
+        Emitted {
+            lean_source: self.lean_source,
+            names: self.names,
+            ingress: self.ingress,
+            declaration_envelope: self.declaration_envelope,
+            map: self.map,
+        }
+    }
+}
+
+const TERMINAL_SENTINEL_DOMAIN: &[u8] = b"sable-generated-terminal-sentinel-v1";
+
+fn terminal_sentinel_name(module_name: &str, pre_sentinel_source: &str) -> String {
+    let mut framed = Vec::with_capacity(
+        TERMINAL_SENTINEL_DOMAIN.len() + module_name.len() + pre_sentinel_source.len() + 24,
+    );
+    append_framed(&mut framed, TERMINAL_SENTINEL_DOMAIN);
+    append_framed(&mut framed, module_name.as_bytes());
+    append_framed(&mut framed, pre_sentinel_source.as_bytes());
+    format!(
+        "SableGenerated.complete_{}",
+        crate::sha256::hex(&framed)
+    )
+}
+
+fn append_framed(output: &mut Vec<u8>, value: &[u8]) {
+    let len = u64::try_from(value.len()).expect("generated Lean input length fits u64");
+    output.extend_from_slice(&len.to_be_bytes());
+    output.extend_from_slice(value);
+}
+
+const INGRESS_REQUEST_SCHEMA: &str = "sable-proof-ingress-request-v2";
+const INGRESS_RESULT_SCHEMA: &str = "sable-proof-ingress-result-v2";
 
 #[derive(Clone)]
 pub(crate) struct IngressFragment {
@@ -89,6 +216,7 @@ pub(crate) struct IngressFragment {
     text: String,
     expected_kind: &'static str,
     expected_name: String,
+    expected_modifiers: String,
     pub(crate) span: Span,
     pub(crate) description: String,
 }
@@ -100,6 +228,7 @@ impl IngressFragment {
             text: text.into(),
             expected_kind: "",
             expected_name: String::new(),
+            expected_modifiers: String::new(),
             span,
             description: description.into(),
         }
@@ -109,6 +238,7 @@ impl IngressFragment {
         text: impl Into<String>,
         expected_kind: &'static str,
         expected_name: impl Into<String>,
+        expected_modifiers: impl Into<String>,
         span: Span,
         description: impl Into<String>,
     ) -> Self {
@@ -117,6 +247,7 @@ impl IngressFragment {
             text: text.into(),
             expected_kind,
             expected_name: expected_name.into(),
+            expected_modifiers: expected_modifiers.into(),
             span,
             description: description.into(),
         }
@@ -148,7 +279,7 @@ pub fn emit(
     skip: &std::collections::HashSet<String>,
     imports: &[String],
     exclude: &EmittedNames,
-) -> Emitted {
+) -> EmittedDraft {
     let mut e = Emitter {
         buf: String::new(),
         line: 0,
@@ -156,6 +287,7 @@ pub fn emit(
     let mut map = Vec::new();
     let mut names = EmittedNames::default();
     let mut ingress = Vec::new();
+    let mut declaration_envelope = ExpectedDeclarationEnvelope::default();
 
     e.push("import Sable");
     for i in imports {
@@ -217,6 +349,13 @@ pub fn emit(
             continue;
         }
         names.classes.insert(lean_name.clone());
+        declaration_envelope.push_structure(
+            lean_name.clone(),
+            r.fields
+                .iter()
+                .map(|field| format!("{lean_name}.{}", field.name))
+                .collect(),
+        );
         let first = e.line + 1;
         e.push(&format!("structure {lean_name} where"));
         for field in &r.fields {
@@ -241,21 +380,41 @@ pub fn emit(
         }
         e.push("");
         e.push(&format!("namespace {lean_name}"));
+        declaration_envelope.push_proof_definition(
+            format!("{lean_name}.layout"),
+            false,
+            false,
+        );
         e.push(&format!(
-            "def layout : Sable.Layout := ⟨{}, {}⟩",
+            "noncomputable def layout : Sable.Layout := ⟨{}, {}⟩",
             r.layout.size, r.layout.align
         ));
+        declaration_envelope.push_theorem(
+            format!("{lean_name}.layout_size"),
+            true,
+            false,
+        );
         e.push(&format!(
             "@[simp] theorem layout_size : layout.size = {} := rfl",
             r.layout.size
         ));
+        declaration_envelope.push_theorem(
+            format!("{lean_name}.layout_align"),
+            true,
+            false,
+        );
         e.push(&format!(
             "@[simp] theorem layout_align : layout.align = {} := rfl",
             r.layout.align
         ));
         for field in &r.fields {
+            declaration_envelope.push_proof_definition(
+                format!("{lean_name}.{}Offset", field.name),
+                false,
+                false,
+            );
             e.push(&format!(
-                "def {}Offset : Int := {}",
+                "noncomputable def {}Offset : Int := {}",
                 field.name, field.offset
             ));
         }
@@ -265,11 +424,21 @@ pub fn emit(
             align /= 2;
             exponent += 1;
         }
+        declaration_envelope.push_theorem(
+            format!("{lean_name}.layout_wf"),
+            false,
+            false,
+        );
         e.push("theorem layout_wf : layout.wf := by");
         e.push(&format!(
             "  refine ⟨by decide, by decide, ⟨{exponent}, rfl⟩⟩"
         ));
         for field in &r.fields {
+            declaration_envelope.push_theorem(
+                format!("{lean_name}.{}_fits", field.name),
+                false,
+                false,
+            );
             e.push(&format!(
                 "theorem {}_fits : Sable.Layout.fieldFits layout {} {}Offset := by simp [Sable.Layout.fieldFits, layout, {}Offset, {}]",
                 field.name, field.layout, field.name, field.name, field.layout
@@ -279,6 +448,14 @@ pub fn emit(
             for right in (left + 1)..r.fields.len() {
                 let lfield = &r.fields[left];
                 let rfield = &r.fields[right];
+                declaration_envelope.push_theorem(
+                    format!(
+                        "{lean_name}.{}_{}_disjoint",
+                        lfield.name, rfield.name
+                    ),
+                    false,
+                    false,
+                );
                 e.push(&format!(
                     "theorem {}_{}_disjoint : Sable.Layout.fieldsDisjoint {} {}Offset {} {}Offset := by simp [Sable.Layout.fieldsDisjoint, {}Offset, {}Offset, {}, {}]",
                     lfield.name,
@@ -300,32 +477,78 @@ pub fn emit(
         } else {
             value_wf.join(" ∧ ")
         };
-        e.push(&format!("def wf (value : {lean_name}) : Prop :="));
+        declaration_envelope.push_proof_definition(
+            format!("{lean_name}.wf"),
+            false,
+            false,
+        );
+        e.push(&format!(
+            "noncomputable def wf (value : {lean_name}) : Prop :="
+        ));
         e.push(&format!("  {wf_body}"));
         // A plain `def` is invisible to `simp`; the explicit unfolding
         // lemma is what lets automation read the field facts out of a
         // `wf` hypothesis (an elementwise array fact included).
+        declaration_envelope.push_theorem(
+            format!("{lean_name}.wf_iff"),
+            true,
+            false,
+        );
         e.push(&format!(
             "@[simp] theorem wf_iff (value : {lean_name}) : wf value ↔ ({wf_body}) := Iff.rfl"
         ));
+        declaration_envelope.push_proof_definition(
+            format!("{lean_name}.cellWf"),
+            false,
+            false,
+        );
         e.push(&format!(
-            "def cellWf (cell : Sable.PointsToView {lean_name}) : Prop :="
+            "noncomputable def cellWf (cell : Sable.PointsToView {lean_name}) : Prop :="
         ));
         e.push("  cell.layout = layout ∧ 0 ≤ cell.off ∧ cell.off % cell.layout.align = 0 ∧");
         e.push("    match cell.state with | .uninit => True | .init value => wf value");
+        declaration_envelope.push_proof_definition(
+            format!("{lean_name}.fromSpan"),
+            false,
+            false,
+        );
         e.push(&format!(
-            "def fromSpan (span : Sable.SpanView) : Sable.PointsToView {lean_name} :="
+            "noncomputable def fromSpan (span : Sable.SpanView) : Sable.PointsToView {lean_name} :="
         ));
         e.push("  { alloc := span.alloc, off := span.off, layout := layout, state := .uninit }");
+        for theorem in [
+            "fromSpan_alloc",
+            "fromSpan_off",
+            "fromSpan_layout",
+            "fromSpan_state",
+        ] {
+            declaration_envelope.push_theorem(
+                format!("{lean_name}.{theorem}"),
+                true,
+                false,
+            );
+        }
         e.push("@[simp] theorem fromSpan_alloc (span : Sable.SpanView) : (fromSpan span).alloc = span.alloc := rfl");
         e.push("@[simp] theorem fromSpan_off (span : Sable.SpanView) : (fromSpan span).off = span.off := rfl");
         e.push("@[simp] theorem fromSpan_layout (span : Sable.SpanView) : (fromSpan span).layout = layout := rfl");
         e.push("@[simp] theorem fromSpan_state (span : Sable.SpanView) : (fromSpan span).state = .uninit := rfl");
+        declaration_envelope.push_proof_definition(
+            format!("{lean_name}.toSpan"),
+            false,
+            false,
+        );
         e.push(&format!(
-            "def toSpan (cell : Sable.PointsToView {lean_name}) : Sable.SpanView :="
+            "noncomputable def toSpan (cell : Sable.PointsToView {lean_name}) : Sable.SpanView :="
         ));
         e.push("  { alloc := cell.alloc, off := cell.off, len := cell.layout.size,");
         e.push("    bytes := ⟨cell.layout.size, fun _ => .init 0⟩ }");
+        for theorem in ["toSpan_alloc", "toSpan_off", "toSpan_len"] {
+            declaration_envelope.push_theorem(
+                format!("{lean_name}.{theorem}"),
+                true,
+                false,
+            );
+        }
         e.push(&format!("@[simp] theorem toSpan_alloc (cell : Sable.PointsToView {lean_name}) : (toSpan cell).alloc = cell.alloc := rfl"));
         e.push(&format!("@[simp] theorem toSpan_off (cell : Sable.PointsToView {lean_name}) : (toSpan cell).off = cell.off := rfl"));
         e.push(&format!("@[simp] theorem toSpan_len (cell : Sable.PointsToView {lean_name}) : (toSpan cell).len = cell.layout.size := rfl"));
@@ -346,7 +569,14 @@ pub fn emit(
         if exclude.classes.contains(&lean_name) {
             continue;
         }
-        names.classes.insert(lean_name);
+        names.classes.insert(lean_name.clone());
+        declaration_envelope.push_structure(
+            lean_name.clone(),
+            c.fields
+                .iter()
+                .map(|(field, _)| format!("{lean_name}.{field}"))
+                .collect(),
+        );
         let first = e.line + 1;
         e.push(&format!(
             "structure {} where",
@@ -383,8 +613,10 @@ pub fn emit(
         // unfolded manually in discharges. `#[unfold]` opts an item in
         // explicitly — typically a conditional step lemma whose side
         // conditions gate the rewrite to concrete data.
+        let recursive = g.keyword == "def" && ghost_recursive(&g.text);
+        let simp = g.unfold || (g.keyword == "def" && !recursive);
         let mut attr = String::new();
-        if g.unfold || (g.keyword == "def" && !ghost_recursive(&g.text)) {
+        if simp {
             attr.push_str("@[simp] ");
         }
         // `#[fact]`: the instantiation tier applies the theorem at the
@@ -392,7 +624,16 @@ pub fn emit(
         if g.fact {
             attr.push_str("@[sable_fact] ");
         }
-        let command = format!("{attr}{} {}", g.keyword, g.text);
+        let (command, expected_modifiers) = if g.keyword == "def" {
+            declaration_envelope.push_proof_definition(head.clone(), recursive, simp);
+            (
+                format!("{attr}noncomputable def {}", g.text),
+                format!("{attr}noncomputable "),
+            )
+        } else {
+            declaration_envelope.push_theorem(head.clone(), simp, g.fact);
+            (format!("{attr}theorem {}", g.text), attr)
+        };
         ingress.push(IngressFragment::command(
             command.clone(),
             if g.keyword == "def" {
@@ -401,6 +642,7 @@ pub fn emit(
                 "theorem"
             },
             head.clone(),
+            expected_modifiers,
             g.span,
             format!("ghost `{}` declaration `{head}`", g.keyword),
         ));
@@ -440,8 +682,9 @@ pub fn emit(
             wf.desc.clone(),
         ));
         let first = e.line + 1;
+        declaration_envelope.push_proof_definition(wf.def_name.clone(), false, false);
         e.push(&format!(
-            "def {} {} : {} :=",
+            "noncomputable def {} {} : {} :=",
             wf.def_name,
             binder_list(&wf.binders),
             wf.result_ty
@@ -488,6 +731,7 @@ pub fn emit(
             format!("certificate `{}` proof", certificate.name),
         ));
         let first = e.line + 1;
+        declaration_envelope.push_theorem(certificate.thm_name.clone(), false, false);
         e.push(&format!(
             "/-- `{}` — kernel-checked {} transition for `{}` -/",
             certificate.name,
@@ -531,6 +775,7 @@ pub fn emit(
             format!("argument-schedule certificate `{}` proof", certificate.name),
         ));
         let first = e.line + 1;
+        declaration_envelope.push_theorem(certificate.thm_name.clone(), false, false);
         e.push(&format!(
             "/-- `{}` — kernel-checked {} for {} -/",
             certificate.name,
@@ -594,6 +839,7 @@ pub fn emit(
             ));
         }
         let first = e.line + 1;
+        declaration_envelope.push_theorem(ob.thm_name.clone(), false, false);
         e.push(&format!(
             "/-- `{}` — {} -/",
             ob.name,
@@ -631,10 +877,11 @@ pub fn emit(
         });
     }
 
-    Emitted {
+    EmittedDraft {
         lean_source: e.buf,
         names,
         ingress,
+        declaration_envelope,
         map,
     }
 }
@@ -723,7 +970,7 @@ pub fn modules_dir(repo_root: &Path) -> PathBuf {
 /// Exact repository-local inputs that can affect a generated proof. The FNV
 /// identifier is only a compact directory/name tag; every reuse also compares
 /// this complete map, so a hash collision fails closed.
-pub(crate) const PROOF_POLICY_VERSION: &str = "confine-generated-lean-ingress-v3";
+pub(crate) const PROOF_POLICY_VERSION: &str = "confine-generated-lean-ingress-v4";
 const PROOF_ENVIRONMENT_ID_PREFIX: &str = "proof-env-v4-fnv64:";
 
 #[derive(Clone)]
@@ -1872,6 +2119,19 @@ fn ingress_transport_failure(emitted: &Emitted, message: impl Into<String>) -> I
     }
 }
 
+fn ingress_audit_request(emitted: &Emitted) -> Result<Vec<u8>, serde_json::Error> {
+    serde_json::to_vec(&serde_json::json!({
+        "schema": INGRESS_REQUEST_SCHEMA,
+        "fragments": emitted.ingress.iter().map(|fragment| serde_json::json!({
+            "category": fragment.category,
+            "text": &fragment.text,
+            "expected_kind": fragment.expected_kind,
+            "expected_name": &fragment.expected_name,
+            "expected_modifiers": &fragment.expected_modifiers,
+        })).collect::<Vec<_>>(),
+    }))
+}
+
 /// Authenticate every compiler-recorded user-derived parser boundary using
 /// the content-hashed trusted auditor. Candidate generated modules are not
 /// imported by this mode; the auditor loads extensions only from `Sable`.
@@ -1880,16 +2140,7 @@ pub(crate) fn audit_ingress(
     environment: &ProofEnvironment,
     emitted: &Emitted,
 ) -> Result<(), IngressAuditFailure> {
-    let request = serde_json::json!({
-        "schema": "sable-proof-ingress-request-v1",
-        "fragments": emitted.ingress.iter().map(|fragment| serde_json::json!({
-            "category": fragment.category,
-            "text": &fragment.text,
-            "expected_kind": fragment.expected_kind,
-            "expected_name": &fragment.expected_name,
-        })).collect::<Vec<_>>(),
-    });
-    let request = serde_json::to_vec(&request).map_err(|error| {
+    let request = ingress_audit_request(emitted).map_err(|error| {
         ingress_transport_failure(
             emitted,
             format!("cannot encode the exact proof-ingress request: {error}"),
@@ -2019,7 +2270,7 @@ fn parse_ingress_audit_output(
         ingress_transport_failure(emitted, "proof auditor result must be a JSON object")
     })?;
     if object.get("schema").and_then(serde_json::Value::as_str)
-        != Some("sable-proof-ingress-result-v1")
+        != Some(INGRESS_RESULT_SCHEMA)
     {
         return Err(ingress_transport_failure(
             emitted,
@@ -2626,8 +2877,8 @@ pub fn diagnose_warnings(
 #[cfg(test)]
 mod warning_policy_tests {
     use super::{
-        DiagnosticDisposition, Emitted, EmittedNames, LeanMessage, MapEntry, MapTarget,
-        UNEXPECTED_LEAN_WARNING_DIAGNOSTIC, diagnostic_disposition,
+        DiagnosticDisposition, Emitted, EmittedNames, ExpectedDeclarationEnvelope, LeanMessage,
+        MapEntry, MapTarget, UNEXPECTED_LEAN_WARNING_DIAGNOSTIC, diagnostic_disposition,
         is_expensive_automation_warning_text, is_recognized_warning,
     };
 
@@ -2668,6 +2919,7 @@ mod warning_policy_tests {
             lean_source: String::new(),
             names: EmittedNames::default(),
             ingress: Vec::new(),
+            declaration_envelope: ExpectedDeclarationEnvelope::default(),
             map: vec![MapEntry {
                 first_line: 7,
                 last_line: 9,
@@ -2703,6 +2955,7 @@ mod warning_policy_tests {
             lean_source: String::new(),
             names: EmittedNames::default(),
             ingress: Vec::new(),
+            declaration_envelope: ExpectedDeclarationEnvelope::default(),
             map: vec![MapEntry {
                 first_line: 7,
                 last_line: 9,
@@ -2772,6 +3025,31 @@ mod proof_build_tests {
                 IngressFragment::term("True", Span::new(2, 3), "first fragment"),
                 IngressFragment::term("False", Span::new(7, 11), "second fragment"),
             ],
+            declaration_envelope: ExpectedDeclarationEnvelope::default(),
+            map: Vec::new(),
+        }
+    }
+
+    fn empty_vc() -> VcResult {
+        VcResult {
+            ghosts: Vec::new(),
+            classes: Vec::new(),
+            records: Vec::new(),
+            clause_wfs: Vec::new(),
+            obligations: Vec::new(),
+            transition_certificates: Vec::new(),
+            argument_schedule_certificates: Vec::new(),
+            trust: crate::vcgen::TrustManifest::default(),
+            machine: crate::vcgen::MachineManifest::default(),
+        }
+    }
+
+    fn draft_with_source(source: &str) -> EmittedDraft {
+        EmittedDraft {
+            lean_source: source.to_owned(),
+            names: EmittedNames::default(),
+            ingress: Vec::new(),
+            declaration_envelope: ExpectedDeclarationEnvelope::default(),
             map: Vec::new(),
         }
     }
@@ -2809,16 +3087,232 @@ mod proof_build_tests {
     }
 
     #[test]
+    fn terminal_sentinel_is_framed_module_unique_and_last() {
+        let pre_sentinel = "import Sable\n\n";
+        let module = "SableGenerated_example_deadbeef";
+        let expected_name = terminal_sentinel_name(module, pre_sentinel);
+        let digest = expected_name
+            .strip_prefix("SableGenerated.complete_")
+            .expect("the sentinel has the reserved compiler prefix");
+        assert_eq!(digest.len(), 64);
+        assert!(digest.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert_ne!(
+            expected_name,
+            terminal_sentinel_name("SableGenerated_other_deadbeef", pre_sentinel)
+        );
+        assert_ne!(
+            expected_name,
+            terminal_sentinel_name(module, "import Sable\nopen Sable\n")
+        );
+        assert_ne!(
+            terminal_sentinel_name("ab", "c\n"),
+            terminal_sentinel_name("a", "bc\n"),
+            "length framing prevents concatenation ambiguity"
+        );
+
+        let emitted = draft_with_source(pre_sentinel).finish(module);
+        assert!(emitted.lean_source.ends_with(&format!(
+            "theorem {expected_name} : True := True.intro\n"
+        )));
+        assert_eq!(
+            emitted.declaration_envelope.roots.last(),
+            Some(&ExpectedDeclarationRoot {
+                name: expected_name,
+                kind: ExpectedDeclarationKind::TerminalSentinel,
+            })
+        );
+    }
+
+    #[test]
+    fn ghost_ingress_binds_owned_modifiers_and_typed_roots() {
+        let mut vc = empty_vc();
+        vc.ghosts = vec![
+            crate::ast::GhostItem {
+                keyword: "def",
+                unfold: false,
+                fact: false,
+                text: "successor (x : Int) : Int := x + 1".into(),
+                span: Span::new(2, 20),
+            },
+            crate::ast::GhostItem {
+                keyword: "def",
+                unfold: false,
+                fact: false,
+                text: "countdown (n : Nat) : Nat := if n = 0 then 0 else countdown (n - 1)\ntermination_by n\ndecreasing_by omega".into(),
+                span: Span::new(21, 90),
+            },
+            crate::ast::GhostItem {
+                keyword: "theorem",
+                unfold: true,
+                fact: true,
+                text: "useful' (x : Int) : x = x := rfl".into(),
+                span: Span::new(91, 130),
+            },
+        ];
+
+        let emitted = emit(
+            &vc,
+            &[],
+            &std::collections::HashSet::new(),
+            &[],
+            &EmittedNames::default(),
+        )
+        .finish("SableGeneratedGhostTest");
+        let commands = emitted
+            .ingress
+            .iter()
+            .filter(|fragment| fragment.category == "command")
+            .collect::<Vec<_>>();
+        assert_eq!(commands.len(), 3);
+        assert_eq!(
+            commands[0].text,
+            "@[simp] noncomputable def successor (x : Int) : Int := x + 1"
+        );
+        assert_eq!(commands[0].expected_modifiers, "@[simp] noncomputable ");
+        assert!(commands[1].text.starts_with("noncomputable def countdown"));
+        assert_eq!(commands[1].expected_modifiers, "noncomputable ");
+        assert_eq!(
+            commands[2].text,
+            "@[simp] @[sable_fact] theorem useful' (x : Int) : x = x := rfl"
+        );
+        assert_eq!(commands[2].expected_modifiers, "@[simp] @[sable_fact] ");
+
+        assert_eq!(
+            &emitted.declaration_envelope.roots[..3],
+            &[
+                ExpectedDeclarationRoot {
+                    name: "successor".into(),
+                    kind: ExpectedDeclarationKind::Definition {
+                        recursive: false,
+                        noncomputable: true,
+                        simp: true,
+                    },
+                },
+                ExpectedDeclarationRoot {
+                    name: "countdown".into(),
+                    kind: ExpectedDeclarationKind::Definition {
+                        recursive: true,
+                        noncomputable: true,
+                        simp: false,
+                    },
+                },
+                ExpectedDeclarationRoot {
+                    name: "useful'".into(),
+                    kind: ExpectedDeclarationKind::Theorem {
+                        simp: true,
+                        sable_fact: true,
+                    },
+                },
+            ]
+        );
+
+        let request: serde_json::Value = serde_json::from_slice(
+            &ingress_audit_request(&emitted).expect("ingress request serializes"),
+        )
+        .expect("ingress request is JSON");
+        assert_eq!(request["schema"], INGRESS_REQUEST_SCHEMA);
+        assert_eq!(
+            request["fragments"][0]["expected_modifiers"],
+            "@[simp] noncomputable "
+        );
+        assert_eq!(request["fragments"][0]["expected_kind"], "definition");
+        assert_eq!(request["fragments"][0]["expected_name"], "successor");
+    }
+
+    #[test]
+    fn record_and_clause_helpers_are_explicitly_noncomputable_roots() {
+        let mut vc = empty_vc();
+        vc.records.push(crate::vcgen::RecordEmit {
+            name: "Pair".into(),
+            fields: vec![
+                crate::vcgen::RecordFieldEmit {
+                    name: "left".into(),
+                    lean_ty: "Int".into(),
+                    layout: "Sable.Layout.int".into(),
+                    offset: 0,
+                    wf: None,
+                },
+                crate::vcgen::RecordFieldEmit {
+                    name: "right".into(),
+                    lean_ty: "Int".into(),
+                    layout: "Sable.Layout.int".into(),
+                    offset: 8,
+                    wf: None,
+                },
+            ],
+            layout: crate::ast::StorageLayout { size: 16, align: 8 },
+            span: Span::new(2, 40),
+        });
+        vc.clause_wfs.push(crate::vcgen::ClauseWf {
+            def_name: "clause_wf".into(),
+            binders: vec![("x".into(), "Int".into())],
+            text: "0 ≤ x".into(),
+            span: Span::new(41, 50),
+            desc: "test clause".into(),
+            result_ty: "Prop",
+        });
+
+        let emitted = emit(
+            &vc,
+            &[],
+            &std::collections::HashSet::new(),
+            &[],
+            &EmittedNames::default(),
+        )
+        .finish("SableGeneratedRecordTest");
+        for declaration in [
+            "layout",
+            "leftOffset",
+            "rightOffset",
+            "wf",
+            "cellWf",
+            "fromSpan",
+            "toSpan",
+            "clause_wf",
+        ] {
+            assert!(
+                emitted
+                    .lean_source
+                    .contains(&format!("noncomputable def {declaration}")),
+                "generated proof helper `{declaration}` must suppress code generation"
+            );
+        }
+        assert_eq!(
+            emitted.declaration_envelope.roots.first(),
+            Some(&ExpectedDeclarationRoot {
+                name: "SableR_Pair".into(),
+                kind: ExpectedDeclarationKind::Structure {
+                    fields: vec!["SableR_Pair.left".into(), "SableR_Pair.right".into()],
+                },
+            })
+        );
+        for root in &emitted.declaration_envelope.roots {
+            if let ExpectedDeclarationKind::Definition { noncomputable, .. } = &root.kind {
+                assert!(
+                    *noncomputable,
+                    "proof definition {} is noncomputable",
+                    root.name
+                );
+            }
+        }
+        assert!(emitted
+            .declaration_envelope
+            .roots
+            .iter()
+            .any(|root| root.name == "clause_wf"));
+    }
+
+    #[test]
     fn ingress_auditor_transport_accepts_only_the_exact_result_schema() {
         let emitted = emitted_with_ingress();
-        let accepted = b"{\"schema\":\"sable-proof-ingress-result-v1\",\"accepted\":true}\n";
+        let accepted = b"{\"schema\":\"sable-proof-ingress-result-v2\",\"accepted\":true}\n";
         parse_ingress_audit_output(&emitted, true, accepted, b"")
             .expect("the exact accepted result passes");
 
         for stdout in [
-            b"{\"schema\":\"sable-proof-ingress-result-v1\",\"accepted\":true}".as_slice(),
-            b"{\"schema\":\"sable-proof-ingress-result-v1\",\"accepted\":true}\r\n".as_slice(),
-            b"{\"schema\":\"sable-proof-ingress-result-v1\",\"accepted\":true,\"extra\":0}\n"
+            b"{\"schema\":\"sable-proof-ingress-result-v2\",\"accepted\":true}".as_slice(),
+            b"{\"schema\":\"sable-proof-ingress-result-v2\",\"accepted\":true}\r\n".as_slice(),
+            b"{\"schema\":\"sable-proof-ingress-result-v2\",\"accepted\":true,\"extra\":0}\n"
                 .as_slice(),
             b"ok\n".as_slice(),
         ] {
@@ -2826,7 +3320,7 @@ mod proof_build_tests {
         }
         assert!(parse_ingress_audit_output(&emitted, false, accepted, b"").is_err());
         assert!(parse_ingress_audit_output(&emitted, true, accepted, b"warning\n").is_err());
-        let forged_kind = b"{\"schema\":\"sable-proof-ingress-result-v1\",\"accepted\":false,\"failure_kind\":\"forged\",\"message\":\"accepted by loose parser\"}\n";
+        let forged_kind = b"{\"schema\":\"sable-proof-ingress-result-v2\",\"accepted\":false,\"failure_kind\":\"forged\",\"message\":\"accepted by loose parser\"}\n";
         assert!(parse_ingress_audit_output(&emitted, true, forged_kind, b"").is_err());
     }
 
@@ -2959,14 +3453,14 @@ mod proof_build_tests {
     #[test]
     fn ingress_auditor_rejection_maps_only_an_authenticated_fragment_index() {
         let emitted = emitted_with_ingress();
-        let rejection = b"{\"schema\":\"sable-proof-ingress-result-v1\",\"accepted\":false,\"failure_kind\":\"fragment\",\"message\":\"escaped parser boundary\",\"index\":1}\n";
+        let rejection = b"{\"schema\":\"sable-proof-ingress-result-v2\",\"accepted\":false,\"failure_kind\":\"fragment\",\"message\":\"escaped parser boundary\",\"index\":1}\n";
         let failure = parse_ingress_audit_output(&emitted, true, rejection, b"")
             .expect_err("fragment rejection fails closed");
         assert_eq!(failure.span, Span::new(7, 11));
         assert_eq!(failure.description, "second fragment");
         assert_eq!(failure.message, "escaped parser boundary");
 
-        let out_of_range = b"{\"schema\":\"sable-proof-ingress-result-v1\",\"accepted\":false,\"failure_kind\":\"fragment\",\"message\":\"forged\",\"index\":2}\n";
+        let out_of_range = b"{\"schema\":\"sable-proof-ingress-result-v2\",\"accepted\":false,\"failure_kind\":\"fragment\",\"message\":\"forged\",\"index\":2}\n";
         let failure = parse_ingress_audit_output(&emitted, true, out_of_range, b"")
             .expect_err("an out-of-range diagnostic index fails as transport evidence");
         assert_eq!(failure.span, Span::new(2, 3));

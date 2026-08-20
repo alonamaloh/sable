@@ -1685,7 +1685,8 @@ mod tests {
             &HashSet::new(),
             &[],
             &crate::lean::EmittedNames::default(),
-        );
+        )
+        .finish("SableGeneratedArgumentScheduleTest");
         let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .expect("compiler crate has a repository parent");
@@ -1839,7 +1840,8 @@ fn subject() -> u8 {
             &attempted_skip,
             &[],
             &crate::lean::EmittedNames::default(),
-        );
+        )
+        .finish("SableGeneratedArgumentScheduleTest");
         assert!(emitted.lean_source.contains(&theorem_name));
         assert!(emitted.lean_source.contains("by decide"));
 
