@@ -126,5 +126,22 @@ structural kills, with no survivors, invalid mutants, crashes, timeouts, or
 harness errors. This is evidence that the selected witnesses detect those
 specific edits; it is not a whole-compiler mutation score or a soundness
 percentage. The certificate-family additions postdate that immutable baseline
-and are not included in its counts. The elapsed time is retained for audit
-context only and is not a performance measurement.
+and are not included in its counts.
+
+[`baselines/dac25ed.json`](./baselines/dac25ed.json) records the expanded
+24-mutant run after the closed argument-schedule certificate and bounded Lean
+proof builder landed. Twelve mutants were semantic kills and eight were
+structural kills, including all four certificate-family mutants. Four checker
+mutants were honestly classified as `equivalent-or-survivor`: removing their
+early checker guard changed the diagnostic, but all seven focused must-fail
+witnesses remained rejected by the downstream closed Lean argument-schedule
+certificate. This is evidence of redundant detection for those witnesses, not
+evidence that the mutants are globally equivalent or sound. The baseline does
+not count them as kills. All four certificate-family mutants were separately
+challenged and failed structurally. There were no invalid mutants, crashes,
+timeouts, or harness errors. A separate process monitor observed at most two
+Lean compiler processes during the two-worker run, and the configured limit
+was never exceeded.
+
+Elapsed time and process observations are retained for audit context only and
+are not performance measurements.
