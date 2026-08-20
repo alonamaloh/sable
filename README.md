@@ -171,3 +171,7 @@ library. See
 - [`docs/ADVERSARIAL-REVIEW.md`](docs/ADVERSARIAL-REVIEW.md) — an evidence-first
   guide for external breakage attempts, exact reproducer commands, and honest
   reporting of proof/runtime findings.
+- [`tools/proof_timing/README.md`](tools/proof_timing/README.md) — the exact
+  release-only cold-roots/warm-artifacts protocol for comparable
+  verification-wall-time evidence, including cache, revision, and
+  subject-manifest checks.

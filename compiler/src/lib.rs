@@ -69,7 +69,17 @@ pub enum Outcome {
 #[derive(Debug, Clone)]
 pub struct VerifiedInfo {
     pub functions: usize,
+    /// Ordinary source obligations emitted in this module's generated Lean
+    /// document. This deliberately excludes compiler-authored certificates.
     pub obligations: usize,
+    /// Non-skippable symbolic-transition certificate theorems emitted in this
+    /// module's generated Lean document.
+    pub transition_certificates: usize,
+    /// Non-skippable argument-schedule certificate theorems emitted in this
+    /// module's generated Lean document.
+    pub argument_schedule_certificates: usize,
+    /// Exact byte length of this module's generated Lean document.
+    pub generated_lean_bytes: usize,
     /// `unsafe` regions in the checked file. Surfaced in build output
     /// because the count of places a reader must audit is a fact about
     /// the program, and burying it would defeat having a boundary
@@ -392,12 +402,33 @@ pub fn verify_file_structured(
     path: &Path,
     opts: &Options,
 ) -> (modules::ModuleSet, Result<VerifiedProgram, Vec<Diagnostic>>) {
+    verify_file_structured_inner(path, opts, true)
+}
+
+/// Verify a file with a fresh batch Lean process, never through the optional
+/// long-lived daemon.
+///
+/// This is primarily useful for reproducible instrumentation whose cache and
+/// process model must not depend on ambient daemon state. Production backends
+/// should normally use [`verify_file_structured`].
+pub fn verify_file_batch_structured(
+    path: &Path,
+    opts: &Options,
+) -> (modules::ModuleSet, Result<VerifiedProgram, Vec<Diagnostic>>) {
+    verify_file_structured_inner(path, opts, false)
+}
+
+fn verify_file_structured_inner(
+    path: &Path,
+    opts: &Options,
+    allow_daemon: bool,
+) -> (modules::ModuleSet, Result<VerifiedProgram, Vec<Diagnostic>>) {
     let (mods, prepared) = prepare_file_structured(path, opts);
     let (repo_root, prep) = match prepared {
         Ok(prepared) => prepared,
         Err(diags) => return (mods, Err(diags)),
     };
-    let result = verify_prepared(&repo_root, opts, &mods, prep);
+    let result = verify_prepared(&repo_root, opts, &mods, prep, allow_daemon);
     (mods, result)
 }
 
@@ -427,6 +458,55 @@ fn prepare_file_structured(
     (mods, prepared.map(|prep| (repo_root, prep)))
 }
 
+fn emitted_certificate_category_counts<'a>(
+    emitted: &std::collections::HashSet<String>,
+    transition_names: impl IntoIterator<Item = &'a str>,
+    argument_schedule_names: impl IntoIterator<Item = &'a str>,
+) -> (usize, usize) {
+    let mut occurrences = std::collections::HashMap::<&str, [usize; 2]>::new();
+    for name in transition_names {
+        if emitted.contains(name) {
+            let count = &mut occurrences.entry(name).or_default()[0];
+            *count = count
+                .checked_add(1)
+                .expect("transition-certificate category count fits usize");
+        }
+    }
+    for name in argument_schedule_names {
+        if emitted.contains(name) {
+            let count = &mut occurrences.entry(name).or_default()[1];
+            *count = count
+                .checked_add(1)
+                .expect("argument-schedule-certificate category count fits usize");
+        }
+    }
+
+    let mut transition_certificates = 0usize;
+    let mut argument_schedule_certificates = 0usize;
+    for name in emitted {
+        let [transition, argument_schedule] =
+            occurrences.get(name.as_str()).copied().unwrap_or_default();
+        assert_eq!(
+            transition
+                .checked_add(argument_schedule)
+                .expect("certificate-category occurrence count fits usize"),
+            1,
+            "emitted certificate `{name}` must occur exactly once across transition and argument-schedule categories (transition={transition}, argument_schedule={argument_schedule})"
+        );
+        if transition == 1 {
+            transition_certificates += 1;
+        } else {
+            argument_schedule_certificates += 1;
+        }
+    }
+    assert_eq!(
+        transition_certificates + argument_schedule_certificates,
+        emitted.len(),
+        "emitted certificate categories must be an exact disjoint partition"
+    );
+    (transition_certificates, argument_schedule_certificates)
+}
+
 fn verified_info(prep: &artifacts::Prepared, warnings: Vec<Diagnostic>) -> VerifiedInfo {
     let deferred: Vec<String> = prep.program.defers.iter().map(|d| d.name.clone()).collect();
     let assumed: Vec<(String, String)> = prep
@@ -437,6 +517,19 @@ fn verified_info(prep: &artifacts::Prepared, warnings: Vec<Diagnostic>) -> Verif
         .collect();
     let functions = prep.program.fns.len();
     let obligations = prep.emitted.names.thms.len();
+    let (transition_certificates, argument_schedule_certificates) =
+        emitted_certificate_category_counts(
+            &prep.emitted.names.certificates,
+            prep.vc
+                .transition_certificates
+                .iter()
+                .map(|certificate| certificate.thm_name.as_str()),
+            prep.vc
+                .argument_schedule_certificates
+                .iter()
+                .map(|certificate| certificate.thm_name.as_str()),
+        );
+    let generated_lean_bytes = prep.emitted.lean_source.len();
     let unsafe_regions = prep.unsafe_regions;
     let externs = prep.vc.trust.externs.clone();
     let machine_profiles = prep.vc.machine.profiles.clone();
@@ -445,6 +538,9 @@ fn verified_info(prep: &artifacts::Prepared, warnings: Vec<Diagnostic>) -> Verif
     VerifiedInfo {
         functions,
         obligations,
+        transition_certificates,
+        argument_schedule_certificates,
+        generated_lean_bytes,
         unsafe_regions,
         externs,
         machine_profiles,
@@ -460,6 +556,7 @@ fn verify_prepared(
     opts: &Options,
     mods: &modules::ModuleSet,
     mut prep: artifacts::Prepared,
+    allow_daemon: bool,
 ) -> Result<VerifiedProgram, Vec<Diagnostic>> {
     // Root documents are immutable and content-addressed. Concurrent checks
     // of the same basename or different source versions cannot overwrite the
@@ -469,18 +566,22 @@ fn verify_prepared(
         Err(message) => return Err(vec![io_diag("io.write", message)]),
     };
 
-    // Warm path: a running `sable daemon` keeps a Lean server alive and
-    // skips the per-check cold start. Any daemon problem falls back to
-    // the batch invocation, unchanged — including a daemon started
-    // before the generated-artifact directory was on its search path
-    // (its messages then report unknown modules).
-    let daemon_messages = daemon::try_check(
-        repo_root,
-        &lean_file,
-        &prep.proof_environment,
-        &prep.emitted.lean_source,
-    )
-    .filter(|ms| !ms.iter().any(|m| m.data.contains("unknown module")));
+    // When allowed, a running `sable daemon` keeps a Lean server alive and
+    // skips the per-check cold start. Any daemon problem falls back to the
+    // batch invocation, unchanged — including a daemon started before the
+    // generated-artifact directory was on its search path (its messages then
+    // report unknown modules). Instrumentation can disable this path exactly.
+    let daemon_messages = if allow_daemon {
+        daemon::try_check(
+            repo_root,
+            &lean_file,
+            &prep.proof_environment,
+            &prep.emitted.lean_source,
+        )
+        .filter(|ms| !ms.iter().any(|m| m.data.contains("unknown module")))
+    } else {
+        None
+    };
     let messages = match daemon_messages {
         Some(m) => m,
         None => match lean::run_lean(
@@ -521,5 +622,43 @@ fn verify_prepared(
         })
     } else {
         Err(diags)
+    }
+}
+
+#[cfg(test)]
+mod verified_info_tests {
+    use super::emitted_certificate_category_counts;
+    use std::collections::HashSet;
+
+    fn names(values: &[&str]) -> HashSet<String> {
+        values.iter().map(|value| (*value).to_owned()).collect()
+    }
+
+    #[test]
+    fn emitted_certificate_categories_are_an_exact_partition() {
+        let emitted = names(&["transition", "argument"]);
+        assert_eq!(
+            emitted_certificate_category_counts(
+                &emitted,
+                ["transition", "imported_transition"],
+                ["argument", "imported_argument"],
+            ),
+            (1, 1),
+            "imported category records are intentionally outside the root-emitted partition"
+        );
+
+        for (transition, argument) in [
+            (vec!["transition", "transition"], vec![]),
+            (vec!["transition"], vec!["transition"]),
+            (vec![], vec!["argument"]),
+        ] {
+            assert!(
+                std::panic::catch_unwind(|| {
+                    emitted_certificate_category_counts(&emitted, transition, argument)
+                })
+                .is_err(),
+                "duplicates, category overlap, and uncategorized emitted names must all fail closed"
+            );
+        }
     }
 }

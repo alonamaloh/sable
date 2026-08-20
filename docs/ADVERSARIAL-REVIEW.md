@@ -8,8 +8,11 @@ the claim made by that particular test over its admitted subset.
 The evidence this guide depends on is versioned: `4b4f93d` closes the latest
 known call-evaluation defects, `208a46a` adds the ownership interaction matrix,
 `a18ec36` records the incident ledger, `6450253` adds the curated mutation
-harness, and `2ad556d` records its first complete baseline. Use a full commit
-hash when reporting a new result.
+harness, `2ad556d` records its first complete baseline, `c9e81b1` adds closed
+argument-schedule certificates, `d7c3f90` adds their four focused mutations,
+`dac25ed` bounds proof-environment construction to one external Lean process,
+and `57451a5` expands the committed baseline to 24 curated mutations. Use a
+full commit hash when reporting a new result.
 
 ## What to attack
 
@@ -54,21 +57,30 @@ and `-O2`; the emitter, hosted runtime, and Clang are not kernel-verified.
 Foreign contracts and explicit assumptions are audited boundaries, not proved
 implementations, and change the reported verification status accordingly.
 
-The kernel-checked transition certificates are deliberately narrower still:
+The kernel-checked compiler certificates are deliberately narrower still.
+Transition certificates establish only these selected state updates:
 
 - explicit unique-borrow calls certify selected fresh-state write-back (and
   the recorded length relation for arrays);
 - local and direct-`self` slot take/put certify only the observed structural
   sequence update.
 
-They do not prove complete effect discovery, loan or move non-overlap,
-evaluation scheduling, index or snapshot provenance, incoming-owner
-provenance, loop havoc, general moves, cleanup, traps, or complete source
-translation. See [ADR 0087](decisions/0087-call-havoc-has-a-kernel-checked-transition-certificate.md),
+Closed argument-schedule certificates separately decide alias safety for the
+exact checker-recorded receiver-first, left-to-right argument effects at each
+admitted call or sealed boundary. They reject the four historical overlap
+shapes under focused checker weakening. They do not prove that the Rust
+extractor found every source effect or that its typed-AST/ownership-plan inputs
+have correct source provenance.
+
+Together these certificates still do not prove complete effect discovery,
+index or snapshot provenance, incoming-owner provenance, loop havoc, cleanup,
+traps, runtime execution, or complete source translation. See
+[ADR 0087](decisions/0087-call-havoc-has-a-kernel-checked-transition-certificate.md),
 [ADR 0090](decisions/0090-ownership-and-mutation-effects-have-one-checked-plan.md),
 [ADR 0092](decisions/0092-structured-control-is-sealed-without-claiming-an-expression-cfg.md),
-and [ADR 0093](decisions/0093-owner-slots-are-not-copy-arrays.md) for the exact
-boundaries.
+[ADR 0093](decisions/0093-owner-slots-are-not-copy-arrays.md), and
+[ADR 0094](decisions/0094-argument-schedules-have-a-closed-safety-certificate.md)
+for the exact boundaries.
 
 ## Minimized historical witnesses
 
@@ -103,7 +115,7 @@ pinned toolchain in `lean/lean-toolchain`, and Clang for native tests.
 Build the complete Lean prelude and formal machine definitions:
 
 ```sh
-(cd lean && lake -Kjobs=1 build)
+(cd lean && LEAN_NUM_THREADS=0 LEAN_IMPORT_WORKERS=1 lake --quiet build Sable)
 ```
 
 Run the pairwise ownership interaction oracles:
@@ -114,7 +126,8 @@ SABLE_TEST_JOBS=1 SABLE_LEAN_JOBS=1 \
   --test ownership_adversarial -- --test-threads=1
 ```
 
-Run all 20 curated trusted-semantics mutations against the committed `HEAD`:
+Run all 24 currently curated trusted-semantics and certificate mutations
+against the committed `HEAD`:
 
 ```sh
 python3 tools/soundness_mutations/runner.py --workers 2 \
@@ -122,11 +135,15 @@ python3 tools/soundness_mutations/runner.py --workers 2 \
 ```
 
 The runner archives the commit and excludes uncommitted files. To reproduce
-the recorded 16-semantic/4-structural-kill baseline exactly, add
-`--revision 6450253`. Interpret a survivor as an investigation request, not as
-evidence of safety; the manifest is curated and has no whole-compiler mutation
-score. See the [harness documentation](../tools/soundness_mutations/README.md)
-and [baseline](../tools/soundness_mutations/baselines/6450253.json).
+the first recorded 16-semantic/4-structural-kill baseline exactly, add
+`--revision 6450253`; its immutable report remains
+[here](../tools/soundness_mutations/baselines/6450253.json). To reproduce the
+expanded 24-mutant result, add `--revision dac25ed`: the corresponding
+[baseline](../tools/soundness_mutations/baselines/dac25ed.json) records 12
+semantic kills, 8 structural kills, and 4 focused downstream-caught survivors.
+Interpret any survivor as an investigation request, not as evidence of safety;
+the manifest is curated and has no whole-compiler mutation score. See the
+[harness documentation](../tools/soundness_mutations/README.md).
 
 Run the complete positive, must-fail, dynamic, and dynamic-fail corpus:
 
@@ -155,22 +172,17 @@ SABLE_REQUIRE_CLANG=1 SABLE_TEST_JOBS=1 SABLE_LEAN_JOBS=1 \
 ```
 
 Proof timing is release instrumentation, not a deterministic correctness or
-performance gate. Prepare the stated cache condition yourself, use a clean
-worktree, and give the machine a stable honest label:
-
-```sh
-SABLE_TEST_JOBS=1 SABLE_LEAN_JOBS=1 \
-SABLE_PROOF_TIMING_CACHE_MODE=warm-artifacts \
-SABLE_PROOF_TIMING_MACHINE="$(hostname)-external-review" \
-SABLE_PROOF_TIMING_OUT=/tmp/sable-proof-timing.json \
-  cargo test --locked --manifest-path compiler/Cargo.toml \
-  --test proof_timing -- --ignored --nocapture --test-threads=1
-```
-
-Use `cold-roots` instead of `warm-artifacts` only after honestly preparing that
-state. Keep the resolved machine label stable across a series. The runner
-records the full revision, toolchains, machine label, cache label, per-subject
-timings, and aggregate statistics.
+performance gate. Follow the exact
+[proof-timing v2 protocol](../tools/proof_timing/README.md): a baseline requires
+`cargo test --release`, one exact clean revision at both ends, a prebuilt
+immutable proof environment, no daemon, `LEAN_NUM_THREADS=0`, a single import
+worker, a content-authenticated 126-subject manifest with zero
+warnings/defers/assumes, and a prescribed cold-roots then warm-artifacts pair
+with no intervening state change. The runner authenticates the selected cold
+report bytes, matching proof-build identity, and equivalent path/type/size
+cache metadata; it cannot prove temporal adjacency, unique physical cache
+lineage, or cache-content identity. An explicitly opted-in debug or dirty
+experiment is labeled `smoke_custom`, never `baseline`.
 
 ## Report a finding
 
