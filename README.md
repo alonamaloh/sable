@@ -92,7 +92,7 @@ requires Clang.
 # from the repository root
 export LEAN_NUM_THREADS=0 LEAN_IMPORT_WORKERS=1
 test ! -e .sable-out/daemon.sock && test ! -L .sable-out/daemon.sock
-(cd lean && lake --quiet build Sable sable-proof-audit)
+(cd lean && lake --quiet build Sable sable-proof-audit sable-declaration-audit)
 CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 \
   cargo build --locked --release -j1 --manifest-path compiler/Cargo.toml
 compiler/target/release/sable doctor

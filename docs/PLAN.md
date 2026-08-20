@@ -53,6 +53,14 @@ submitted to Lean. Proof-policy identity is exact in published environments,
 artifacts, and stamps; proof-environment READY additionally binds the exact
 sorted local `.olean` set and parser-auditor executable by SHA-256.
 
+A second READY-bound executable now has a strict, source-side transport for an
+observational `Lean.readModuleData` inventory (module/import flags, parallel
+constant names and kinds/safety, code-generation names, and raw extension
+family counts). It is deliberately dormant in verification: no candidate is
+imported or replayed, no manifest is written, and this inventory grants no
+cache authority or stronger assurance. It is scaffolding for the compiled
+declaration-envelope audit, not that audit itself.
+
 No current path can emit `fully verified`. Lean's declaration-level warning
 remains fatal even when a syntactically permitted theorem locally suppresses
 `warn.sorry`, but source confinement does not authenticate the compiled

@@ -132,12 +132,14 @@ This is a cold generated-artifact start, not a cold operating-system page
 cache and not a Lean-prelude build measurement. Imported artifacts become warm
 as the lexicographically ordered series progresses. The runner records and
 compares a proof-build identity at both ends: `READY`, the exact sorted local
-`.olean` set, and the proof-ingress auditor executable, with content SHA-256,
-size, and mtime for each and device/inode on Unix. `Sable.olean` remains
-separately named in the JSON for compatibility but is also a member of that
-complete set. A changed identity invalidates the series so a same-source-id
-proof-environment rebuild or trusted-output mutation cannot be silently
-included in measured verification time.
+`.olean` set, the proof-ingress auditor executable, and the READY-bound
+observational declaration-inventory executable, with content SHA-256, size,
+and mtime for each and device/inode on Unix. `Sable.olean` remains separately
+named in the JSON for compatibility but is also a member of that complete set.
+The declaration inventory is dormant provenance in v3 and is not part of the
+per-document measured workload. A changed identity invalidates the series so a
+same-source-id proof-environment rebuild or proof-output mutation cannot be
+silently included in measured verification time.
 
 For the prescribed paired procedure, `warm-artifacts` means:
 
@@ -292,7 +294,7 @@ The v3 document records:
 - start/end nanosecond timestamps;
 - exact start/end Git revisions, cleanliness, and porcelain status;
 - the sorted subject content manifest and per-file SHA-256;
-- immutable proof-environment, full local proof-output/auditor build,
+- immutable proof-environment, full local proof-output/auditor/inventory build,
   root-artifact, test-executable, Cargo lockfile, and protocol-source
   identities;
 - machine label, host, kernel, architecture, CPU model, logical CPUs, Rust,

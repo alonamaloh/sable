@@ -126,7 +126,7 @@ Build the complete Lean prelude and formal machine definitions:
 
 ```sh
 (cd lean && LEAN_NUM_THREADS=0 LEAN_IMPORT_WORKERS=1 \
-  lake --quiet build Sable sable-proof-audit)
+  lake --quiet build Sable sable-proof-audit sable-declaration-audit)
 ```
 
 Run the pairwise ownership interaction oracles:
