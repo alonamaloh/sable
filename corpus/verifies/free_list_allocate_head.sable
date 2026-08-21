@@ -119,8 +119,7 @@ pub fn free_list_allocate_head(raw<u8> base,
 /// discharge free_list_allocate_head.free_header.init by
 ///   rw [h_header6_header]
 ///   simp [Sable.FreeBlockView.toHeader, Sable.PointsToView.names,
-///     h_fact_sable_rawptr_add_base_ol, Sable.freeHeaderBytes,
-///     Sable.u64.layout]
+///     Sable.freeHeaderBytes, Sable.u64.layout]
 ///   refine ⟨⟨h_fact_sable_rawptr_add_base_ol.1,
 ///       h_fact_sable_rawptr_add_base_ol.2.1⟩,
 ///     h_fact_sable_rawptr_add_base_ol.1.symm,

@@ -404,7 +404,7 @@ fn demo() {
 ///   · rw [if_pos rfl]
 
 /// discharge HashMap::insert.post.result_i_0_i_i_self_occ_len_self_occ_get.2 by
-///   simp only [Sable.Seq.len_set, Sable.Seq.get_set]
+///   simp only [Sable.Seq.get_set]
 ///   intro _
 ///   refine ⟨p, h_p_range.1, by omega, ?_, ?_, ?_⟩
 ///   · have h01 := h_inv_i_0_i_i_cap_self_occ_get_2 p h_p_range.1 h_probe_step_post_result_cap
@@ -417,7 +417,7 @@ fn demo() {
 ///   exact (h_result.mp h).elim
 
 /// discharge HashMap::insert.post.i_0_i_i_self_occ_len_old_self_occ_get_i.2 by
-///   simp only [Sable.Seq.len_set, Sable.Seq.get_set]
+///   simp only [Sable.Seq.get_set]
 ///   intro i hi0 hic hold
 ///   have hfr := h_inv_i_0_i_i_cap_self_occ_get i hi0 (by omega)
 ///   refine ⟨?_, ?_, ?_⟩

@@ -75,7 +75,7 @@ pub fn quicksort(&mut [i32] a) {
 ///     exact h_path_a_get_j_old_a_get_hi_1
 ///   · by_cases hki : k = i
 ///     · have hij : ¬ i = j := by omega
-///       simp [Sable.Seq.get_set, hki, hkj, hij]
+///       simp [Sable.Seq.get_set, hki, hij]
 ///       exact h_path_a_get_j_old_a_get_hi_1
 ///     · simp [Sable.Seq.get_set, hki, hkj]
 ///       exact h_inv_k_lo_k_k_i_a_get_k_pivot k hk0 (by omega)

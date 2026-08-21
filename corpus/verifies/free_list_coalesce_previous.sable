@@ -276,8 +276,7 @@ pub fn free_list_coalesce_previous(raw<u8> base,
 ///     rw [hleft, hright]
 ///   rw [h_header8_header]
 ///   simp [Sable.FreeBlockView.toHeader, Sable.PointsToView.names,
-///     h_fact_sable_rawptr_add_base_pr, Sable.freeHeaderBytes,
-///     Sable.u64.layout]
+///     Sable.freeHeaderBytes, Sable.u64.layout]
 ///   refine ⟨⟨h_fact_sable_rawptr_add_base_pr.1,
 ///       h_fact_sable_rawptr_add_base_pr.2.1⟩,
 ///     h_fact_sable_rawptr_add_base_pr.1.symm,

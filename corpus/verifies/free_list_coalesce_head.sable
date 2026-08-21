@@ -232,8 +232,7 @@ pub fn free_list_coalesce_head(raw<u8> base,
 ///     rw [h_pre_size, hright]
 ///   rw [h_header9_header]
 ///   simp [Sable.FreeBlockView.toHeader, Sable.PointsToView.names,
-///     h_fact_sable_rawptr_add_base_ke, Sable.freeHeaderBytes,
-///     Sable.u64.layout]
+///     Sable.freeHeaderBytes, Sable.u64.layout]
 ///   refine ⟨⟨h_fact_sable_rawptr_add_base_ke.1,
 ///       h_fact_sable_rawptr_add_base_ke.2.1⟩,
 ///     h_fact_sable_rawptr_add_base_ke.1.symm,
