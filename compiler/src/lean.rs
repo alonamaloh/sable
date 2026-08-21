@@ -5395,6 +5395,66 @@ mod proof_build_tests {
         (envelope, inventory)
     }
 
+    fn representative_declaration_canary_emitted(module_name: &str) -> Emitted {
+        let mut vc = empty_vc();
+        vc.classes.push(crate::vcgen::ClassEmit {
+            name: "DeclarationInventoryCanary".into(),
+            fields: vec![
+                ("data".into(), "Nat".into()),
+                ("proof".into(), "data = data".into()),
+            ],
+            span: Span::new(2, 40),
+        });
+        vc.ghosts = vec![
+            crate::ast::GhostItem {
+                keyword: "def",
+                unfold: false,
+                fact: false,
+                text: "successor (x : Nat) : Nat := x + 1".into(),
+                span: Span::new(41, 80),
+            },
+            crate::ast::GhostItem {
+                keyword: "def",
+                unfold: false,
+                fact: false,
+                text: "countdown (n : Nat) : Nat := if n = 0 then 0 else countdown (n - 1)\ntermination_by n\ndecreasing_by omega".into(),
+                span: Span::new(81, 180),
+            },
+            crate::ast::GhostItem {
+                keyword: "theorem",
+                unfold: true,
+                fact: true,
+                text: "useful' (x : Nat) : x = x := rfl".into(),
+                span: Span::new(181, 230),
+            },
+        ];
+
+        // A generated dependency would require preparing and authenticating a
+        // second artifact under its own lifecycle. This focused canary keeps
+        // that future integration separate and exercises the normal captured
+        // `Sable` import only.
+        emit(
+            &vc,
+            &[],
+            &std::collections::HashSet::new(),
+            &[],
+            &EmittedNames::default(),
+        )
+        .finish(module_name)
+    }
+
+    fn explicit_preflight_match<'a>(
+        preflight: &'a DeclarationInventoryPreflight,
+        name: &str,
+    ) -> &'a DeclarationInventoryExplicitMatch {
+        let structural_name = preflight_name(name);
+        preflight
+            .explicit_matches
+            .iter()
+            .find(|matched| matched.name == structural_name)
+            .unwrap_or_else(|| panic!("missing explicit preflight match `{name}`"))
+    }
+
     #[test]
     fn declaration_audit_subject_has_one_exact_ordered_serialization() {
         let subject = DeclarationAuditSubject::new(
@@ -6682,6 +6742,110 @@ mod proof_build_tests {
     }
 
     #[test]
+    fn representative_declaration_canary_is_production_emitted_and_feature_complete() {
+        let module_name = "SableGeneratedDeclarationObservationCanary";
+        let emitted = representative_declaration_canary_emitted(module_name);
+        let imports = emitted
+            .lean_source
+            .lines()
+            .filter(|line| line.starts_with("import "))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            imports,
+            vec!["import Sable"],
+            "generated dependency lifecycle is deferred; this canary covers the normal Sable import"
+        );
+        assert!(emitted.lean_source.contains(concat!(
+            "structure SableC_DeclarationInventoryCanary where\n",
+            "  data : Nat\n",
+            "  proof : data = data\n"
+        )));
+        assert!(
+            emitted
+                .lean_source
+                .contains("@[simp] noncomputable def successor (x : Nat) : Nat := x + 1")
+        );
+        assert!(
+            emitted
+                .lean_source
+                .contains("noncomputable def countdown (n : Nat)")
+        );
+        assert!(emitted.lean_source.contains("termination_by n"));
+        assert!(emitted.lean_source.contains("decreasing_by omega"));
+        assert!(
+            emitted
+                .lean_source
+                .contains("@[simp] @[sable_fact] theorem useful' (x : Nat) : x = x := rfl")
+        );
+
+        assert_eq!(emitted.declaration_envelope.roots.len(), 5);
+        assert_eq!(
+            emitted.declaration_envelope.roots[0],
+            ExpectedDeclarationRoot {
+                name: "SableC_DeclarationInventoryCanary".into(),
+                kind: ExpectedDeclarationKind::Structure {
+                    fields: vec![
+                        "SableC_DeclarationInventoryCanary.data".into(),
+                        "SableC_DeclarationInventoryCanary.proof".into(),
+                    ],
+                },
+            }
+        );
+        assert_eq!(
+            emitted.declaration_envelope.roots[1],
+            ExpectedDeclarationRoot {
+                name: "successor".into(),
+                kind: ExpectedDeclarationKind::Definition {
+                    recursive: false,
+                    noncomputable: true,
+                    simp: true,
+                },
+            }
+        );
+        assert_eq!(
+            emitted.declaration_envelope.roots[2],
+            ExpectedDeclarationRoot {
+                name: "countdown".into(),
+                kind: ExpectedDeclarationKind::Definition {
+                    recursive: true,
+                    noncomputable: true,
+                    simp: false,
+                },
+            }
+        );
+        assert_eq!(
+            emitted.declaration_envelope.roots[3],
+            ExpectedDeclarationRoot {
+                name: "useful'".into(),
+                kind: ExpectedDeclarationKind::Theorem {
+                    simp: true,
+                    sable_fact: true,
+                },
+            }
+        );
+        assert!(matches!(
+            &emitted.declaration_envelope.roots[4].kind,
+            ExpectedDeclarationKind::TerminalSentinel
+        ));
+        assert_eq!(
+            emitted
+                .ingress
+                .iter()
+                .filter(|fragment| fragment.category == "term")
+                .count(),
+            2
+        );
+        assert_eq!(
+            emitted
+                .ingress
+                .iter()
+                .filter(|fragment| fragment.category == "command")
+                .count(),
+            3
+        );
+    }
+
+    #[test]
     #[ignore = "end-to-end canary; explicitly runs the pinned proof build, ingress auditor, Lean compiler, and declaration inventory"]
     fn declaration_compile_and_observe_cross_language_canary() {
         assert_eq!(
@@ -6697,7 +6861,7 @@ mod proof_build_tests {
         let environment =
             ProofEnvironment::capture(&repo_root).expect("capture exact proof environment");
         let module_name = "SableGeneratedDeclarationObservationCanary";
-        let emitted = draft_with_source("import Sable\n\n").finish(module_name);
+        let emitted = representative_declaration_canary_emitted(module_name);
         let subject = DeclarationAuditSubject::new(
             environment.id(),
             environment.policy(),
@@ -6767,15 +6931,125 @@ mod proof_build_tests {
         assert!(observation.declaration.observational);
         assert!(!observation.declaration.authoritative);
         assert_eq!(observation.declaration.expected_module_name, module_name);
-        assert!(observation.declaration.inventory.observational);
-        assert!(!observation.declaration.inventory.is_module);
-        assert!(observation.inventory_preflight.observational);
-        assert!(!observation.inventory_preflight.authoritative);
-        assert_eq!(observation.inventory_preflight.explicit_matches.len(), 1);
+        let inventory = &observation.declaration.inventory;
+        let preflight = &observation.inventory_preflight;
+        assert!(inventory.observational);
+        assert!(
+            !inventory.is_module,
+            "representative candidate remains a traditional non-module-system artifact"
+        );
+        assert!(
+            inventory.extra_const_names.is_empty(),
+            "representative generated proof code has no code-generation extras"
+        );
+        assert!(
+            inventory
+                .imports
+                .iter()
+                .any(|import| import.module == preflight_name("Sable"))
+        );
+        for (slot_index, slot) in inventory.constants.iter().enumerate() {
+            assert_eq!(
+                &slot.const_name, &slot.info_name,
+                "candidate constant slot {slot_index} keeps parallel names paired"
+            );
+            assert_eq!(
+                slot.safety,
+                Some(ObservedConstantSafety::Safe),
+                "candidate constant slot {slot_index} has no unsafe/partial declaration"
+            );
+            assert_ne!(
+                slot.kind,
+                Some(ObservedConstantKind::Axiom),
+                "candidate constant slot {slot_index} is not an axiom"
+            );
+        }
+
+        assert!(preflight.observational);
+        assert!(!preflight.authoritative);
+        assert_eq!(preflight.explicit_matches.len(), 7);
+        let structure = explicit_preflight_match(preflight, "SableC_DeclarationInventoryCanary");
         assert!(matches!(
-            &observation.inventory_preflight.explicit_matches[0].role,
-            DeclarationInventoryExplicitRole::TerminalSentinel { root_index: 0 }
+            &structure.role,
+            DeclarationInventoryExplicitRole::StructureRoot { root_index: 0 }
         ));
+        assert_eq!(structure.kind, ObservedConstantKind::Inductive);
+        let data = explicit_preflight_match(preflight, "SableC_DeclarationInventoryCanary.data");
+        assert!(matches!(
+            &data.role,
+            DeclarationInventoryExplicitRole::StructureField {
+                root_index: 0,
+                field_index: 0,
+            }
+        ));
+        assert_eq!(data.kind, ObservedConstantKind::Definition);
+        let proof = explicit_preflight_match(preflight, "SableC_DeclarationInventoryCanary.proof");
+        assert!(matches!(
+            &proof.role,
+            DeclarationInventoryExplicitRole::StructureField {
+                root_index: 0,
+                field_index: 1,
+            }
+        ));
+        assert_eq!(
+            proof.kind,
+            ObservedConstantKind::Theorem,
+            "the dependent Prop projection is represented as a theorem"
+        );
+        let successor = explicit_preflight_match(preflight, "successor");
+        assert!(matches!(
+            &successor.role,
+            DeclarationInventoryExplicitRole::DefinitionRoot { root_index: 1 }
+        ));
+        assert_eq!(successor.kind, ObservedConstantKind::Definition);
+        let countdown = explicit_preflight_match(preflight, "countdown");
+        assert!(matches!(
+            &countdown.role,
+            DeclarationInventoryExplicitRole::DefinitionRoot { root_index: 2 }
+        ));
+        assert_eq!(countdown.kind, ObservedConstantKind::Definition);
+        let useful = explicit_preflight_match(preflight, "useful'");
+        assert!(matches!(
+            &useful.role,
+            DeclarationInventoryExplicitRole::TheoremRoot { root_index: 3 }
+        ));
+        assert_eq!(useful.kind, ObservedConstantKind::Theorem);
+        let sentinel_name = &emitted
+            .declaration_envelope
+            .roots
+            .last()
+            .expect("representative emitter appends its sentinel")
+            .name;
+        let sentinel = explicit_preflight_match(preflight, sentinel_name);
+        assert!(matches!(
+            &sentinel.role,
+            DeclarationInventoryExplicitRole::TerminalSentinel { root_index: 4 }
+        ));
+        assert_eq!(sentinel.kind, ObservedConstantKind::Theorem);
+
+        assert!(
+            !preflight.unclassified_constants.is_empty(),
+            "the representative inventory retains at least one candidate constant outside the explicit envelope"
+        );
+        assert!(
+            preflight
+                .unclassified_constants
+                .windows(2)
+                .all(|window| window[0].slot_index < window[1].slot_index),
+            "unclassified constants retain ModuleData slot order"
+        );
+        eprintln!(
+            "representative declaration imports: {:#?}",
+            inventory.imports
+        );
+        eprintln!(
+            "representative declaration extension families: {:#?}",
+            inventory.extension_families
+        );
+        eprintln!(
+            "representative unclassified constants in ModuleData slot order: {:#?}",
+            preflight.unclassified_constants
+        );
     }
 
     #[test]
