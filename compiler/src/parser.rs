@@ -794,7 +794,7 @@ pub fn parse_module(
             continue;
         }
         for clause in &block.clauses {
-            validate_clause_label(clause)?;
+            validate_proof_clause(clause)?;
             match clause.kind {
                 ClauseKind::Discharge => discharges.push(parse_discharge(clause)?),
                 ClauseKind::Defer => defers.push(parse_defer(clause)?),
@@ -862,9 +862,10 @@ fn obligation_name(text: &str) -> (String, &str) {
     (name, rest)
 }
 
-/// A contract clause whose text still starts with `#[` carried a
-/// malformed label (well-formed ones are stripped by the scanner).
-pub fn validate_clause_label(clause: &Clause) -> PResult<()> {
+/// Apply scanner-metadata validation at every proof-clause intake site.
+/// Contract text that still starts with `#[` carried a malformed label;
+/// well-formed attributes admitted for the clause's kind were stripped.
+pub fn validate_proof_clause(clause: &Clause) -> PResult<()> {
     if matches!(
         clause.kind,
         ClauseKind::Pre
@@ -879,6 +880,23 @@ pub fn validate_clause_label(clause: &Clause) -> PResult<()> {
             title: "malformed `#[label(...)]`".into(),
             span: clause.span,
             label: "expected `#[label(name)]` with an identifier name".into(),
+            notes: vec![],
+        });
+    }
+    validate_ghost_attributes(clause)
+}
+
+/// The scanner strips only attributes admitted for a ghost item's kind.
+/// Diagnose the one known well-formed-but-misplaced attribute in Sable's
+/// front end instead of asking the trusted ingress gate to classify invalid
+/// Lean declaration syntax.
+fn validate_ghost_attributes(clause: &Clause) -> PResult<()> {
+    if clause.kind == ClauseKind::GhostDef && clause.text.starts_with("#[fact]") {
+        return Err(Diagnostic {
+            name: "proof.clause_syntax".into(),
+            title: "`#[fact]` does not apply to a ghost definition".into(),
+            span: clause.span,
+            label: "`#[fact]` marks ghost theorems only".into(),
             notes: vec![],
         });
     }
@@ -2490,7 +2508,7 @@ impl<'a> Parser<'a> {
             }
             self.consumed[bi] = true;
             for clause in &block.clauses {
-                validate_clause_label(clause)?;
+                validate_proof_clause(clause)?;
                 if clause.kind == ClauseKind::Invariant {
                     invariants.push(clause.clone());
                 } else {
@@ -2627,7 +2645,7 @@ impl<'a> Parser<'a> {
     fn attach_member_contract(&mut self, item_line: usize, f: &mut Fn, what: &str) -> PResult<()> {
         if let Some(block) = self.take_block_ending_before(item_line) {
             for clause in &block.clauses {
-                validate_clause_label(clause)?;
+                validate_proof_clause(clause)?;
                 match clause.kind {
                     ClauseKind::Pre => f.pres.push(clause.clone()),
                     ClauseKind::Post => f.posts.push(clause.clone()),
@@ -3056,7 +3074,7 @@ impl<'a> Parser<'a> {
         // Contract block above `fn`.
         if let Some(block) = self.take_block_ending_before(fn_line) {
             for clause in &block.clauses {
-                validate_clause_label(clause)?;
+                validate_proof_clause(clause)?;
                 match clause.kind {
                     ClauseKind::Pre => f.pres.push(clause.clone()),
                     ClauseKind::Post => f.posts.push(clause.clone()),
@@ -3110,7 +3128,7 @@ impl<'a> Parser<'a> {
         }
         if let Some(block) = self.take_block_ending_before(brace_line) {
             for clause in &block.clauses {
-                validate_clause_label(clause)?;
+                validate_proof_clause(clause)?;
                 match clause.kind {
                     ClauseKind::Variant => set_fn_variant(&mut f, clause)?,
                     other => {
@@ -3183,7 +3201,7 @@ impl<'a> Parser<'a> {
             };
             if let Some(block) = self.take_block_ending_before(item_line) {
                 for clause in &block.clauses {
-                    validate_clause_label(clause)?;
+                    validate_proof_clause(clause)?;
                     match clause.kind {
                         ClauseKind::Pre => f.pres.push(clause.clone()),
                         ClauseKind::Post => f.posts.push(clause.clone()),
@@ -3243,7 +3261,7 @@ impl<'a> Parser<'a> {
             };
             if let Some(block) = self.take_block_ending_before(item_line) {
                 for clause in &block.clauses {
-                    validate_clause_label(clause)?;
+                    validate_proof_clause(clause)?;
                     match clause.kind {
                         ClauseKind::GhostDef => ghosts.push(GhostItem {
                             keyword: "def",
@@ -3296,7 +3314,7 @@ impl<'a> Parser<'a> {
             }
             self.consumed[bi] = true;
             for clause in &block.clauses {
-                validate_clause_label(clause)?;
+                validate_proof_clause(clause)?;
                 if clause.kind == ClauseKind::GhostDef {
                     ghosts.push(GhostItem {
                         keyword: "def",
@@ -3364,7 +3382,7 @@ impl<'a> Parser<'a> {
         let line = self.peek_line();
         if let Some(block) = self.take_block_ending_before(line) {
             for clause in &block.clauses {
-                validate_clause_label(clause)?;
+                validate_proof_clause(clause)?;
                 match clause.kind {
                     ClauseKind::Assert => stmts.push(Stmt::Assert(clause.clone())),
                     other => {
@@ -3393,7 +3411,7 @@ impl<'a> Parser<'a> {
         let mut user_invariants = Vec::new();
         if let Some(block) = self.take_block_ending_before(for_line) {
             for clause in &block.clauses {
-                validate_clause_label(clause)?;
+                validate_proof_clause(clause)?;
                 match clause.kind {
                     ClauseKind::Invariant => user_invariants.push(clause.clone()),
                     ClauseKind::Variant => {
@@ -4007,7 +4025,7 @@ impl<'a> Parser<'a> {
         let mut variant = None;
         if let Some(block) = self.take_block_ending_before(while_line) {
             for clause in &block.clauses {
-                validate_clause_label(clause)?;
+                validate_proof_clause(clause)?;
                 match clause.kind {
                     ClauseKind::Invariant => invariants.push(clause.clone()),
                     ClauseKind::Assert => asserts.push(Stmt::Assert(clause.clone())),
@@ -5304,6 +5322,69 @@ fn expr_vars(e: &Expr, out: &mut std::collections::HashSet<String>) {
             out.insert(array.clone());
         }
         ExprKind::IntLit(_) | ExprKind::BoolLit(_) | ExprKind::NoneE => {}
+    }
+}
+
+#[cfg(test)]
+mod proof_clause_tests {
+    use super::*;
+
+    fn parse_source(source: &str) -> PResult<Program> {
+        let scanned = crate::scan::scan(source);
+        let tokens = crate::lexer::lex(&scanned.program_text).unwrap();
+        let lines = LineMap::new(source);
+        parse(&tokens, &scanned.blocks, &lines, &scanned.program_text)
+    }
+
+    #[test]
+    fn fact_attribute_on_a_ghost_definition_is_clause_syntax() {
+        let source = "/// def #[fact] shadow (n : Int) : Int := n + 1\n\nfn f() {}\n";
+        let attribute = source.find("#[fact]").expect("fixture contains attribute");
+        let diagnostic = parse_source(source).expect_err("`#[fact]` is theorem-only");
+
+        assert_eq!(diagnostic.name, "proof.clause_syntax");
+        assert_eq!(
+            diagnostic.title,
+            "`#[fact]` does not apply to a ghost definition"
+        );
+        assert_eq!(diagnostic.span.start, attribute);
+        assert!(diagnostic.span.end > diagnostic.span.start);
+    }
+
+    #[test]
+    fn fact_attribute_on_a_ghost_theorem_remains_admitted() {
+        let source = "/// theorem #[fact] reflexive (n : Int) : n = n := rfl\n\nfn f() {}\n";
+        let program = parse_source(source).expect("the theorem fact attribute is admitted");
+
+        assert_eq!(program.ghosts.len(), 1);
+        assert_eq!(program.ghosts[0].keyword, "theorem");
+        assert!(program.ghosts[0].fact);
+        assert_eq!(program.ghosts[0].text, "reflexive (n : Int) : n = n := rfl");
+    }
+
+    #[test]
+    fn fact_attribute_on_impl_ghost_definitions_is_always_clause_syntax() {
+        let attached = "trait Value { fn value(Self x) -> u64; }\n\
+                        impl Value for u64 {\n\
+                          /// def #[fact] value (x : Int) : Int := x\n\
+                          fn value(u64 x) -> u64 { return x; }\n\
+                        }\n";
+        let free = "trait Value { fn value(Self x) -> u64; }\n\
+                    impl Value for u64 {\n\
+                      fn value(u64 x) -> u64 { return x; }\n\
+\n\
+                      /// def #[fact] helper (x : Int) : Int := x\n\
+                    }\n";
+
+        for (context, source) in [("attached", attached), ("free", free)] {
+            let diagnostic =
+                parse_source(source).expect_err("`#[fact]` stays theorem-only inside an impl");
+            assert_eq!(diagnostic.name, "proof.clause_syntax", "{context}");
+            assert_eq!(
+                diagnostic.title, "`#[fact]` does not apply to a ghost definition",
+                "{context}"
+            );
+        }
     }
 }
 

@@ -4,7 +4,7 @@ import Sable
 open Lean
 
 private def requestSchema := "sable-proof-ingress-request-v2"
-private def resultSchema := "sable-proof-ingress-result-v2"
+private def resultSchema := "sable-proof-ingress-result-v3"
 
 private structure Fragment where
   category : String
@@ -51,10 +51,29 @@ private def rejectExecutableElaborationSyntax (stx : Syntax) : Except String Uni
     if child.isOfKind ``Parser.Tactic.runTac then
       throw "`run_tac` is not permitted in generated proof fragments"
 
-private def validateCommand
+private inductive FragmentFailure where
+  | parseError (message : String)
+  | confinement (message : String)
+
+private def parseExactCategory
     (environment : Environment)
+    (category : Name)
+    (input : String) : Except FragmentFailure Syntax :=
+  match Parser.runParserCategory environment category input with
+  | .ok stx => return stx
+  | .error message =>
+      -- `runParserCategory` consumes EOF. Under pinned Lean 4.32.2 its
+      -- valid-prefix/trailing-token branch has this exact terminal message.
+      -- This distinction only routes the rejection's source diagnostic; both
+      -- cases fail closed and no candidate source reaches elaboration.
+      if message.endsWith "expected end of input" then
+        throw (.confinement message)
+      else
+        throw (.parseError message)
+
+private def validateCommand
+    (stx : Syntax)
     (fragment : Fragment) : Except String Unit := do
-  let stx ← Parser.runParserCategory environment `command fragment.text
   rejectExecutableElaborationSyntax stx
   unless stx.isOfKind ``Parser.Command.declaration do
     throw s!"expected one declaration command, got syntax kind '{stx.getKind}'"
@@ -72,12 +91,20 @@ private def validateCommand
   let (actualName, _) := Elab.expandDeclIdCore declaration[1]
   unless actualName.toString == fragment.expectedName do
     throw s!"expected declaration '{fragment.expectedName}', got '{actualName}'"
-  unless declaration[3].isOfKind ``Parser.Command.declValSimple do
-    throw "ghost declarations must use one simple `:=` value"
-  -- Termination/decreasing suffixes remain available for recursive ghost
-  -- definitions, but nested `where` declarations could manufacture siblings.
-  unless declaration[3][3].isNone do
-    throw "ghost declarations may not contain `where` declarations"
+  let declarationValue := declaration[3]
+  if declarationValue.isOfKind ``Parser.Command.declValSimple then
+    -- Termination/decreasing suffixes remain available for recursive ghost
+    -- definitions, but nested `where` declarations could manufacture siblings.
+    unless declarationValue[3].isNone do
+      throw "ghost declarations may not contain `where` declarations"
+  else if fragment.expectedKind == "definition" &&
+      declarationValue.isOfKind ``Parser.Command.declValEqns then
+    -- Equation clauses are still one value of the exact outer definition.
+    -- Their optional `where` block can manufacture siblings and stays closed.
+    unless declarationValue[0][2].isNone do
+      throw "ghost declarations may not contain `where` declarations"
+  else
+    throw "ghost declarations must use one simple `:=` value, or definitions may use equation clauses"
   -- A source-authored `deriving` clause can manufacture sibling declarations.
   -- Sable ghost definitions do not expose that feature; any auxiliaries must
   -- instead be attributable to elaborating the one confined declaration.
@@ -86,16 +113,22 @@ private def validateCommand
 
 private def validateFragment
     (environment : Environment)
-    (fragment : Fragment) : Except String Unit := do
+    (fragment : Fragment) : Except FragmentFailure Unit := do
   match fragment.category with
-  | "command" => validateCommand environment fragment
+  | "command" =>
+      let stx ← parseExactCategory environment `command fragment.text
+      match validateCommand stx fragment with
+      | .ok _ => pure ()
+      | .error message => throw (.confinement message)
   | "term" =>
       unless fragment.expectedKind.isEmpty && fragment.expectedName.isEmpty &&
           fragment.expectedModifiers.isEmpty do
-        throw "term fragments must not carry declaration expectations"
-      let stx ← Parser.runParserCategory environment `term fragment.text
-      rejectExecutableElaborationSyntax stx
-  | other => throw s!"unsupported fragment category '{other}'"
+        throw (.confinement "term fragments must not carry declaration expectations")
+      let stx ← parseExactCategory environment `term fragment.text
+      match rejectExecutableElaborationSyntax stx with
+      | .ok _ => pure ()
+      | .error message => throw (.confinement message)
+  | other => throw (.confinement s!"unsupported fragment category '{other}'")
 
 private def accepted : Json := Json.mkObj [
   ("schema", Json.str resultSchema),
@@ -140,13 +173,16 @@ private unsafe def run : IO Json := do
   | .error message => return rejected "request" message
   | .ok fragments =>
       let environment ← parserEnvironment
-      let mut rejection : Option (Nat × String) := none
+      let mut rejection : Option (Nat × FragmentFailure) := none
       for entry in fragments.zipIdx do
         if rejection.isNone then
-          if let .error message := validateFragment environment entry.1 then
-            rejection := some (entry.2, message)
+          if let .error failure := validateFragment environment entry.1 then
+            rejection := some (entry.2, failure)
       match rejection with
-      | some (index, message) => return rejected "fragment" message (some index)
+      | some (index, .parseError message) =>
+          return rejected "fragment_syntax" message (some index)
+      | some (index, .confinement message) =>
+          return rejected "fragment" message (some index)
       | none => return accepted
 
 unsafe def main : IO UInt32 := do

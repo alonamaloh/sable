@@ -210,8 +210,9 @@ fn parse_clause(line: &str, indent: usize, line_offset: usize) -> Clause {
     }
 
     // `#[unfold]` on ghost defs and theorems, `#[fact]` on ghost
-    // theorems: strip the flags (either order); anything malformed or
-    // misplaced stays in `text` for Lean to reject at the item's span.
+    // theorems: strip the flags (either order). Anything malformed stays in
+    // `text` for the trusted parser; the front end gives the well-formed but
+    // misplaced `#[fact]`-on-`def` case its source-level clause diagnostic.
     let mut unfold = false;
     let mut fact = false;
     loop {

@@ -205,7 +205,7 @@ fn append_framed(output: &mut Vec<u8>, value: &[u8]) {
 }
 
 const INGRESS_REQUEST_SCHEMA: &str = "sable-proof-ingress-request-v2";
-const INGRESS_RESULT_SCHEMA: &str = "sable-proof-ingress-result-v2";
+const INGRESS_RESULT_SCHEMA: &str = "sable-proof-ingress-result-v3";
 
 #[derive(Clone)]
 pub(crate) struct IngressFragment {
@@ -214,8 +214,15 @@ pub(crate) struct IngressFragment {
     expected_kind: &'static str,
     expected_name: String,
     expected_modifiers: String,
+    syntax_diagnostic: IngressSyntaxDiagnostic,
     pub(crate) span: Span,
     pub(crate) description: String,
+}
+
+#[derive(Clone, Copy)]
+enum IngressSyntaxDiagnostic {
+    Boundary,
+    ClauseSyntax,
 }
 
 impl IngressFragment {
@@ -226,8 +233,16 @@ impl IngressFragment {
             expected_kind: "",
             expected_name: String::new(),
             expected_modifiers: String::new(),
+            syntax_diagnostic: IngressSyntaxDiagnostic::Boundary,
             span,
             description: description.into(),
+        }
+    }
+
+    fn clause_term(text: impl Into<String>, span: Span, description: impl Into<String>) -> Self {
+        Self {
+            syntax_diagnostic: IngressSyntaxDiagnostic::ClauseSyntax,
+            ..Self::term(text, span, description)
         }
     }
 
@@ -245,6 +260,7 @@ impl IngressFragment {
             expected_kind,
             expected_name: expected_name.into(),
             expected_modifiers: expected_modifiers.into(),
+            syntax_diagnostic: IngressSyntaxDiagnostic::Boundary,
             span,
             description: description.into(),
         }
@@ -565,15 +581,14 @@ pub fn emit(
         // conditions gate the rewrite to concrete data.
         let recursive = g.keyword == "def" && ghost_recursive(&g.text);
         let simp = g.unfold || (g.keyword == "def" && !recursive);
-        let mut attr = String::new();
-        if simp {
-            attr.push_str("@[simp] ");
-        }
+        let attr = match (simp, g.fact) {
+            (true, true) => "@[simp, sable_fact] ",
+            (true, false) => "@[simp] ",
+            (false, true) => "@[sable_fact] ",
+            (false, false) => "",
+        };
         // `#[fact]`: the instantiation tier applies the theorem at the
         // argument tuples occurring in each obligation.
-        if g.fact {
-            attr.push_str("@[sable_fact] ");
-        }
         let (command, expected_modifiers) = if g.keyword == "def" {
             declaration_envelope.push_proof_definition(head.clone(), recursive, simp);
             (
@@ -582,7 +597,7 @@ pub fn emit(
             )
         } else {
             declaration_envelope.push_theorem(head.clone(), simp, g.fact);
-            (format!("{attr}theorem {}", g.text), attr)
+            (format!("{attr}theorem {}", g.text), attr.to_owned())
         };
         ingress.push(IngressFragment::command(
             command.clone(),
@@ -626,7 +641,7 @@ pub fn emit(
             format!("{} result type", wf.desc),
         ));
         let wrapped_text = format!("({})", wf.text);
-        ingress.push(IngressFragment::term(
+        ingress.push(IngressFragment::clause_term(
             wrapped_text.clone(),
             wf.span,
             wf.desc.clone(),
@@ -855,13 +870,44 @@ fn binder_list(binders: &[(String, String)]) -> String {
         .join(" ")
 }
 
-/// A ghost def is recursive if its body mentions its own head name.
+/// Conservatively classify a ghost def as recursive when anything after its
+/// declaration head mentions that head. This deliberately scans the whole
+/// remaining declaration instead of trying to rediscover Lean's simple versus
+/// equation-style value grammar: a false positive merely suppresses an
+/// automatically generated simp attribute, while a false negative could make
+/// simplification loop.
 fn ghost_recursive(text: &str) -> bool {
-    let name = ghost_head_name(text);
-    match text.split_once(":=") {
-        Some((_, body)) => !name.is_empty() && crate::vcgen::mentions(body, &name),
-        None => false,
+    let trimmed = text.trim_start();
+    let name = ghost_head_name(trimmed);
+    if name.is_empty() {
+        return false;
     }
+    mentions_identifier_including_qualified(&trimmed[name.len()..], &name)
+}
+
+/// Match an ASCII Lean identifier in any position, including after a dot.
+/// Ghost recursion needs the latter for `_root_.f` and namespace-qualified
+/// self calls. This scanner is intentionally conservative: occurrences in a
+/// field name, comment, or string can only suppress an automatic simp tag.
+fn mentions_identifier_including_qualified(text: &str, name: &str) -> bool {
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i].is_ascii_alphabetic() || bytes[i] == b'_' {
+            let start = i;
+            while i < bytes.len()
+                && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_' || bytes[i] == b'\'')
+            {
+                i += 1;
+            }
+            if &text[start..i] == name {
+                return true;
+            }
+        } else {
+            i += 1;
+        }
+    }
+    false
 }
 
 fn doc_safe(s: &str) -> String {
@@ -920,7 +966,7 @@ pub fn modules_dir(repo_root: &Path) -> PathBuf {
 /// Exact repository-local inputs that can affect a generated proof. The FNV
 /// identifier is only a compact directory/name tag; every reuse also compares
 /// this complete map, so a hash collision fails closed.
-pub(crate) const PROOF_POLICY_VERSION: &str = "confine-generated-lean-ingress-v4";
+pub(crate) const PROOF_POLICY_VERSION: &str = "confine-generated-lean-ingress-v5";
 const PROOF_ENVIRONMENT_ID_PREFIX: &str = "proof-env-v4-fnv64:";
 
 #[derive(Clone)]
@@ -2055,6 +2101,34 @@ pub(crate) struct IngressAuditFailure {
     pub(crate) span: Span,
     pub(crate) description: String,
     pub(crate) message: String,
+    class: IngressAuditFailureClass,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IngressAuditFailureClass {
+    Boundary,
+    ClauseSyntax,
+}
+
+impl IngressAuditFailure {
+    pub(crate) fn into_diagnostic(self) -> Diagnostic {
+        match self.class {
+            IngressAuditFailureClass::Boundary => Diagnostic {
+                name: INVALID_LEAN_INGRESS_DIAGNOSTIC.into(),
+                title: format!("{} is not one confined Lean fragment", self.description),
+                span: self.span,
+                label: "this proof text could change the generated declaration boundary".into(),
+                notes: vec![("lean parser".into(), self.message)],
+            },
+            IngressAuditFailureClass::ClauseSyntax => Diagnostic {
+                name: "proof.clause_syntax".into(),
+                title: format!("{} fails to parse", self.description),
+                span: self.span,
+                label: "this clause is not well-formed proof language".into(),
+                notes: vec![("lean parser".into(), self.message)],
+            },
+        }
+    }
 }
 
 fn ingress_transport_failure(emitted: &Emitted, message: impl Into<String>) -> IngressAuditFailure {
@@ -2066,6 +2140,7 @@ fn ingress_transport_failure(emitted: &Emitted, message: impl Into<String>) -> I
         span,
         description,
         message: message.into(),
+        class: IngressAuditFailureClass::Boundary,
     }
 }
 
@@ -2282,7 +2357,7 @@ fn parse_ingress_audit_output(
         .ok_or_else(|| {
             ingress_transport_failure(emitted, "rejected proof auditor result lacks `message`")
         })?;
-    if failure_kind == "fragment" {
+    if matches!(failure_kind, "fragment" | "fragment_syntax") {
         if object.len() != 5 {
             return Err(ingress_transport_failure(
                 emitted,
@@ -2305,6 +2380,15 @@ fn parse_ingress_audit_output(
             span: fragment.span,
             description: fragment.description.clone(),
             message: message.to_owned(),
+            class: if failure_kind == "fragment_syntax"
+                && matches!(
+                    fragment.syntax_diagnostic,
+                    IngressSyntaxDiagnostic::ClauseSyntax
+                ) {
+                IngressAuditFailureClass::ClauseSyntax
+            } else {
+                IngressAuditFailureClass::Boundary
+            },
         });
     }
     if object.len() != 4 {
@@ -2994,7 +3078,7 @@ mod proof_build_tests {
             lean_source: String::new(),
             names: EmittedNames::default(),
             ingress: vec![
-                IngressFragment::term("True", Span::new(2, 3), "first fragment"),
+                IngressFragment::clause_term("True", Span::new(2, 3), "first fragment"),
                 IngressFragment::term("False", Span::new(7, 11), "second fragment"),
             ],
             declaration_envelope: ExpectedDeclarationEnvelope::default(),
@@ -3055,6 +3139,98 @@ mod proof_build_tests {
         assert_eq!(
             ghost_head_name("  ordinary_name : Nat := 0"),
             "ordinary_name"
+        );
+    }
+
+    #[test]
+    fn multiline_ghost_recursion_is_recorded_from_the_complete_body_form() {
+        let linked = "Linked (xs : List Nat) : List Nat → Prop\n\
+                      | [] => True\n\
+                      | _ :: rest => Linked xs rest";
+        let piecewise = "piecewise : Nat → Nat\n\
+                         | 0 => 0\n\
+                         | n + 1 => n";
+        let recursive_match = "descend (n : Nat) : Nat :=\n\
+                               match descend (n - 1) with\n\
+                               | 0 => 0\n\
+                               | k + 1 => k";
+        let equation_with_let = "step : Nat → Nat\n\
+                                 | 0 => 0\n\
+                                 | n + 1 => step n + (let x := 1; x)";
+        let same_line_equations = "countdown : Nat → Nat | 0 => 0 | n + 1 => countdown n";
+        let qualified_self_call = "countdown (n : Nat) : Nat := _root_.countdown (n - 1)";
+
+        assert!(ghost_recursive(linked));
+        assert!(!ghost_recursive(piecewise));
+        assert!(ghost_recursive(recursive_match));
+        assert!(ghost_recursive(equation_with_let));
+        assert!(ghost_recursive(same_line_equations));
+        assert!(ghost_recursive(qualified_self_call));
+
+        let mut vc = empty_vc();
+        vc.ghosts.push(crate::ast::GhostItem {
+            keyword: "def",
+            unfold: false,
+            fact: false,
+            text: linked.into(),
+            span: Span::new(2, 80),
+        });
+        vc.ghosts.push(crate::ast::GhostItem {
+            keyword: "def",
+            unfold: false,
+            fact: false,
+            text: recursive_match.into(),
+            span: Span::new(81, 160),
+        });
+        let emitted = emit(
+            &vc,
+            &[],
+            &std::collections::HashSet::new(),
+            &[],
+            &EmittedNames::default(),
+        )
+        .finish("SableGeneratedEquationGhostTest");
+        let ingress = emitted
+            .ingress
+            .iter()
+            .find(|fragment| fragment.category == "command")
+            .expect("the equation-style ghost has one command ingress fragment");
+        assert!(ingress.text.starts_with("noncomputable def Linked"));
+        assert_eq!(ingress.expected_name, "Linked");
+        assert_eq!(ingress.expected_kind, "definition");
+        assert_eq!(ingress.expected_modifiers, "noncomputable ");
+        assert_eq!(
+            emitted.declaration_envelope.roots.first(),
+            Some(&ExpectedDeclarationRoot {
+                name: "Linked".into(),
+                kind: ExpectedDeclarationKind::Definition {
+                    recursive: true,
+                    noncomputable: true,
+                    simp: false,
+                },
+            })
+        );
+        assert_eq!(
+            emitted.declaration_envelope.roots.get(1),
+            Some(&ExpectedDeclarationRoot {
+                name: "descend".into(),
+                kind: ExpectedDeclarationKind::Definition {
+                    recursive: true,
+                    noncomputable: true,
+                    simp: false,
+                },
+            })
+        );
+        let descend_ingress = emitted
+            .ingress
+            .iter()
+            .filter(|fragment| fragment.category == "command")
+            .nth(1)
+            .expect("the simple-body recursive ghost has one command fragment");
+        assert!(
+            descend_ingress
+                .text
+                .starts_with("noncomputable def descend")
         );
     }
 
@@ -3126,7 +3302,7 @@ mod proof_build_tests {
                 keyword: "theorem",
                 unfold: true,
                 fact: true,
-                text: "useful' (x : Int) : x = x := rfl".into(),
+                text: "useful' (x : Int) : x + 0 = x := by omega".into(),
                 span: Span::new(91, 130),
             },
         ];
@@ -3154,9 +3330,9 @@ mod proof_build_tests {
         assert_eq!(commands[1].expected_modifiers, "noncomputable ");
         assert_eq!(
             commands[2].text,
-            "@[simp] @[sable_fact] theorem useful' (x : Int) : x = x := rfl"
+            "@[simp, sable_fact] theorem useful' (x : Int) : x + 0 = x := by omega"
         );
-        assert_eq!(commands[2].expected_modifiers, "@[simp] @[sable_fact] ");
+        assert_eq!(commands[2].expected_modifiers, "@[simp, sable_fact] ");
 
         assert_eq!(
             &emitted.declaration_envelope.roots[..3],
@@ -3288,23 +3464,33 @@ mod proof_build_tests {
     #[test]
     fn ingress_auditor_transport_accepts_only_the_exact_result_schema() {
         let emitted = emitted_with_ingress();
-        let accepted = b"{\"schema\":\"sable-proof-ingress-result-v2\",\"accepted\":true}\n";
-        parse_ingress_audit_output(&emitted, true, accepted, b"")
+        let accepted = format!("{{\"schema\":\"{INGRESS_RESULT_SCHEMA}\",\"accepted\":true}}\n");
+        parse_ingress_audit_output(&emitted, true, accepted.as_bytes(), b"")
             .expect("the exact accepted result passes");
 
+        let missing_newline = accepted.trim_end_matches('\n').as_bytes().to_vec();
+        let crlf = accepted.replace('\n', "\r\n").into_bytes();
+        let unknown_field =
+            format!("{{\"schema\":\"{INGRESS_RESULT_SCHEMA}\",\"accepted\":true,\"extra\":0}}\n")
+                .into_bytes();
+        let retired_v2 = b"{\"schema\":\"sable-proof-ingress-result-v2\",\"accepted\":true}\n";
         for stdout in [
-            b"{\"schema\":\"sable-proof-ingress-result-v2\",\"accepted\":true}".as_slice(),
-            b"{\"schema\":\"sable-proof-ingress-result-v2\",\"accepted\":true}\r\n".as_slice(),
-            b"{\"schema\":\"sable-proof-ingress-result-v2\",\"accepted\":true,\"extra\":0}\n"
-                .as_slice(),
+            missing_newline.as_slice(),
+            crlf.as_slice(),
+            unknown_field.as_slice(),
+            retired_v2.as_slice(),
             b"ok\n".as_slice(),
         ] {
             assert!(parse_ingress_audit_output(&emitted, true, stdout, b"").is_err());
         }
-        assert!(parse_ingress_audit_output(&emitted, false, accepted, b"").is_err());
-        assert!(parse_ingress_audit_output(&emitted, true, accepted, b"warning\n").is_err());
-        let forged_kind = b"{\"schema\":\"sable-proof-ingress-result-v2\",\"accepted\":false,\"failure_kind\":\"forged\",\"message\":\"accepted by loose parser\"}\n";
-        assert!(parse_ingress_audit_output(&emitted, true, forged_kind, b"").is_err());
+        assert!(parse_ingress_audit_output(&emitted, false, accepted.as_bytes(), b"").is_err());
+        assert!(
+            parse_ingress_audit_output(&emitted, true, accepted.as_bytes(), b"warning\n").is_err()
+        );
+        let forged_kind = format!(
+            "{{\"schema\":\"{INGRESS_RESULT_SCHEMA}\",\"accepted\":false,\"failure_kind\":\"forged\",\"message\":\"accepted by loose parser\"}}\n"
+        );
+        assert!(parse_ingress_audit_output(&emitted, true, forged_kind.as_bytes(), b"").is_err());
     }
 
     #[test]
@@ -3436,15 +3622,60 @@ mod proof_build_tests {
     #[test]
     fn ingress_auditor_rejection_maps_only_an_authenticated_fragment_index() {
         let emitted = emitted_with_ingress();
-        let rejection = b"{\"schema\":\"sable-proof-ingress-result-v2\",\"accepted\":false,\"failure_kind\":\"fragment\",\"message\":\"escaped parser boundary\",\"index\":1}\n";
-        let failure = parse_ingress_audit_output(&emitted, true, rejection, b"")
+        let rejection = format!(
+            "{{\"schema\":\"{INGRESS_RESULT_SCHEMA}\",\"accepted\":false,\"failure_kind\":\"fragment\",\"message\":\"escaped parser boundary\",\"index\":1}}\n"
+        );
+        let failure = parse_ingress_audit_output(&emitted, true, rejection.as_bytes(), b"")
             .expect_err("fragment rejection fails closed");
         assert_eq!(failure.span, Span::new(7, 11));
         assert_eq!(failure.description, "second fragment");
         assert_eq!(failure.message, "escaped parser boundary");
+        assert_eq!(
+            failure.into_diagnostic().name,
+            INVALID_LEAN_INGRESS_DIAGNOSTIC
+        );
 
-        let out_of_range = b"{\"schema\":\"sable-proof-ingress-result-v2\",\"accepted\":false,\"failure_kind\":\"fragment\",\"message\":\"forged\",\"index\":2}\n";
-        let failure = parse_ingress_audit_output(&emitted, true, out_of_range, b"")
+        let syntax_rejection = format!(
+            "{{\"schema\":\"{INGRESS_RESULT_SCHEMA}\",\"accepted\":false,\"failure_kind\":\"fragment_syntax\",\"message\":\"expected term\",\"index\":0}}\n"
+        );
+        let syntax_failure =
+            parse_ingress_audit_output(&emitted, true, syntax_rejection.as_bytes(), b"")
+                .expect_err("ordinary malformed term syntax fails closed");
+        assert_eq!(syntax_failure.span, Span::new(2, 3));
+        assert_eq!(syntax_failure.into_diagnostic().name, "proof.clause_syntax");
+
+        let ordinary_term_syntax = format!(
+            "{{\"schema\":\"{INGRESS_RESULT_SCHEMA}\",\"accepted\":false,\"failure_kind\":\"fragment_syntax\",\"message\":\"expected term\",\"index\":1}}\n"
+        );
+        let ordinary_term_failure =
+            parse_ingress_audit_output(&emitted, true, ordinary_term_syntax.as_bytes(), b"")
+                .expect_err("an unclassified term syntax failure stays a boundary failure");
+        assert_eq!(
+            ordinary_term_failure.into_diagnostic().name,
+            INVALID_LEAN_INGRESS_DIAGNOSTIC
+        );
+
+        let mut command_emitted = emitted_with_ingress();
+        command_emitted.ingress[0] = IngressFragment::command(
+            "noncomputable def malformed",
+            "definition",
+            "malformed",
+            "noncomputable ",
+            Span::new(2, 3),
+            "malformed ghost definition",
+        );
+        let command_failure =
+            parse_ingress_audit_output(&command_emitted, true, syntax_rejection.as_bytes(), b"")
+                .expect_err("malformed command syntax stays a confinement failure");
+        assert_eq!(
+            command_failure.into_diagnostic().name,
+            INVALID_LEAN_INGRESS_DIAGNOSTIC
+        );
+
+        let out_of_range = format!(
+            "{{\"schema\":\"{INGRESS_RESULT_SCHEMA}\",\"accepted\":false,\"failure_kind\":\"fragment\",\"message\":\"forged\",\"index\":2}}\n"
+        );
+        let failure = parse_ingress_audit_output(&emitted, true, out_of_range.as_bytes(), b"")
             .expect_err("an out-of-range diagnostic index fails as transport evidence");
         assert_eq!(failure.span, Span::new(2, 3));
         assert_eq!(failure.description, "first fragment");

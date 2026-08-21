@@ -189,6 +189,24 @@ fn assert_ingress_failed_closed(output: Output, context: &str) {
     assert!(!stderr.contains("fully verified"));
 }
 
+fn assert_clause_syntax_failed_closed(output: Output, context: &str) {
+    let stdout = String::from_utf8(output.stdout).expect("Sable stdout is UTF-8");
+    let stderr = String::from_utf8(output.stderr).expect("Sable stderr is UTF-8");
+    assert!(
+        !output.status.success(),
+        "{context} unexpectedly passed:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("fails to parse")
+            && stderr.contains("this clause is not well-formed proof language"),
+        "{context} did not retain the source-level clause-syntax diagnostic:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(!stderr.contains("is not one confined Lean fragment"));
+    assert!(!stdout.contains("status:"));
+    assert!(!stdout.contains("fully verified"));
+    assert!(!stderr.contains("fully verified"));
+}
+
 #[test]
 fn emit_only_reports_generated_only_assurance() {
     let source = temp_source(
@@ -250,7 +268,7 @@ fn subject() -> u64 {
     );
     assert_eq!(
         fs::read(&published[0]).expect("read root verification stamp"),
-        b"sable-verification-policy:confine-generated-lean-ingress-v4\n"
+        b"sable-verification-policy:confine-generated-lean-ingress-v5\n"
     );
 }
 
@@ -263,6 +281,7 @@ fn owned_ghost_modifiers_and_recursive_suffix_pass_the_ingress_gate() {
 /// def pw (n : int) : int := if 0 < n then 2 * pw (n - 1) else 1
 /// termination_by n.toNat
 /// decreasing_by omega
+/// theorem #[unfold] #[fact] useful' (x : Int) : x + 0 = x := by omega
 
 /// post result = 0
 fn subject() -> u64 {
@@ -551,6 +570,26 @@ fn subject() {
 }
 
 #[test]
+fn ordinary_incomplete_clause_retains_its_clause_syntax_diagnostic() {
+    let source = temp_source(
+        "ordinary-clause-syntax-no-final-artifact",
+        r#"
+/// pre b >
+/// post result = a
+fn ident(u32 a, u32 b) -> u32 {
+    return a;
+}
+"#,
+    );
+    let before = final_artifacts_for(&source.0);
+    assert_clause_syntax_failed_closed(
+        check_path(&source.0, None),
+        "ordinary incomplete clause witness",
+    );
+    assert_no_new_final_artifacts(&source.0, &before, "ordinary incomplete clause witness");
+}
+
+#[test]
 fn discharge_continuation_cannot_escape_its_term_boundary() {
     let source = temp_source(
         "discharge-command-no-final-artifact",
@@ -595,9 +634,9 @@ fn subject() -> u64 {
 }
 
 #[test]
-fn ghost_definition_equations_are_rejected() {
+fn ghost_definition_equations_remain_one_confined_declaration() {
     let source = temp_source(
-        "ghost-equations-no-final-artifact",
+        "ghost-equations-confined",
         r#"
 /// def piecewise : Nat → Nat
 ///   | 0 => 0
@@ -610,11 +649,77 @@ fn subject() -> u64 {
 "#,
     );
     let before = final_artifacts_for(&source.0);
+    let output = check_path(&source.0, None);
+    let stdout = String::from_utf8(output.stdout).expect("Sable stdout is UTF-8");
+    let stderr = String::from_utf8(output.stderr).expect("Sable stderr is UTF-8");
+    assert!(
+        output.status.success(),
+        "one equation-style ghost definition did not pass:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(stdout.lines().any(|line| line == UNAUDITED_PROOF_STATUS));
+    assert!(!stdout.contains("fully verified"));
+    assert!(!stderr.contains("fully verified"));
+    let published = final_artifacts_for(&source.0)
+        .difference(&before)
+        .cloned()
+        .collect::<Vec<_>>();
+    assert_eq!(published.len(), 1, "{published:#?}");
+    assert_eq!(
+        published[0].extension().and_then(|value| value.to_str()),
+        Some("ok")
+    );
+}
+
+#[test]
+fn ghost_definition_equations_cannot_add_where_declarations() {
+    let source = temp_source(
+        "ghost-equations-where-no-final-artifact",
+        r#"
+/// def outer : Nat → Nat
+///   | 0 => inner
+///   | n + 1 => n
+///   where
+///     inner : Nat := 0
+
+/// post result = 0
+fn subject() -> u64 {
+    return 0;
+}
+"#,
+    );
+    let before = final_artifacts_for(&source.0);
     assert_ingress_failed_closed(
         check_path(&source.0, None),
-        "ghost definition equation witness",
+        "equation-style ghost definition `where` witness",
     );
-    assert_no_new_final_artifacts(&source.0, &before, "ghost definition equation witness");
+    assert_no_new_final_artifacts(
+        &source.0,
+        &before,
+        "equation-style ghost definition `where` witness",
+    );
+}
+
+#[test]
+fn ghost_theorem_equations_are_not_admitted() {
+    let source = temp_source(
+        "ghost-theorem-equations-no-final-artifact",
+        r#"
+/// theorem by_cases : Nat → True
+///   | 0 => True.intro
+///   | _ => True.intro
+
+/// post result = 0
+fn subject() -> u64 {
+    return 0;
+}
+"#,
+    );
+    let before = final_artifacts_for(&source.0);
+    assert_ingress_failed_closed(
+        check_path(&source.0, None),
+        "equation-style ghost theorem witness",
+    );
+    assert_no_new_final_artifacts(&source.0, &before, "equation-style ghost theorem witness");
 }
 
 #[test]

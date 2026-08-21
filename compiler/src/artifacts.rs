@@ -1091,13 +1091,7 @@ fn build_artifact(
     }
 
     if let Err(failure) = lean::audit_ingress(repo_root, proof_environment, &prep.emitted) {
-        let diagnostic = Diagnostic {
-            name: lean::INVALID_LEAN_INGRESS_DIAGNOSTIC.into(),
-            title: format!("{} is not one confined Lean fragment", failure.description),
-            span: failure.span,
-            label: "this proof text could change the generated declaration boundary".into(),
-            notes: vec![("lean parser".into(), failure.message)],
-        };
+        let diagnostic = failure.into_diagnostic();
         return Err(Arc::new(vec![to_portable(&mods, &diagnostic)]));
     }
 
