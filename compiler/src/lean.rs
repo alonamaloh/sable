@@ -547,6 +547,34 @@ pub(crate) struct ProvisionalDeclarationEvidence {
     direct_children: Vec<ProvisionalDirectChildEvidence>,
 }
 
+/// Current-process, non-authoritative evidence for one freshly compiled
+/// declaration candidate. The exact `.olean` and canonical provisional bytes
+/// are retained in memory; no path, cache admission, or proof authority is
+/// exposed. A parent transaction must additionally prove that the stable
+/// child `.olean` Lean can import still has these exact bytes.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct ProvisionalDeclarationCapability {
+    declaration_subject: DeclarationAuditSubject,
+    olean_bytes: Vec<u8>,
+    olean_sha256: String,
+    provisional_evidence: ProvisionalDeclarationEvidence,
+    provisional_evidence_utf8: Vec<u8>,
+    provisional_evidence_sha256: String,
+}
+
+/// One exact ordered child input as observed around a serialized stable-source
+/// compilation. Both the in-memory evidence carrier and the on-disk `.olean`
+/// Lean can import are represented, so neither a module name nor a digest by
+/// itself can stand in for the actual child bytes.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProvisionalChildInputSnapshot {
+    identity: ProvisionalDirectChildEvidence,
+    stable_olean: ExactObservedFile,
+    provisional_evidence_utf8: Vec<u8>,
+}
+
 /// An opaque, compiler-owned path reserved for a future freshly compiled
 /// declaration-observation candidate. The dormant compound helper writes it
 /// only as an ephemeral input to inventory; it is never published and the path
@@ -588,15 +616,19 @@ impl Drop for DeclarationCandidateOlean {
 }
 
 fn declaration_candidate_output_paths(candidate: &DeclarationCandidateOlean) -> [PathBuf; 4] {
-    let mut server = candidate.path.as_os_str().to_owned();
+    declaration_olean_output_paths(&candidate.path)
+}
+
+fn declaration_olean_output_paths(olean: &Path) -> [PathBuf; 4] {
+    let mut server = olean.as_os_str().to_owned();
     server.push(".server");
-    let mut private = candidate.path.as_os_str().to_owned();
+    let mut private = olean.as_os_str().to_owned();
     private.push(".private");
     [
-        candidate.path.clone(),
+        olean.to_path_buf(),
         PathBuf::from(server),
         PathBuf::from(private),
-        candidate.path.with_extension("ir"),
+        olean.with_extension("ir"),
     ]
 }
 
@@ -656,6 +688,14 @@ pub(crate) struct DeclarationModuleObservation {
     inventory_result: Vec<u8>,
     inventory_result_sha256: String,
     inventory: DeclarationModuleInventory,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+struct ExactDeclarationModuleObservation {
+    observation: DeclarationModuleObservation,
+    /// These are the exact post-inventory bytes; binding has already required
+    /// them to equal the pre-inventory candidate bytes byte-for-byte.
+    candidate_olean: ExactObservedFile,
 }
 
 /// Dormant one-workload result that binds strict batch compilation to the raw
@@ -1562,6 +1602,116 @@ fn ensure_declaration_observation_modules_dir(repo_root: &Path) -> Result<PathBu
     }
     require_regular_directory(&modules, "declaration observation directory")?;
     Ok(modules)
+}
+
+/// Materialize the exact stable generated source without ever replacing an
+/// existing path. A complete, synced temporary file is hard-linked into place
+/// atomically; a concurrent winner is accepted only after an exact regular-
+/// file byte comparison. This is source materialization only, not declaration
+/// evidence or cache publication.
+#[cfg_attr(not(test), allow(dead_code))]
+fn materialize_stable_declaration_source(
+    repo_root: &Path,
+    expected_module_name: &str,
+    source: &str,
+) -> Result<PathBuf, String> {
+    require_generated_module_name(expected_module_name)?;
+    let modules = ensure_declaration_observation_modules_dir(repo_root)?;
+    let stable = modules.join(format!("{expected_module_name}.lean"));
+
+    let mut temporary = None;
+    for _ in 0..100 {
+        let nonce = NEXT_PROOF_TEMP.fetch_add(1, Ordering::Relaxed);
+        let path = modules.join(format!(
+            ".{expected_module_name}.stable-source.{}.{}.tmp",
+            std::process::id(),
+            nonce
+        ));
+        match OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(file) => {
+                temporary = Some((path, file));
+                break;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(format!(
+                    "cannot create temporary stable declaration source {}: {error}",
+                    path.display()
+                ));
+            }
+        }
+    }
+    let Some((temporary_path, mut temporary_file)) = temporary else {
+        return Err(format!(
+            "cannot allocate a temporary stable declaration source in {}",
+            modules.display()
+        ));
+    };
+
+    let write_result = temporary_file
+        .write_all(source.as_bytes())
+        .and_then(|()| temporary_file.sync_all());
+    drop(temporary_file);
+    if let Err(error) = write_result {
+        let _ = std::fs::remove_file(&temporary_path);
+        return Err(format!(
+            "cannot write temporary stable declaration source {}: {error}",
+            temporary_path.display()
+        ));
+    }
+
+    let publish_result = std::fs::hard_link(&temporary_path, &stable);
+    let cleanup_result = std::fs::remove_file(&temporary_path);
+    if let Err(error) = cleanup_result {
+        return Err(format!(
+            "cannot remove temporary stable declaration source {}: {error}",
+            temporary_path.display()
+        ));
+    }
+    match publish_result {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => {
+            return Err(format!(
+                "cannot create stable declaration source {} without replacement: {error}",
+                stable.display()
+            ));
+        }
+    }
+
+    let observed = observe_regular_file(&stable, "stable declaration source")?;
+    require_exact_observed_source(&observed, source, "after create-or-compare")?;
+    Ok(stable)
+}
+
+fn require_exact_declaration_import_header(
+    emitted: &Emitted,
+    dependencies: &[DeclarationModuleSubject],
+) -> Result<(), String> {
+    let mut expected = String::from("import Sable\n");
+    for dependency in dependencies {
+        require_generated_module_name(&dependency.module_name)?;
+        expected.push_str("import ");
+        expected.push_str(&dependency.module_name);
+        expected.push('\n');
+    }
+    expected.push_str("open Sable\n");
+    let Some(remainder) = emitted.lean_source.strip_prefix(&expected) else {
+        return Err(
+            "stable declaration source does not begin with the exact compiler-owned ordered import header"
+                .into(),
+        );
+    };
+    if remainder
+        .lines()
+        .any(|line| line.trim_start().starts_with("import "))
+    {
+        return Err(
+            "stable declaration source contains an import outside its exact compiler-owned header"
+                .into(),
+        );
+    }
+    Ok(())
 }
 
 fn unique_declaration_candidate_source(
@@ -3888,6 +4038,170 @@ impl ProvisionalDeclarationEvidence {
     }
 }
 
+fn validate_provisional_declaration_capability(
+    capability: &ProvisionalDeclarationCapability,
+) -> Result<ProvisionalDirectChildEvidence, String> {
+    if capability.olean_bytes.is_empty() {
+        return Err("provisional declaration capability has an empty candidate olean".into());
+    }
+    if capability.olean_sha256 != crate::sha256::hex(&capability.olean_bytes) {
+        return Err(
+            "provisional declaration capability olean digest does not match its exact bytes".into(),
+        );
+    }
+    let exact_evidence = capability.provisional_evidence.canonical_json();
+    if capability.provisional_evidence_utf8 != exact_evidence {
+        return Err(
+            "provisional declaration capability does not retain the exact canonical evidence bytes"
+                .into(),
+        );
+    }
+    if capability.provisional_evidence_sha256
+        != crate::sha256::hex(&capability.provisional_evidence_utf8)
+    {
+        return Err(
+            "provisional declaration capability evidence digest does not match its exact bytes"
+                .into(),
+        );
+    }
+    let parsed = parse_provisional_declaration_evidence(
+        &capability.provisional_evidence_utf8,
+        &capability.declaration_subject,
+        &capability.provisional_evidence.proof_ready_sha256,
+        &capability.olean_sha256,
+        &capability.provisional_evidence.inventory_result_utf8,
+        &capability.provisional_evidence.direct_children,
+    )?;
+    if parsed != capability.provisional_evidence {
+        return Err(
+            "provisional declaration capability evidence does not exactly reconstruct".into(),
+        );
+    }
+    Ok(ProvisionalDirectChildEvidence {
+        module: capability.declaration_subject.candidate.module_name.clone(),
+        subject_sha256: crate::sha256::hex(&capability.declaration_subject.canonical_json()),
+        olean_sha256: capability.olean_sha256.clone(),
+        provisional_sha256: capability.provisional_evidence_sha256.clone(),
+    })
+}
+
+fn bind_provisional_declaration_capability(
+    declaration_subject: DeclarationAuditSubject,
+    candidate_olean: ExactObservedFile,
+    provisional_evidence: ProvisionalDeclarationEvidence,
+) -> Result<ProvisionalDeclarationCapability, String> {
+    if candidate_olean.sha256 != crate::sha256::hex(&candidate_olean.bytes) {
+        return Err(
+            "provisional declaration candidate digest does not match its exact bytes".into(),
+        );
+    }
+    let provisional_evidence_utf8 = provisional_evidence.canonical_json();
+    let provisional_evidence_sha256 = crate::sha256::hex(&provisional_evidence_utf8);
+    let capability = ProvisionalDeclarationCapability {
+        declaration_subject,
+        olean_bytes: candidate_olean.bytes,
+        olean_sha256: candidate_olean.sha256,
+        provisional_evidence,
+        provisional_evidence_utf8,
+        provisional_evidence_sha256,
+    };
+    validate_provisional_declaration_capability(&capability)?;
+    Ok(capability)
+}
+
+fn require_no_declaration_olean_sidecars(olean: &Path, description: &str) -> Result<(), String> {
+    for sidecar in declaration_olean_output_paths(olean).into_iter().skip(1) {
+        match std::fs::symlink_metadata(&sidecar) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!(
+                    "cannot inspect {description} sidecar {}: {error}",
+                    sidecar.display()
+                ));
+            }
+            Ok(_) => {
+                return Err(format!(
+                    "{description} has an unsupported multipart or IR sidecar {}",
+                    sidecar.display()
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn observe_ordered_provisional_children(
+    repo_root: &Path,
+    parent_subject: &DeclarationAuditSubject,
+    children: &[ProvisionalDeclarationCapability],
+    expected_proof_ready_sha256: &str,
+) -> Result<Vec<ProvisionalChildInputSnapshot>, String> {
+    require_lowercase_sha256(
+        expected_proof_ready_sha256,
+        "stable declaration transaction proof READY digest",
+    )?;
+    if parent_subject.dependencies.len() != children.len() {
+        return Err(format!(
+            "stable declaration transaction has {} in-memory child capabilities for {} ordered dependencies",
+            children.len(),
+            parent_subject.dependencies.len()
+        ));
+    }
+    let modules = modules_dir(repo_root);
+    require_regular_directory(&modules, "stable declaration module directory")?;
+    let mut snapshots = Vec::with_capacity(children.len());
+    let mut identities = Vec::with_capacity(children.len());
+    for (index, (dependency, child)) in parent_subject.dependencies.iter().zip(children).enumerate()
+    {
+        if child.declaration_subject.proof_environment_id != parent_subject.proof_environment_id
+            || child.declaration_subject.proof_policy != parent_subject.proof_policy
+        {
+            return Err(format!(
+                "stable declaration child {index} was produced under a different proof environment or policy"
+            ));
+        }
+        if child.provisional_evidence.proof_ready_sha256 != expected_proof_ready_sha256 {
+            return Err(format!(
+                "stable declaration child {index} was observed under different proof READY bytes"
+            ));
+        }
+        if &child.declaration_subject.candidate != dependency {
+            return Err(format!(
+                "stable declaration child {index} does not exactly match its ordered dependency subject"
+            ));
+        }
+        let identity = validate_provisional_declaration_capability(child)?;
+        if identity.module != dependency.module_name {
+            return Err(format!(
+                "stable declaration child {index} names module `{}`, expected `{}`",
+                identity.module, dependency.module_name
+            ));
+        }
+        let stable_olean_path = modules.join(format!("{}.olean", dependency.module_name));
+        require_no_declaration_olean_sidecars(
+            &stable_olean_path,
+            &format!("stable declaration child {index}"),
+        )?;
+        let stable_olean = observe_regular_file(
+            &stable_olean_path,
+            &format!("stable declaration child {index} olean"),
+        )?;
+        if stable_olean.bytes != child.olean_bytes || stable_olean.sha256 != child.olean_sha256 {
+            return Err(format!(
+                "stable declaration child {index} olean does not match its current in-memory capability"
+            ));
+        }
+        identities.push(identity.clone());
+        snapshots.push(ProvisionalChildInputSnapshot {
+            identity,
+            stable_olean,
+            provisional_evidence_utf8: child.provisional_evidence_utf8.clone(),
+        });
+    }
+    validate_provisional_declaration_subject(parent_subject, &identities)?;
+    Ok(snapshots)
+}
+
 fn provisional_string_field(
     object: &serde_json::Map<String, serde_json::Value>,
     field: &str,
@@ -4111,12 +4425,12 @@ fn parse_provisional_declaration_evidence(
     Ok(expected)
 }
 
-fn validate_declaration_observation_subject(
+fn validate_declaration_subject_for_module(
     proof_environment_id: &str,
     proof_policy: &str,
     subject: &DeclarationAuditSubject,
     expected_emitted: &Emitted,
-    candidate: &DeclarationCandidateOlean,
+    expected_module_name: &str,
 ) -> Result<Vec<u8>, String> {
     if subject.schema != DECLARATION_AUDIT_SUBJECT_SCHEMA {
         return Err(format!(
@@ -4137,18 +4451,16 @@ fn validate_declaration_observation_subject(
         ));
     }
     require_generated_module_name(&subject.candidate.module_name)?;
-    if subject.candidate.module_name != candidate.expected_module_name {
+    if subject.candidate.module_name != expected_module_name {
         return Err(format!(
-            "declaration observation candidate path is reserved for expected module `{}`, but the source subject names `{}`",
-            candidate.expected_module_name, subject.candidate.module_name
+            "declaration observation expected module `{expected_module_name}`, but the source subject names `{}`",
+            subject.candidate.module_name
         ));
     }
     require_terminal_sentinel_for_module(expected_emitted, &subject.candidate.module_name)
         .map_err(|failure| failure.message)?;
-    let expected_candidate = DeclarationModuleSubject::from_emitted(
-        candidate.expected_module_name.clone(),
-        expected_emitted,
-    );
+    let expected_candidate =
+        DeclarationModuleSubject::from_emitted(expected_module_name.to_owned(), expected_emitted);
     if subject.candidate != expected_candidate {
         return Err(format!(
             "declaration observation candidate subject does not exactly match the generated source digest and typed envelope for expected module `{}`",
@@ -4156,6 +4468,22 @@ fn validate_declaration_observation_subject(
         ));
     }
     Ok(subject.canonical_json())
+}
+
+fn validate_declaration_observation_subject(
+    proof_environment_id: &str,
+    proof_policy: &str,
+    subject: &DeclarationAuditSubject,
+    expected_emitted: &Emitted,
+    candidate: &DeclarationCandidateOlean,
+) -> Result<Vec<u8>, String> {
+    validate_declaration_subject_for_module(
+        proof_environment_id,
+        proof_policy,
+        subject,
+        expected_emitted,
+        &candidate.expected_module_name,
+    )
 }
 
 #[allow(dead_code)]
@@ -4388,7 +4716,7 @@ fn observe_declaration_module_locked(
     expected_emitted: &Emitted,
     candidate: &DeclarationCandidateOlean,
     proof_ready_before: ExactObservedFile,
-) -> Result<DeclarationModuleObservation, String> {
+) -> Result<ExactDeclarationModuleObservation, String> {
     validate_declaration_candidate_path(repo_root, candidate)?;
     validate_declaration_observation_subject(
         environment.id(),
@@ -4461,7 +4789,8 @@ fn observe_declaration_module_locked(
     )?;
     environment.validate_built(&built)?;
     let proof_ready_after = observe_regular_file(&ready, "proof READY")?;
-    bind_declaration_observation(
+    let exact_candidate = candidate_after.clone();
+    let observation = bind_declaration_observation(
         environment.id(),
         environment.policy(),
         subject,
@@ -4475,7 +4804,11 @@ fn observe_declaration_module_locked(
         output.status.success(),
         output.stdout,
         output.stderr,
-    )
+    )?;
+    Ok(ExactDeclarationModuleObservation {
+        observation,
+        candidate_olean: exact_candidate,
+    })
 }
 
 /// Observe one explicit, freshly compiled temporary `.olean` under the same
@@ -4517,6 +4850,7 @@ pub(crate) fn observe_declaration_module(
         candidate,
         proof_ready_before,
     )
+    .map(|exact| exact.observation)
 }
 
 fn require_exact_observed_source(
@@ -4631,7 +4965,7 @@ pub(crate) fn compile_and_observe_declaration_module(
             "after compilation",
         )?;
 
-        let declaration = observe_declaration_module_locked(
+        let exact_declaration = observe_declaration_module_locked(
             &process_lock,
             repo_root,
             environment,
@@ -4641,6 +4975,7 @@ pub(crate) fn compile_and_observe_declaration_module(
             &candidate,
             proof_ready_before,
         )?;
+        let declaration = exact_declaration.observation;
         validate_declaration_candidate_source(repo_root, &source)?;
         let source_after_inventory =
             observe_regular_file(&source.path, "declaration observation source")?;
@@ -4696,6 +5031,230 @@ pub(crate) fn compile_and_observe_declaration_module(
     }
     drop(process_lock);
     Ok(observation)
+}
+
+fn require_exact_observation_unchanged(
+    before: &ExactObservedFile,
+    after: &ExactObservedFile,
+    description: &str,
+) -> Result<(), String> {
+    if before.bytes != after.bytes || before.sha256 != after.sha256 {
+        return Err(format!(
+            "{description} changed during the stable declaration transaction"
+        ));
+    }
+    Ok(())
+}
+
+fn require_candidate_cleanup(
+    output_paths: &[PathBuf; 4],
+    output_root: &Path,
+) -> Result<(), String> {
+    for path in output_paths {
+        require_declaration_temporary_path_absent(path, "ephemeral stable candidate output")?;
+    }
+    require_declaration_temporary_path_absent(
+        output_root,
+        "ephemeral stable candidate output directory",
+    )
+}
+
+fn stable_declaration_compilation_command(
+    built: &Path,
+    modules: &Path,
+    stable_source: &Path,
+    candidate: &DeclarationCandidateOlean,
+) -> Command {
+    generated_lean_command(
+        &built.join("lean"),
+        modules,
+        stable_source,
+        Some((modules, candidate.path())),
+    )
+}
+
+/// Compile one exact stable generated source into an isolated temporary
+/// candidate and return only a current-process, non-authoritative capability
+/// containing its exact bytes and provisional evidence. This B1g slice-2
+/// helper remains dormant: it does not publish an `.olean` or `.PROVISIONAL`,
+/// authorize reuse, change assurance, or participate in production checking.
+///
+/// Direct children are accepted only as opaque capabilities from the current
+/// process. The exact stable child `.olean` files Lean can import must match
+/// those capabilities byte-for-byte before and after the serialized workload.
+#[allow(dead_code)]
+pub(crate) fn compile_stable_provisional_declaration(
+    repo_root: &Path,
+    environment: &ProofEnvironment,
+    emitted: &Emitted,
+    subject: &DeclarationAuditSubject,
+    direct_children: &[ProvisionalDeclarationCapability],
+) -> Result<ProvisionalDeclarationCapability, String> {
+    // Lean compilation executes elaborators and tactics. Authenticate every
+    // compiler-recorded ingress fragment before materializing the stable
+    // source or allowing the generated module to execute.
+    audit_ingress(repo_root, environment, emitted).map_err(|failure| failure.message)?;
+
+    // A cold proof build may take the same non-reentrant lock, so resolve it
+    // before the one compound compile/inventory transaction begins.
+    let built = environment.ensure_built(repo_root)?;
+    let expected_module_name = subject.candidate.module_name.clone();
+    validate_declaration_subject_for_module(
+        environment.id(),
+        environment.policy(),
+        subject,
+        emitted,
+        &expected_module_name,
+    )?;
+    require_exact_declaration_import_header(emitted, &subject.dependencies)?;
+    let stable_source = materialize_stable_declaration_source(
+        repo_root,
+        &expected_module_name,
+        &emitted.lean_source,
+    )?;
+    let modules = modules_dir(repo_root);
+    let ready = built.join("READY");
+
+    let process_lock = ProofProcessLock::acquire(repo_root)?;
+    environment.validate_built(&built)?;
+    let proof_ready_before = observe_regular_file(&ready, "proof READY")?;
+    let source_before = observe_regular_file(&stable_source, "stable declaration source")?;
+    require_exact_observed_source(
+        &source_before,
+        &emitted.lean_source,
+        "before stable compilation",
+    )?;
+    let children_before = observe_ordered_provisional_children(
+        repo_root,
+        subject,
+        direct_children,
+        &proof_ready_before.sha256,
+    )?;
+
+    let candidate = unique_declaration_candidate_olean(repo_root, &expected_module_name)?;
+    let candidate_paths = declaration_candidate_output_paths(&candidate);
+    let candidate_root = candidate.directory.clone();
+    let transaction = (|| {
+        validate_declaration_candidate_path(repo_root, &candidate)?;
+        require_absent_candidate(&candidate)?;
+        let command =
+            stable_declaration_compilation_command(&built, &modules, &stable_source, &candidate);
+        let lean_output = run_lean_locked(
+            &process_lock,
+            environment,
+            &built,
+            &stable_source,
+            &emitted.lean_source,
+            command,
+        )?;
+        require_observational_compilation_acceptance(emitted, &lean_output)?;
+        let source_after_compile =
+            observe_regular_file(&stable_source, "stable declaration source")?;
+        require_exact_observed_source(
+            &source_after_compile,
+            &emitted.lean_source,
+            "after stable compilation",
+        )?;
+        require_exact_observation_unchanged(
+            &source_before,
+            &source_after_compile,
+            "stable declaration source",
+        )?;
+
+        let exact_declaration = observe_declaration_module_locked(
+            &process_lock,
+            repo_root,
+            environment,
+            &built,
+            subject,
+            emitted,
+            &candidate,
+            proof_ready_before.clone(),
+        )?;
+        let preflight = preflight_declaration_observation(&exact_declaration.observation)?;
+        let direct_child_identities = children_before
+            .iter()
+            .map(|child| child.identity.clone())
+            .collect::<Vec<_>>();
+        let provisional_evidence = ProvisionalDeclarationEvidence::new(
+            subject,
+            proof_ready_before.sha256.clone(),
+            exact_declaration.candidate_olean.sha256.clone(),
+            exact_declaration.observation.inventory_result.clone(),
+            direct_child_identities,
+        )?;
+        if provisional_evidence.denial_preflight_utf8 != preflight.canonical_json()? {
+            return Err(
+                "stable declaration evidence did not retain the exact denial preflight".into(),
+            );
+        }
+
+        environment.validate_built(&built)?;
+        let proof_ready_after = observe_regular_file(&ready, "proof READY")?;
+        require_exact_observation_unchanged(
+            &proof_ready_before,
+            &proof_ready_after,
+            "proof READY bytes",
+        )?;
+        let source_after = observe_regular_file(&stable_source, "stable declaration source")?;
+        require_exact_observed_source(
+            &source_after,
+            &emitted.lean_source,
+            "after stable inventory and evidence construction",
+        )?;
+        require_exact_observation_unchanged(
+            &source_before,
+            &source_after,
+            "stable declaration source",
+        )?;
+        let children_after = observe_ordered_provisional_children(
+            repo_root,
+            subject,
+            direct_children,
+            &proof_ready_before.sha256,
+        )?;
+        if children_before != children_after {
+            return Err(
+                "ordered stable declaration child inputs changed during compilation and inventory"
+                    .into(),
+            );
+        }
+        require_declaration_candidate_output_state(
+            &candidate,
+            DeclarationCandidateOutputState::TraditionalOlean,
+        )?;
+        let candidate_final = observe_regular_file(
+            candidate.path(),
+            "stable declaration temporary candidate `.olean`",
+        )?;
+        require_exact_observation_unchanged(
+            &exact_declaration.candidate_olean,
+            &candidate_final,
+            "stable declaration candidate `.olean`",
+        )?;
+
+        bind_provisional_declaration_capability(
+            subject.clone(),
+            exact_declaration.candidate_olean,
+            provisional_evidence,
+        )
+    })();
+
+    // Cleanup is part of the serialized workload on both success and failure.
+    // Drop removes only the candidate's exact recognized output set; explicit
+    // absence checks make an unexpected residual fail closed.
+    drop(candidate);
+    let cleanup = require_candidate_cleanup(&candidate_paths, &candidate_root);
+    let result = match (transaction, cleanup) {
+        (Ok(capability), Ok(())) => Ok(capability),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(_), Err(cleanup_error)) => Err(cleanup_error),
+        (Err(error), Err(cleanup_error)) => Err(format!(
+            "{error}; candidate cleanup also failed: {cleanup_error}"
+        )),
+    };
+    drop(process_lock);
+    result
 }
 
 fn terminal_sentinel_preimage(
@@ -6113,6 +6672,36 @@ mod proof_build_tests {
         }
     }
 
+    fn synthetic_provisional_capability(
+        module_name: &str,
+        olean_bytes: &[u8],
+    ) -> ProvisionalDeclarationCapability {
+        let (declaration_envelope, inventory) = declaration_preflight_fixture();
+        let subject = DeclarationAuditSubject::new(
+            "proof-env-v4-fnv64:0123456789abcdef",
+            "stable-provisional-test-policy",
+            DeclarationModuleSubject {
+                module_name: module_name.into(),
+                generated_source_sha256: crate::sha256::hex(
+                    format!("{module_name} exact generated source").as_bytes(),
+                ),
+                declaration_envelope,
+            },
+            Vec::new(),
+        );
+        let observed_olean = exact_observed_file(olean_bytes);
+        let evidence = ProvisionalDeclarationEvidence::new(
+            &subject,
+            crate::sha256::hex(b"shared exact READY"),
+            observed_olean.sha256.clone(),
+            inventory_fixture_result(&inventory),
+            Vec::new(),
+        )
+        .expect("synthetic child evidence constructs");
+        bind_provisional_declaration_capability(subject, observed_olean, evidence)
+            .expect("synthetic current-process child capability binds")
+    }
+
     fn replace_once(bytes: &[u8], from: &str, to: &str) -> Vec<u8> {
         let text = std::str::from_utf8(bytes).expect("fixture evidence is UTF-8");
         assert!(text.contains(from), "mutation needle is present: {from:?}");
@@ -6418,6 +7007,61 @@ mod proof_build_tests {
             .expect("create candidate before compilation");
         assert!(require_absent_candidate(&preexisting).is_err());
         drop(preexisting);
+    }
+
+    #[test]
+    fn stable_declaration_source_is_atomic_create_or_exact_compare() {
+        use std::os::unix::fs::{MetadataExt, symlink};
+
+        let root = unique_directory(
+            &std::env::temp_dir(),
+            "sable-stable-declaration-source-test",
+        )
+        .expect("create isolated stable-source tree");
+        let _cleanup = TempProofTree(root.clone());
+        let exact_source = "import Sable\n\n";
+        let stable = materialize_stable_declaration_source(&root, "Root_module", exact_source)
+            .expect("atomically materialize a new stable source");
+        assert_eq!(stable, modules_dir(&root).join("Root_module.lean"));
+        let first_metadata = std::fs::symlink_metadata(&stable).expect("inspect stable source");
+        assert!(first_metadata.is_file());
+        assert!(!first_metadata.file_type().is_symlink());
+
+        let compared = materialize_stable_declaration_source(&root, "Root_module", exact_source)
+            .expect("an existing exact source is compared, not replaced");
+        let second_metadata =
+            std::fs::symlink_metadata(&compared).expect("reinspect stable source");
+        assert_eq!(first_metadata.dev(), second_metadata.dev());
+        assert_eq!(first_metadata.ino(), second_metadata.ino());
+        assert_eq!(std::fs::read(&stable).unwrap(), exact_source.as_bytes());
+        assert!(
+            materialize_stable_declaration_source(
+                &root,
+                "Root_module",
+                "import Sable\n-- different\n",
+            )
+            .is_err()
+        );
+        assert_eq!(std::fs::read(&stable).unwrap(), exact_source.as_bytes());
+        assert!(
+            std::fs::read_dir(modules_dir(&root))
+                .unwrap()
+                .filter_map(Result::ok)
+                .all(|entry| !entry
+                    .file_name()
+                    .to_string_lossy()
+                    .contains(".stable-source.")),
+            "atomic source publication leaves no temporary file"
+        );
+
+        std::fs::remove_file(&stable).expect("remove owned source fixture");
+        let target = root.join("replacement-target.lean");
+        std::fs::write(&target, exact_source).expect("write symlink target");
+        symlink(&target, &stable).expect("install final-path symlink fixture");
+        assert!(
+            materialize_stable_declaration_source(&root, "Root_module", exact_source,).is_err()
+        );
+        assert_eq!(std::fs::read(&target).unwrap(), exact_source.as_bytes());
     }
 
     #[test]
@@ -7595,6 +8239,138 @@ mod proof_build_tests {
     }
 
     #[test]
+    fn stable_declaration_import_header_is_exact_and_ordered() {
+        let dependencies = vec![
+            declaration_module_fixture("Dep_first", &crate::sha256::hex(b"first source")),
+            declaration_module_fixture("Dep_second", &crate::sha256::hex(b"second source")),
+        ];
+        let emitted = draft_with_source(concat!(
+            "import Sable\n",
+            "import Dep_first\n",
+            "import Dep_second\n",
+            "open Sable\n",
+            "set_option linter.unusedVariables false\n",
+        ))
+        .finish("Root_module");
+        require_exact_declaration_import_header(&emitted, &dependencies)
+            .expect("exact compiler-owned import order passes");
+
+        for source in [
+            concat!(
+                "import Sable\n",
+                "import Dep_second\n",
+                "import Dep_first\n",
+                "open Sable\n",
+            ),
+            concat!("import Sable\n", "import Dep_first\n", "open Sable\n"),
+            concat!(
+                "import Sable\n",
+                "import Dep_first\n",
+                "import Dep_second\n",
+                "import Dep_extra\n",
+                "open Sable\n",
+            ),
+            concat!(
+                "import Sable\n",
+                "import Dep_first\n",
+                "import Dep_second\n",
+                "open Sable\n",
+                "  import Dep_late\n",
+            ),
+        ] {
+            let changed = draft_with_source(source).finish("Root_module");
+            assert!(require_exact_declaration_import_header(&changed, &dependencies).is_err());
+        }
+    }
+
+    #[test]
+    fn stable_declaration_children_require_ordered_capabilities_and_exact_importable_bytes() {
+        let root = unique_directory(
+            &std::env::temp_dir(),
+            "sable-stable-declaration-children-test",
+        )
+        .expect("create isolated stable-child tree");
+        let _cleanup = TempProofTree(root.clone());
+        std::fs::create_dir_all(modules_dir(&root)).expect("create module directory");
+
+        let child_first = synthetic_provisional_capability("Dep_first", b"first exact olean");
+        let child_second = synthetic_provisional_capability("Dep_second", b"second exact olean");
+        let mut children = vec![child_first, child_second];
+        for child in &children {
+            std::fs::write(
+                modules_dir(&root).join(format!(
+                    "{}.olean",
+                    child.declaration_subject.candidate.module_name
+                )),
+                &child.olean_bytes,
+            )
+            .expect("materialize exact stable child olean fixture");
+        }
+        let parent = DeclarationAuditSubject::new(
+            "proof-env-v4-fnv64:0123456789abcdef",
+            "stable-provisional-test-policy",
+            DeclarationModuleSubject {
+                module_name: "Root_module".into(),
+                generated_source_sha256: crate::sha256::hex(b"root exact source"),
+                declaration_envelope: ExpectedDeclarationEnvelope::default(),
+            },
+            children
+                .iter()
+                .map(|child| child.declaration_subject.candidate.clone())
+                .collect(),
+        );
+
+        let ready_sha256 = crate::sha256::hex(b"shared exact READY");
+        let exact = observe_ordered_provisional_children(&root, &parent, &children, &ready_sha256)
+            .expect("ordered child capabilities bind their exact importable files");
+        assert_eq!(
+            exact
+                .iter()
+                .map(|child| child.identity.module.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Dep_first", "Dep_second"]
+        );
+        assert!(
+            observe_ordered_provisional_children(
+                &root,
+                &parent,
+                &children,
+                &crate::sha256::hex(b"different READY"),
+            )
+            .is_err()
+        );
+
+        children.swap(0, 1);
+        assert!(
+            observe_ordered_provisional_children(&root, &parent, &children, &ready_sha256,)
+                .is_err()
+        );
+        children.swap(0, 1);
+
+        let second_path = modules_dir(&root).join("Dep_second.olean");
+        std::fs::write(&second_path, b"changed child olean").expect("mutate child fixture");
+        assert!(
+            observe_ordered_provisional_children(&root, &parent, &children, &ready_sha256,)
+                .is_err()
+        );
+        std::fs::write(&second_path, &children[1].olean_bytes).expect("restore child fixture");
+
+        let first_ir = modules_dir(&root).join("Dep_first.ir");
+        std::fs::write(&first_ir, b"unmodeled IR").expect("write rejected child sidecar");
+        assert!(
+            observe_ordered_provisional_children(&root, &parent, &children, &ready_sha256,)
+                .is_err()
+        );
+        std::fs::remove_file(first_ir).expect("remove rejected sidecar fixture");
+
+        children[0].provisional_evidence_sha256 = crate::sha256::hex(b"forged evidence");
+        assert!(
+            observe_ordered_provisional_children(&root, &parent, &children, &ready_sha256,)
+                .is_err()
+        );
+    }
+
+    #[test]
     fn declaration_preflight_maps_only_exact_ascii_dotted_names() {
         assert_eq!(
             observed_ascii_dotted_name("SableR_Node.proof'")
@@ -8223,6 +8999,118 @@ mod proof_build_tests {
     }
 
     #[test]
+    #[ignore = "end-to-end stable-source canary; explicitly runs the pinned ingress auditor, Lean compiler, and declaration inventory"]
+    fn stable_provisional_declaration_cross_language_canary() {
+        assert_eq!(
+            std::env::var("SABLE_RUN_STABLE_PROVISIONAL_DECLARATION_CANARY").as_deref(),
+            Ok("1"),
+            "set SABLE_RUN_STABLE_PROVISIONAL_DECLARATION_CANARY=1 to authorize this ignored Lean canary"
+        );
+        let repo_root = PathBuf::from(
+            std::env::var_os("SABLE_STABLE_PROVISIONAL_DECLARATION_REPO")
+                .expect("set SABLE_STABLE_PROVISIONAL_DECLARATION_REPO to the explicit repo root"),
+        );
+        assert!(repo_root.is_absolute());
+        let environment =
+            ProofEnvironment::capture(&repo_root).expect("capture exact proof environment");
+        let module_name = "SableGeneratedStableProvisionalCanary";
+        let emitted = representative_declaration_canary_emitted(module_name);
+        let subject = DeclarationAuditSubject::new(
+            environment.id(),
+            environment.policy(),
+            DeclarationModuleSubject::from_emitted(module_name, &emitted),
+            Vec::new(),
+        );
+        let modules = modules_dir(&repo_root);
+        let stable_source = modules.join(format!("{module_name}.lean"));
+        let stable_olean = modules.join(format!("{module_name}.olean"));
+        let provisional_path = modules.join(format!("{module_name}.PROVISIONAL"));
+        assert!(
+            std::fs::symlink_metadata(&stable_olean).is_err(),
+            "the canary starts without a stable olean publication"
+        );
+        assert!(
+            std::fs::symlink_metadata(&provisional_path).is_err(),
+            "the canary starts without provisional evidence on disk"
+        );
+        let temporary_outputs = |root: &Path| -> std::collections::BTreeSet<String> {
+            let Ok(entries) = std::fs::read_dir(modules_dir(root)) else {
+                return std::collections::BTreeSet::new();
+            };
+            entries
+                .filter_map(Result::ok)
+                .filter_map(|entry| entry.file_name().into_string().ok())
+                .filter(|name| name.contains(".declaration-output."))
+                .collect()
+        };
+        let before = temporary_outputs(&repo_root);
+        let capability = compile_stable_provisional_declaration(
+            &repo_root,
+            &environment,
+            &emitted,
+            &subject,
+            &[],
+        )
+        .expect("stable-source compile, inventory, denial preflight, and evidence binding pass");
+        let after = temporary_outputs(&repo_root);
+
+        assert_eq!(before, after, "isolated candidate output is cleaned");
+        let stable = observe_regular_file(&stable_source, "stable canary source")
+            .expect("stable source remains one regular file");
+        require_exact_observed_source(&stable, &emitted.lean_source, "after the stable canary")
+            .expect("stable source retains exact emitted bytes");
+        assert!(std::fs::symlink_metadata(&stable_olean).is_err());
+        assert!(std::fs::symlink_metadata(&provisional_path).is_err());
+
+        assert!(!capability.olean_bytes.is_empty());
+        assert_eq!(
+            capability.olean_sha256,
+            crate::sha256::hex(&capability.olean_bytes)
+        );
+        assert_eq!(capability.declaration_subject, subject);
+        assert!(!capability.provisional_evidence.authoritative);
+        assert!(
+            !capability
+                .provisional_evidence
+                .reusable_without_fresh_compilation
+        );
+        assert!(capability.provisional_evidence.direct_children.is_empty());
+        assert_eq!(
+            capability.provisional_evidence.candidate_olean_sha256,
+            capability.olean_sha256
+        );
+        assert_eq!(
+            capability.provisional_evidence_utf8,
+            capability.provisional_evidence.canonical_json()
+        );
+        assert_eq!(
+            capability.provisional_evidence_sha256,
+            crate::sha256::hex(&capability.provisional_evidence_utf8)
+        );
+        let identity = validate_provisional_declaration_capability(&capability)
+            .expect("returned in-memory capability revalidates exactly");
+        assert_eq!(identity.module, module_name);
+        let inventory = parse_declaration_inventory_output(
+            true,
+            &capability.provisional_evidence.inventory_result_utf8,
+            b"",
+        )
+        .expect("evidence retains exact inventory transport");
+        let preflight = preflight_declaration_inventory(
+            &capability
+                .declaration_subject
+                .candidate
+                .declaration_envelope,
+            &inventory,
+        )
+        .expect("representative stable candidate passes denial-only preflight");
+        assert_eq!(
+            capability.provisional_evidence.denial_preflight_utf8,
+            preflight.canonical_json().unwrap()
+        );
+    }
+
+    #[test]
     fn declaration_inventory_transport_rejects_noncanonical_or_loose_evidence() {
         let exact = concat!(
             r#"{"constants":[],"extension_families":[],"extra_const_names":[],"imports":[],"is_module":false,"observational":true,"schema":"sable-declaration-inventory-result-v1"}"#,
@@ -8591,6 +9479,52 @@ mod proof_build_tests {
             Some("Root_module.lean"),
             "the explicit root yields the exact expected module name"
         );
+    }
+
+    #[test]
+    fn stable_declaration_compilation_command_uses_exact_module_root_and_isolated_output() {
+        let built = Path::new("/proof-environment/built");
+        let modules = Path::new("/repo/.sable-out/modules");
+        let stable_source = modules.join("Root_module.lean");
+        let candidate = DeclarationCandidateOlean {
+            expected_module_name: "Root_module".into(),
+            directory: modules.join(".Root_module.declaration-output.42.9"),
+            path: modules
+                .join(".Root_module.declaration-output.42.9")
+                .join("Root_module.olean"),
+        };
+        let command =
+            stable_declaration_compilation_command(built, modules, &stable_source, &candidate);
+        assert_eq!(command.get_program(), OsStr::new("lake"));
+        assert_eq!(
+            command.get_current_dir(),
+            Some(built.join("lean").as_path())
+        );
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            [
+                OsStr::new("env"),
+                OsStr::new("lean"),
+                OsStr::new("--json"),
+                OsStr::new("--root"),
+                modules.as_os_str(),
+                OsStr::new("-o"),
+                candidate.path.as_os_str(),
+                stable_source.as_os_str(),
+            ]
+        );
+        let envs = command.get_envs().collect::<Vec<_>>();
+        assert!(envs.contains(&(OsStr::new("LEAN_PATH"), Some(modules.as_os_str()))));
+        for name in PROOF_TOOL_OVERRIDES {
+            if name != "LEAN_PATH" {
+                assert!(
+                    envs.contains(&(OsStr::new(name), None)),
+                    "stable declaration compilation removes ambient override {name}"
+                );
+            }
+        }
+        assert_eq!(stable_source.parent(), Some(modules));
+        assert_ne!(candidate.path.parent(), Some(modules));
     }
 
     #[test]
