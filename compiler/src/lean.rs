@@ -357,6 +357,9 @@ const INGRESS_RESULT_SCHEMA: &str = "sable-proof-ingress-result-v2";
 const DECLARATION_INVENTORY_REQUEST_SCHEMA: &str = "sable-declaration-inventory-request-v1";
 const DECLARATION_INVENTORY_RESULT_SCHEMA: &str = "sable-declaration-inventory-result-v1";
 const DECLARATION_OBSERVATION_SCHEMA: &str = "sable-declaration-observation-v1";
+const PROVISIONAL_DECLARATION_EVIDENCE_SCHEMA: &str = "sable-provisional-declaration-evidence-v1";
+const PROVISIONAL_DECLARATION_ASSURANCE: &str = "lean-accepted-dependencies-unaudited";
+const DECLARATION_DENIAL_PREFLIGHT_SCHEMA: &str = "sable-declaration-denial-preflight-v1";
 
 /// Exact recursive Lean `Name` identity. Printable names are insufficient for
 /// hygienic components, so the transport preserves anonymous/str/num shape.
@@ -496,6 +499,52 @@ pub(crate) struct DeclarationInventoryPreflight {
     pub(crate) authoritative: bool,
     pub(crate) explicit_matches: Vec<DeclarationInventoryExplicitMatch>,
     pub(crate) unclassified_constants: Vec<DeclarationInventoryUnclassifiedConstant>,
+}
+
+/// Exact identity of one direct child artifact that could be supplied to a
+/// future policy design. These hashes are carried in emitted import order.
+/// They remain metadata only: the current tranche neither reads nor publishes
+/// evidence and cannot construct cache authority from this value.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProvisionalDirectChildEvidence {
+    pub(crate) module: String,
+    /// SHA-256 of the child's complete `DeclarationAuditSubject`, not merely
+    /// its `DeclarationModuleSubject` entry in this parent's subject.
+    pub(crate) subject_sha256: String,
+    pub(crate) olean_sha256: String,
+    pub(crate) provisional_sha256: String,
+}
+
+/// Dormant, portable canonical bytes for a future `.PROVISIONAL` evidence
+/// record.
+/// Checked construction, strict parsing, and canonical encoding fix both
+/// flags false and fix the assurance string to the existing unaudited state.
+/// That string is only an assurance ceiling/context label: this record never
+/// establishes Lean acceptance and can only preserve, not mint or raise, a
+/// weak status established independently.
+/// No filesystem, cache, publication, or proof path consumes these bytes in
+/// B1g slice 1.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProvisionalDeclarationEvidence {
+    schema: &'static str,
+    authoritative: bool,
+    reusable_without_fresh_compilation: bool,
+    proof_assurance: &'static str,
+    expected_module_name: String,
+    proof_environment_id: String,
+    proof_policy: String,
+    generated_source_sha256: String,
+    proof_ready_sha256: String,
+    candidate_olean_sha256: String,
+    declaration_audit_subject_utf8: Vec<u8>,
+    declaration_audit_subject_sha256: String,
+    inventory_result_utf8: Vec<u8>,
+    inventory_result_sha256: String,
+    denial_preflight_utf8: Vec<u8>,
+    denial_preflight_sha256: String,
+    direct_children: Vec<ProvisionalDirectChildEvidence>,
 }
 
 /// An opaque, compiler-owned path reserved for a future freshly compiled
@@ -3526,6 +3575,542 @@ fn preflight_declaration_observation(
     )
 }
 
+fn observed_constant_kind_label(kind: ObservedConstantKind) -> &'static str {
+    match kind {
+        ObservedConstantKind::Axiom => "axiom",
+        ObservedConstantKind::Definition => "definition",
+        ObservedConstantKind::Theorem => "theorem",
+        ObservedConstantKind::Opaque => "opaque",
+        ObservedConstantKind::Quotient => "quotient",
+        ObservedConstantKind::Inductive => "inductive",
+        ObservedConstantKind::Constructor => "constructor",
+        ObservedConstantKind::Recursor => "recursor",
+    }
+}
+
+fn push_observed_name_json(output: &mut String, name: &ObservedName) {
+    match name {
+        ObservedName::Anonymous => output.push_str("null"),
+        ObservedName::Str { prefix, value } => {
+            output.push_str("{\"str\":[");
+            push_observed_name_json(output, prefix);
+            output.push(',');
+            push_json_string(output, value);
+            output.push_str("]}");
+        }
+        ObservedName::Num { prefix, value } => {
+            output.push_str("{\"num\":[");
+            push_observed_name_json(output, prefix);
+            output.push(',');
+            output.push_str(&value.to_string());
+            output.push_str("]}");
+        }
+    }
+}
+
+fn push_inventory_explicit_role_json(output: &mut String, role: &DeclarationInventoryExplicitRole) {
+    match role {
+        DeclarationInventoryExplicitRole::StructureRoot { root_index } => {
+            output.push_str("\"structure_root\",\"root_index\":");
+            output.push_str(&root_index.to_string());
+        }
+        DeclarationInventoryExplicitRole::DefinitionRoot { root_index } => {
+            output.push_str("\"definition_root\",\"root_index\":");
+            output.push_str(&root_index.to_string());
+        }
+        DeclarationInventoryExplicitRole::TheoremRoot { root_index } => {
+            output.push_str("\"theorem_root\",\"root_index\":");
+            output.push_str(&root_index.to_string());
+        }
+        DeclarationInventoryExplicitRole::TerminalSentinel { root_index } => {
+            output.push_str("\"terminal_sentinel\",\"root_index\":");
+            output.push_str(&root_index.to_string());
+        }
+        DeclarationInventoryExplicitRole::StructureField {
+            root_index,
+            field_index,
+        } => {
+            output.push_str("\"structure_field\",\"root_index\":");
+            output.push_str(&root_index.to_string());
+            output.push_str(",\"field_index\":");
+            output.push_str(&field_index.to_string());
+        }
+    }
+}
+
+impl DeclarationInventoryPreflight {
+    /// Canonical denial-only bytes. Every explicit match and every unclassified
+    /// constant remains in its established order; nothing is sorted or
+    /// omitted to manufacture a smaller apparent declaration boundary.
+    fn canonical_json(&self) -> Result<Vec<u8>, String> {
+        if !self.observational || self.authoritative {
+            return Err(
+                "declaration denial preflight must be observational and non-authoritative".into(),
+            );
+        }
+        let mut json = String::new();
+        json.push_str("{\"schema\":");
+        push_json_string(&mut json, DECLARATION_DENIAL_PREFLIGHT_SCHEMA);
+        json.push_str(",\"observational\":true,\"authoritative\":false,\"explicit_matches\":[");
+        for (index, matched) in self.explicit_matches.iter().enumerate() {
+            if index != 0 {
+                json.push(',');
+            }
+            json.push_str("{\"role\":");
+            push_inventory_explicit_role_json(&mut json, &matched.role);
+            json.push_str(",\"name\":");
+            push_observed_name_json(&mut json, &matched.name);
+            json.push_str(",\"slot_index\":");
+            json.push_str(&matched.slot_index.to_string());
+            json.push_str(",\"kind\":");
+            push_json_string(&mut json, observed_constant_kind_label(matched.kind));
+            json.push('}');
+        }
+        json.push_str("],\"unclassified_constants\":[");
+        for (index, constant) in self.unclassified_constants.iter().enumerate() {
+            if index != 0 {
+                json.push(',');
+            }
+            json.push_str("{\"name\":");
+            push_observed_name_json(&mut json, &constant.name);
+            json.push_str(",\"slot_index\":");
+            json.push_str(&constant.slot_index.to_string());
+            json.push_str(",\"kind\":");
+            push_json_string(&mut json, observed_constant_kind_label(constant.kind));
+            json.push('}');
+        }
+        json.push_str("]}\n");
+        Ok(json.into_bytes())
+    }
+}
+
+fn require_lowercase_sha256(value: &str, description: &str) -> Result<(), String> {
+    if value.len() != 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(format!(
+            "{description} must be exactly 64 lowercase hexadecimal SHA-256 characters"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_provisional_declaration_subject(
+    subject: &DeclarationAuditSubject,
+    direct_children: &[ProvisionalDirectChildEvidence],
+) -> Result<(), String> {
+    if subject.schema != DECLARATION_AUDIT_SUBJECT_SCHEMA {
+        return Err(format!(
+            "provisional declaration evidence subject has unsupported schema `{}`",
+            subject.schema
+        ));
+    }
+    if subject.proof_environment_id.is_empty()
+        || subject.proof_environment_id.contains(['\n', '\r'])
+    {
+        return Err(
+            "provisional declaration evidence proof-environment id must be one nonempty line"
+                .into(),
+        );
+    }
+    if subject.proof_policy.is_empty() || subject.proof_policy.contains(['\n', '\r']) {
+        return Err(
+            "provisional declaration evidence proof policy must be one nonempty line".into(),
+        );
+    }
+    require_generated_module_name(&subject.candidate.module_name)?;
+    require_lowercase_sha256(
+        &subject.candidate.generated_source_sha256,
+        "provisional declaration evidence generated-source digest",
+    )?;
+
+    if subject.dependencies.len() != direct_children.len() {
+        return Err(format!(
+            "provisional declaration evidence has {} direct child identities for {} ordered subject dependencies",
+            direct_children.len(),
+            subject.dependencies.len()
+        ));
+    }
+    let mut modules = BTreeSet::new();
+    modules.insert(subject.candidate.module_name.as_str());
+    for (index, (dependency, child)) in subject.dependencies.iter().zip(direct_children).enumerate()
+    {
+        require_generated_module_name(&dependency.module_name)?;
+        require_lowercase_sha256(
+            &dependency.generated_source_sha256,
+            &format!("provisional declaration dependency {index} generated-source digest"),
+        )?;
+        if !modules.insert(dependency.module_name.as_str()) {
+            return Err(format!(
+                "provisional declaration evidence has duplicate module identity `{}`",
+                dependency.module_name
+            ));
+        }
+        if child.module != dependency.module_name {
+            return Err(format!(
+                "provisional declaration child {index} names module `{}`, expected ordered dependency `{}`",
+                child.module, dependency.module_name
+            ));
+        }
+        for (digest, description) in [
+            (&child.subject_sha256, "subject"),
+            (&child.olean_sha256, "olean"),
+            (&child.provisional_sha256, "provisional evidence"),
+        ] {
+            require_lowercase_sha256(
+                digest,
+                &format!("provisional declaration child {index} {description} digest"),
+            )?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl ProvisionalDeclarationEvidence {
+    fn new(
+        subject: &DeclarationAuditSubject,
+        proof_ready_sha256: impl Into<String>,
+        candidate_olean_sha256: impl Into<String>,
+        inventory_result_utf8: Vec<u8>,
+        direct_children: Vec<ProvisionalDirectChildEvidence>,
+    ) -> Result<Self, String> {
+        validate_provisional_declaration_subject(subject, &direct_children)?;
+        let proof_ready_sha256 = proof_ready_sha256.into();
+        let candidate_olean_sha256 = candidate_olean_sha256.into();
+        require_lowercase_sha256(
+            &proof_ready_sha256,
+            "provisional declaration evidence proof READY digest",
+        )?;
+        require_lowercase_sha256(
+            &candidate_olean_sha256,
+            "provisional declaration evidence candidate olean digest",
+        )?;
+
+        let declaration_audit_subject_utf8 = subject.canonical_json();
+        std::str::from_utf8(&declaration_audit_subject_utf8).map_err(|error| {
+            format!("canonical declaration audit subject is not UTF-8: {error}")
+        })?;
+        let declaration_audit_subject_sha256 = crate::sha256::hex(&declaration_audit_subject_utf8);
+
+        let inventory = parse_declaration_inventory_output(true, &inventory_result_utf8, b"")?;
+        let preflight =
+            preflight_declaration_inventory(&subject.candidate.declaration_envelope, &inventory)?;
+        let denial_preflight_utf8 = preflight.canonical_json()?;
+        let inventory_result_sha256 = crate::sha256::hex(&inventory_result_utf8);
+        let denial_preflight_sha256 = crate::sha256::hex(&denial_preflight_utf8);
+
+        Ok(Self {
+            schema: PROVISIONAL_DECLARATION_EVIDENCE_SCHEMA,
+            authoritative: false,
+            reusable_without_fresh_compilation: false,
+            proof_assurance: PROVISIONAL_DECLARATION_ASSURANCE,
+            expected_module_name: subject.candidate.module_name.clone(),
+            proof_environment_id: subject.proof_environment_id.clone(),
+            proof_policy: subject.proof_policy.clone(),
+            generated_source_sha256: subject.candidate.generated_source_sha256.clone(),
+            proof_ready_sha256,
+            candidate_olean_sha256,
+            declaration_audit_subject_utf8,
+            declaration_audit_subject_sha256,
+            inventory_result_utf8,
+            inventory_result_sha256,
+            denial_preflight_utf8,
+            denial_preflight_sha256,
+            direct_children,
+        })
+    }
+
+    fn canonical_json(&self) -> Vec<u8> {
+        debug_assert_eq!(self.schema, PROVISIONAL_DECLARATION_EVIDENCE_SCHEMA);
+        debug_assert!(!self.authoritative);
+        debug_assert!(!self.reusable_without_fresh_compilation);
+        debug_assert_eq!(self.proof_assurance, PROVISIONAL_DECLARATION_ASSURANCE);
+        let subject = std::str::from_utf8(&self.declaration_audit_subject_utf8)
+            .expect("compiler-authored canonical declaration subject remains UTF-8");
+        let inventory = std::str::from_utf8(&self.inventory_result_utf8)
+            .expect("strictly parsed declaration inventory remains UTF-8");
+        let preflight = std::str::from_utf8(&self.denial_preflight_utf8)
+            .expect("compiler-authored declaration preflight remains UTF-8");
+
+        let mut json = String::new();
+        json.push_str("{\"schema\":");
+        push_json_string(&mut json, self.schema);
+        json.push_str(",\"authoritative\":false,\"reusable_without_fresh_compilation\":false,\"proof_assurance\":");
+        push_json_string(&mut json, self.proof_assurance);
+        json.push_str(",\"expected_module_name\":");
+        push_json_string(&mut json, &self.expected_module_name);
+        json.push_str(",\"proof_environment_id\":");
+        push_json_string(&mut json, &self.proof_environment_id);
+        json.push_str(",\"proof_policy\":");
+        push_json_string(&mut json, &self.proof_policy);
+        json.push_str(",\"generated_source_sha256\":");
+        push_json_string(&mut json, &self.generated_source_sha256);
+        json.push_str(",\"proof_ready_sha256\":");
+        push_json_string(&mut json, &self.proof_ready_sha256);
+        json.push_str(",\"candidate_olean_sha256\":");
+        push_json_string(&mut json, &self.candidate_olean_sha256);
+        json.push_str(",\"declaration_audit_subject_utf8\":");
+        push_json_string(&mut json, subject);
+        json.push_str(",\"declaration_audit_subject_sha256\":");
+        push_json_string(&mut json, &self.declaration_audit_subject_sha256);
+        json.push_str(",\"inventory_result_utf8\":");
+        push_json_string(&mut json, inventory);
+        json.push_str(",\"inventory_result_sha256\":");
+        push_json_string(&mut json, &self.inventory_result_sha256);
+        json.push_str(",\"denial_preflight_utf8\":");
+        push_json_string(&mut json, preflight);
+        json.push_str(",\"denial_preflight_sha256\":");
+        push_json_string(&mut json, &self.denial_preflight_sha256);
+        json.push_str(",\"direct_children\":[");
+        for (index, child) in self.direct_children.iter().enumerate() {
+            if index != 0 {
+                json.push(',');
+            }
+            json.push_str("{\"module\":");
+            push_json_string(&mut json, &child.module);
+            json.push_str(",\"subject_sha256\":");
+            push_json_string(&mut json, &child.subject_sha256);
+            json.push_str(",\"olean_sha256\":");
+            push_json_string(&mut json, &child.olean_sha256);
+            json.push_str(",\"provisional_sha256\":");
+            push_json_string(&mut json, &child.provisional_sha256);
+            json.push('}');
+        }
+        json.push_str("]}\n");
+        json.into_bytes()
+    }
+
+    fn canonical_sha256(&self) -> String {
+        crate::sha256::hex(&self.canonical_json())
+    }
+}
+
+fn provisional_string_field(
+    object: &serde_json::Map<String, serde_json::Value>,
+    field: &str,
+) -> Result<String, String> {
+    inventory_string(object, field, "provisional declaration evidence")
+}
+
+fn parse_provisional_children(
+    object: &serde_json::Map<String, serde_json::Value>,
+) -> Result<Vec<ProvisionalDirectChildEvidence>, String> {
+    inventory_array(
+        object,
+        "direct_children",
+        "provisional declaration evidence",
+    )?
+    .iter()
+    .enumerate()
+    .map(|(index, value)| {
+        let description = format!("provisional declaration direct child {index}");
+        let child = exact_inventory_object(
+            value,
+            &[
+                "module",
+                "subject_sha256",
+                "olean_sha256",
+                "provisional_sha256",
+            ],
+            &description,
+        )?;
+        let result = ProvisionalDirectChildEvidence {
+            module: inventory_string(child, "module", &description)?,
+            subject_sha256: inventory_string(child, "subject_sha256", &description)?,
+            olean_sha256: inventory_string(child, "olean_sha256", &description)?,
+            provisional_sha256: inventory_string(child, "provisional_sha256", &description)?,
+        };
+        for (digest, label) in [
+            (&result.subject_sha256, "subject"),
+            (&result.olean_sha256, "olean"),
+            (&result.provisional_sha256, "provisional evidence"),
+        ] {
+            require_lowercase_sha256(digest, &format!("{description} {label} digest"))?;
+        }
+        Ok(result)
+    })
+    .collect()
+}
+
+/// Strictly parse one portable provisional evidence record against the exact
+/// current compiler-owned inputs. Requiring canonical re-encoding rejects
+/// duplicate, unknown, missing, or reordered fields and alternative JSON
+/// spellings. Success still grants no authority and cannot skip compilation.
+#[cfg_attr(not(test), allow(dead_code))]
+fn parse_provisional_declaration_evidence(
+    bytes: &[u8],
+    expected_subject: &DeclarationAuditSubject,
+    expected_proof_ready_sha256: &str,
+    expected_candidate_olean_sha256: &str,
+    expected_inventory_result_utf8: &[u8],
+    expected_direct_children: &[ProvisionalDirectChildEvidence],
+) -> Result<ProvisionalDeclarationEvidence, String> {
+    let text = std::str::from_utf8(bytes)
+        .map_err(|error| format!("provisional declaration evidence is not UTF-8: {error}"))?;
+    let Some(line) = text.strip_suffix('\n') else {
+        return Err("provisional declaration evidence must end in exactly one newline".into());
+    };
+    if line.is_empty() || line.contains(['\n', '\r']) {
+        return Err("provisional declaration evidence must be exactly one JSON line".into());
+    }
+    let value: serde_json::Value = serde_json::from_str(line)
+        .map_err(|error| format!("provisional declaration evidence is not valid JSON: {error}"))?;
+    let object = exact_inventory_object(
+        &value,
+        &[
+            "schema",
+            "authoritative",
+            "reusable_without_fresh_compilation",
+            "proof_assurance",
+            "expected_module_name",
+            "proof_environment_id",
+            "proof_policy",
+            "generated_source_sha256",
+            "proof_ready_sha256",
+            "candidate_olean_sha256",
+            "declaration_audit_subject_utf8",
+            "declaration_audit_subject_sha256",
+            "inventory_result_utf8",
+            "inventory_result_sha256",
+            "denial_preflight_utf8",
+            "denial_preflight_sha256",
+            "direct_children",
+        ],
+        "provisional declaration evidence",
+    )?;
+    if provisional_string_field(object, "schema")? != PROVISIONAL_DECLARATION_EVIDENCE_SCHEMA {
+        return Err("provisional declaration evidence has the wrong schema".into());
+    }
+    if inventory_bool(object, "authoritative", "provisional declaration evidence")? {
+        return Err("provisional declaration evidence cannot be authoritative".into());
+    }
+    if inventory_bool(
+        object,
+        "reusable_without_fresh_compilation",
+        "provisional declaration evidence",
+    )? {
+        return Err(
+            "provisional declaration evidence cannot authorize reuse without fresh compilation"
+                .into(),
+        );
+    }
+    if provisional_string_field(object, "proof_assurance")? != PROVISIONAL_DECLARATION_ASSURANCE {
+        return Err("provisional declaration evidence has the wrong weak assurance".into());
+    }
+
+    validate_provisional_declaration_subject(expected_subject, expected_direct_children)?;
+    for (field, expected) in [
+        (
+            "expected_module_name",
+            expected_subject.candidate.module_name.as_str(),
+        ),
+        (
+            "proof_environment_id",
+            expected_subject.proof_environment_id.as_str(),
+        ),
+        ("proof_policy", expected_subject.proof_policy.as_str()),
+        (
+            "generated_source_sha256",
+            expected_subject.candidate.generated_source_sha256.as_str(),
+        ),
+        ("proof_ready_sha256", expected_proof_ready_sha256),
+        ("candidate_olean_sha256", expected_candidate_olean_sha256),
+    ] {
+        if provisional_string_field(object, field)? != expected {
+            return Err(format!(
+                "provisional declaration evidence field `{field}` does not match the exact current input"
+            ));
+        }
+    }
+
+    for field in [
+        "generated_source_sha256",
+        "proof_ready_sha256",
+        "candidate_olean_sha256",
+        "declaration_audit_subject_sha256",
+        "inventory_result_sha256",
+        "denial_preflight_sha256",
+    ] {
+        require_lowercase_sha256(
+            &provisional_string_field(object, field)?,
+            &format!("provisional declaration evidence field `{field}`"),
+        )?;
+    }
+
+    let subject_utf8 = provisional_string_field(object, "declaration_audit_subject_utf8")?;
+    let expected_subject_utf8 = expected_subject.canonical_json();
+    if subject_utf8.as_bytes() != expected_subject_utf8 {
+        return Err(
+            "provisional declaration evidence does not contain the exact current declaration subject bytes"
+                .into(),
+        );
+    }
+    if provisional_string_field(object, "declaration_audit_subject_sha256")?
+        != crate::sha256::hex(subject_utf8.as_bytes())
+    {
+        return Err(
+            "provisional declaration evidence subject digest does not match its exact bytes".into(),
+        );
+    }
+
+    let inventory_utf8 = provisional_string_field(object, "inventory_result_utf8")?;
+    if inventory_utf8.as_bytes() != expected_inventory_result_utf8 {
+        return Err(
+            "provisional declaration evidence does not contain the exact current inventory-result bytes"
+                .into(),
+        );
+    }
+    if provisional_string_field(object, "inventory_result_sha256")?
+        != crate::sha256::hex(inventory_utf8.as_bytes())
+    {
+        return Err(
+            "provisional declaration evidence inventory-result digest does not match its exact bytes"
+                .into(),
+        );
+    }
+
+    let parsed_children = parse_provisional_children(object)?;
+    if parsed_children != expected_direct_children {
+        return Err(
+            "provisional declaration evidence direct-child identities are not the exact current ordered inputs"
+                .into(),
+        );
+    }
+
+    let expected = ProvisionalDeclarationEvidence::new(
+        expected_subject,
+        expected_proof_ready_sha256,
+        expected_candidate_olean_sha256,
+        expected_inventory_result_utf8.to_vec(),
+        expected_direct_children.to_vec(),
+    )?;
+    let preflight_utf8 = provisional_string_field(object, "denial_preflight_utf8")?;
+    if preflight_utf8.as_bytes() != expected.denial_preflight_utf8 {
+        return Err(
+            "provisional declaration evidence denial-preflight bytes are inconsistent with the exact inventory and subject"
+                .into(),
+        );
+    }
+    if provisional_string_field(object, "denial_preflight_sha256")?
+        != crate::sha256::hex(preflight_utf8.as_bytes())
+    {
+        return Err(
+            "provisional declaration evidence denial-preflight digest does not match its exact bytes"
+                .into(),
+        );
+    }
+    if bytes != expected.canonical_json() {
+        return Err(
+            "provisional declaration evidence is not the exact canonical field order and encoding"
+                .into(),
+        );
+    }
+    Ok(expected)
+}
+
 fn validate_declaration_observation_subject(
     proof_environment_id: &str,
     proof_policy: &str,
@@ -5395,6 +5980,145 @@ mod proof_build_tests {
         (envelope, inventory)
     }
 
+    fn observed_name_json_value(name: &ObservedName) -> serde_json::Value {
+        match name {
+            ObservedName::Anonymous => serde_json::Value::Null,
+            ObservedName::Str { prefix, value } => serde_json::json!({
+                "str": [observed_name_json_value(prefix), value],
+            }),
+            ObservedName::Num { prefix, value } => serde_json::json!({
+                "num": [observed_name_json_value(prefix), value],
+            }),
+        }
+    }
+
+    fn optional_observed_name_json_value(name: &Option<ObservedName>) -> serde_json::Value {
+        name.as_ref().map_or(
+            serde_json::Value::Null,
+            |name| serde_json::json!({ "some": observed_name_json_value(name) }),
+        )
+    }
+
+    fn inventory_fixture_result(inventory: &DeclarationModuleInventory) -> Vec<u8> {
+        let mut result = serde_json::to_vec(&serde_json::json!({
+            "schema": DECLARATION_INVENTORY_RESULT_SCHEMA,
+            "observational": inventory.observational,
+            "is_module": inventory.is_module,
+            "imports": inventory.imports.iter().map(|import| serde_json::json!({
+                "module": observed_name_json_value(&import.module),
+                "import_all": import.import_all,
+                "is_exported": import.is_exported,
+                "is_meta": import.is_meta,
+            })).collect::<Vec<_>>(),
+            "constants": inventory.constants.iter().map(|slot| serde_json::json!({
+                "const_name": optional_observed_name_json_value(&slot.const_name),
+                "info_name": optional_observed_name_json_value(&slot.info_name),
+                "kind": slot.kind.map(observed_constant_kind_label),
+                "safety": slot.safety.map(|safety| match safety {
+                    ObservedConstantSafety::Safe => "safe",
+                    ObservedConstantSafety::Unsafe => "unsafe",
+                    ObservedConstantSafety::Partial => "partial",
+                }),
+            })).collect::<Vec<_>>(),
+            "extra_const_names": inventory.extra_const_names.iter()
+                .map(observed_name_json_value)
+                .collect::<Vec<_>>(),
+            "extension_families": inventory.extension_families.iter().map(|family| serde_json::json!({
+                "name": observed_name_json_value(&family.name),
+                "count": family.count,
+            })).collect::<Vec<_>>(),
+        }))
+        .expect("test inventory serializes");
+        result.push(b'\n');
+        parse_declaration_inventory_output(true, &result, b"")
+            .expect("test inventory uses the exact canonical transport");
+        result
+    }
+
+    struct ProvisionalEvidenceFixture {
+        subject: DeclarationAuditSubject,
+        proof_ready_sha256: String,
+        candidate_olean_sha256: String,
+        inventory_result: Vec<u8>,
+        direct_children: Vec<ProvisionalDirectChildEvidence>,
+    }
+
+    impl ProvisionalEvidenceFixture {
+        fn new() -> Self {
+            let (envelope, inventory) = declaration_preflight_fixture();
+            let dependencies = ["Dep_first", "Dep_second"]
+                .into_iter()
+                .map(|module| {
+                    declaration_module_fixture(
+                        module,
+                        &crate::sha256::hex(format!("{module} generated source").as_bytes()),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let subject = DeclarationAuditSubject::new(
+                "proof-env-v4-fnv64:0123456789abcdef",
+                "provisional-evidence-test-policy",
+                DeclarationModuleSubject {
+                    module_name: "Root_module".into(),
+                    generated_source_sha256: crate::sha256::hex(b"exact generated Lean source"),
+                    declaration_envelope: envelope,
+                },
+                dependencies,
+            );
+            let direct_children = subject
+                .dependencies
+                .iter()
+                .map(|dependency| ProvisionalDirectChildEvidence {
+                    module: dependency.module_name.clone(),
+                    subject_sha256: crate::sha256::hex(
+                        format!("{} complete subject", dependency.module_name).as_bytes(),
+                    ),
+                    olean_sha256: crate::sha256::hex(
+                        format!("{} olean", dependency.module_name).as_bytes(),
+                    ),
+                    provisional_sha256: crate::sha256::hex(
+                        format!("{} provisional", dependency.module_name).as_bytes(),
+                    ),
+                })
+                .collect();
+            Self {
+                subject,
+                proof_ready_sha256: crate::sha256::hex(b"exact proof READY bytes"),
+                candidate_olean_sha256: crate::sha256::hex(b"exact candidate olean bytes"),
+                inventory_result: inventory_fixture_result(&inventory),
+                direct_children,
+            }
+        }
+
+        fn evidence(&self) -> ProvisionalDeclarationEvidence {
+            ProvisionalDeclarationEvidence::new(
+                &self.subject,
+                self.proof_ready_sha256.clone(),
+                self.candidate_olean_sha256.clone(),
+                self.inventory_result.clone(),
+                self.direct_children.clone(),
+            )
+            .expect("the exact provisional evidence fixture constructs")
+        }
+
+        fn parse(&self, bytes: &[u8]) -> Result<ProvisionalDeclarationEvidence, String> {
+            parse_provisional_declaration_evidence(
+                bytes,
+                &self.subject,
+                &self.proof_ready_sha256,
+                &self.candidate_olean_sha256,
+                &self.inventory_result,
+                &self.direct_children,
+            )
+        }
+    }
+
+    fn replace_once(bytes: &[u8], from: &str, to: &str) -> Vec<u8> {
+        let text = std::str::from_utf8(bytes).expect("fixture evidence is UTF-8");
+        assert!(text.contains(from), "mutation needle is present: {from:?}");
+        text.replacen(from, to, 1).into_bytes()
+    }
+
     fn representative_declaration_canary_emitted(module_name: &str) -> Emitted {
         let mut vc = empty_vc();
         vc.classes.push(crate::vcgen::ClassEmit {
@@ -6422,6 +7146,452 @@ mod proof_build_tests {
             }]
         );
         assert_eq!(inventory.extension_families[0].count, 2);
+    }
+
+    #[test]
+    fn provisional_declaration_evidence_is_exact_portable_and_non_authoritative() {
+        let fixture = ProvisionalEvidenceFixture::new();
+        let evidence = fixture.evidence();
+        assert_eq!(evidence.schema, PROVISIONAL_DECLARATION_EVIDENCE_SCHEMA);
+        assert!(!evidence.authoritative);
+        assert!(!evidence.reusable_without_fresh_compilation);
+        assert_eq!(evidence.proof_assurance, PROVISIONAL_DECLARATION_ASSURANCE);
+        assert_eq!(evidence.expected_module_name, "Root_module");
+        assert_eq!(
+            evidence.generated_source_sha256,
+            fixture.subject.candidate.generated_source_sha256
+        );
+        assert_eq!(
+            evidence.declaration_audit_subject_utf8,
+            fixture.subject.canonical_json()
+        );
+        assert_eq!(
+            evidence.declaration_audit_subject_sha256,
+            crate::sha256::hex(&fixture.subject.canonical_json())
+        );
+        assert_eq!(evidence.inventory_result_utf8, fixture.inventory_result);
+        assert_eq!(
+            evidence.inventory_result_sha256,
+            crate::sha256::hex(&fixture.inventory_result)
+        );
+        assert_eq!(evidence.direct_children, fixture.direct_children);
+
+        let bytes = evidence.canonical_json();
+        assert!(bytes.ends_with(b"\n"));
+        assert_eq!(fixture.parse(&bytes), Ok(evidence.clone()));
+        assert_eq!(evidence.canonical_sha256().len(), 64);
+        require_lowercase_sha256(
+            &evidence.canonical_sha256(),
+            "test provisional evidence digest",
+        )
+        .expect("canonical evidence digest is lowercase SHA-256");
+
+        let outer: serde_json::Value =
+            serde_json::from_slice(&bytes).expect("canonical evidence is JSON");
+        assert_eq!(outer["authoritative"], false);
+        assert_eq!(outer["reusable_without_fresh_compilation"], false);
+        assert_eq!(outer["proof_assurance"], PROVISIONAL_DECLARATION_ASSURANCE);
+        assert_eq!(
+            outer["declaration_audit_subject_utf8"],
+            std::str::from_utf8(&fixture.subject.canonical_json())
+                .expect("subject fixture is UTF-8")
+        );
+        assert_eq!(outer["direct_children"][0]["module"], "Dep_first");
+        assert_eq!(outer["direct_children"][1]["module"], "Dep_second");
+
+        let preflight: serde_json::Value = serde_json::from_str(
+            outer["denial_preflight_utf8"]
+                .as_str()
+                .expect("preflight field is exact UTF-8"),
+        )
+        .expect("canonical denial preflight is JSON");
+        assert_eq!(preflight["schema"], DECLARATION_DENIAL_PREFLIGHT_SCHEMA);
+        assert_eq!(preflight["observational"], true);
+        assert_eq!(preflight["authoritative"], false);
+        assert_eq!(
+            preflight["explicit_matches"]
+                .as_array()
+                .expect("explicit matches are ordered")
+                .iter()
+                .map(|value| value["slot_index"].as_u64().unwrap())
+                .collect::<Vec<_>>(),
+            [3, 4, 2, 5, 6, 1]
+        );
+        assert_eq!(
+            preflight["unclassified_constants"]
+                .as_array()
+                .expect("unclassified constants are ordered")
+                .iter()
+                .map(|value| value["slot_index"].as_u64().unwrap())
+                .collect::<Vec<_>>(),
+            [0, 7, 8]
+        );
+        assert_eq!(
+            outer["denial_preflight_sha256"],
+            crate::sha256::hex(&evidence.denial_preflight_utf8)
+        );
+    }
+
+    #[test]
+    fn provisional_declaration_evidence_pins_a_zero_child_canonical_preflight() {
+        let sentinel = format!("SableGenerated.complete_{}", "0".repeat(64));
+        let subject = DeclarationAuditSubject::new(
+            "proof-env-v4-fnv64:0000000000000000",
+            "zero-child-policy",
+            DeclarationModuleSubject {
+                module_name: "Zero_child".into(),
+                generated_source_sha256: crate::sha256::hex(b"zero-child source"),
+                declaration_envelope: ExpectedDeclarationEnvelope {
+                    roots: vec![ExpectedDeclarationRoot {
+                        name: sentinel.clone(),
+                        kind: ExpectedDeclarationKind::TerminalSentinel,
+                    }],
+                },
+            },
+            Vec::new(),
+        );
+        let inventory_result = inventory_fixture_result(&DeclarationModuleInventory {
+            observational: true,
+            is_module: false,
+            imports: Vec::new(),
+            constants: vec![preflight_slot(
+                preflight_name(&sentinel),
+                ObservedConstantKind::Theorem,
+            )],
+            extra_const_names: Vec::new(),
+            extension_families: Vec::new(),
+        });
+        let ready_sha256 = crate::sha256::hex(b"zero-child READY");
+        let olean_sha256 = crate::sha256::hex(b"zero-child olean");
+        let evidence = ProvisionalDeclarationEvidence::new(
+            &subject,
+            &ready_sha256,
+            &olean_sha256,
+            inventory_result.clone(),
+            Vec::new(),
+        )
+        .expect("a no-import provisional evidence record remains representable");
+        let expected_preflight = [
+            r#"{"schema":"sable-declaration-denial-preflight-v1","observational":true,"authoritative":false,"explicit_matches":[{"role":"terminal_sentinel","root_index":0,"name":{"str":[{"str":[null,"SableGenerated"]},""#,
+            sentinel.strip_prefix("SableGenerated.").unwrap(),
+            r#""]},"slot_index":0,"kind":"theorem"}],"unclassified_constants":[]}"#,
+            "\n",
+        ]
+        .concat()
+        .into_bytes();
+        assert_eq!(evidence.denial_preflight_utf8, expected_preflight);
+        serde_json::from_slice::<serde_json::Value>(&evidence.denial_preflight_utf8)
+            .expect("the independently pinned denial preflight is canonical JSON");
+        assert!(evidence.direct_children.is_empty());
+
+        let bytes = evidence.canonical_json();
+        assert_eq!(
+            parse_provisional_declaration_evidence(
+                &bytes,
+                &subject,
+                &ready_sha256,
+                &olean_sha256,
+                &inventory_result,
+                &[],
+            ),
+            Ok(evidence)
+        );
+    }
+
+    #[test]
+    fn provisional_declaration_evidence_rejects_noncanonical_or_changed_fields() {
+        let fixture = ProvisionalEvidenceFixture::new();
+        let evidence = fixture.evidence();
+        let exact = evidence.canonical_json();
+        let exact_text = std::str::from_utf8(&exact).expect("fixture evidence is UTF-8");
+        let policy_json = serde_json::to_string(&fixture.subject.proof_policy).unwrap();
+        let schema_json = serde_json::to_string(PROVISIONAL_DECLARATION_EVIDENCE_SCHEMA).unwrap();
+        let assurance_json = serde_json::to_string(PROVISIONAL_DECLARATION_ASSURANCE).unwrap();
+        let wrong_digest = crate::sha256::hex(b"wrong digest input");
+
+        let mut mutations: Vec<(&str, Vec<u8>)> = vec![
+            ("legacy bare ok", b"ok\n".to_vec()),
+            (
+                "legacy policy stamp",
+                b"sable-verification-policy:legacy\n".to_vec(),
+            ),
+            ("missing final newline", exact[..exact.len() - 1].to_vec()),
+            (
+                "CRLF transport",
+                [exact[..exact.len() - 1].to_vec(), b"\r\n".to_vec()].concat(),
+            ),
+            (
+                "authoritative true",
+                replace_once(&exact, "\"authoritative\":false", "\"authoritative\":true"),
+            ),
+            (
+                "reuse true",
+                replace_once(
+                    &exact,
+                    "\"reusable_without_fresh_compilation\":false",
+                    "\"reusable_without_fresh_compilation\":true",
+                ),
+            ),
+            (
+                "wrong schema",
+                replace_once(
+                    &exact,
+                    &format!("\"schema\":{schema_json}"),
+                    "\"schema\":\"sable-provisional-declaration-evidence-v0\"",
+                ),
+            ),
+            (
+                "wrong assurance",
+                replace_once(
+                    &exact,
+                    &format!("\"proof_assurance\":{assurance_json}"),
+                    "\"proof_assurance\":\"fully-verified\"",
+                ),
+            ),
+            (
+                "wrong module",
+                replace_once(
+                    &exact,
+                    "\"expected_module_name\":\"Root_module\"",
+                    "\"expected_module_name\":\"Other_module\"",
+                ),
+            ),
+            (
+                "wrong environment",
+                replace_once(
+                    &exact,
+                    "\"proof_environment_id\":\"proof-env-v4-fnv64:0123456789abcdef\"",
+                    "\"proof_environment_id\":\"proof-env-v4-fnv64:ffffffffffffffff\"",
+                ),
+            ),
+            (
+                "wrong policy",
+                replace_once(
+                    &exact,
+                    &format!("\"proof_policy\":{policy_json}"),
+                    "\"proof_policy\":\"different-policy\"",
+                ),
+            ),
+            (
+                "wrong source digest",
+                replace_once(
+                    &exact,
+                    &format!(
+                        "\"generated_source_sha256\":\"{}\"",
+                        fixture.subject.candidate.generated_source_sha256
+                    ),
+                    &format!("\"generated_source_sha256\":\"{wrong_digest}\""),
+                ),
+            ),
+            (
+                "uppercase READY digest",
+                replace_once(
+                    &exact,
+                    &fixture.proof_ready_sha256,
+                    &fixture.proof_ready_sha256.to_uppercase(),
+                ),
+            ),
+            (
+                "wrong olean digest",
+                replace_once(&exact, &fixture.candidate_olean_sha256, &wrong_digest),
+            ),
+            (
+                "changed subject bytes",
+                replace_once(
+                    &exact,
+                    "\\\"module_name\\\":\\\"Root_module\\\"",
+                    "\\\"module_name\\\":\\\"Other_module\\\"",
+                ),
+            ),
+            (
+                "wrong subject digest",
+                replace_once(
+                    &exact,
+                    &evidence.declaration_audit_subject_sha256,
+                    &wrong_digest,
+                ),
+            ),
+            (
+                "changed inventory bytes",
+                replace_once(&exact, "\\\"is_module\\\":false", "\\\"is_module\\\":true"),
+            ),
+            (
+                "wrong inventory digest",
+                replace_once(&exact, &evidence.inventory_result_sha256, &wrong_digest),
+            ),
+            (
+                "changed preflight bytes",
+                replace_once(
+                    &exact,
+                    "sable-declaration-denial-preflight-v1\\\",\\\"observational\\\":true",
+                    "sable-declaration-denial-preflight-v1\\\",\\\"observational\\\":false",
+                ),
+            ),
+            (
+                "wrong preflight digest",
+                replace_once(&exact, &evidence.denial_preflight_sha256, &wrong_digest),
+            ),
+        ];
+
+        let prefix = format!("{{\"schema\":{schema_json},\"authoritative\":false");
+        mutations.push((
+            "reordered top-level fields",
+            replace_once(
+                &exact,
+                &prefix,
+                &format!("{{\"authoritative\":false,\"schema\":{schema_json}"),
+            ),
+        ));
+        mutations.push((
+            "unknown field",
+            replace_once(
+                &exact,
+                &format!("{{\"schema\":{schema_json}"),
+                &format!("{{\"schema\":{schema_json},\"unknown\":0"),
+            ),
+        ));
+        mutations.push((
+            "missing field",
+            replace_once(&exact, &format!(",\"proof_policy\":{policy_json}"), ""),
+        ));
+        mutations.push((
+            "duplicate field",
+            replace_once(
+                &exact,
+                &format!(",\"proof_policy\":{policy_json}"),
+                &format!(",\"proof_policy\":{policy_json},\"proof_policy\":{policy_json}"),
+            ),
+        ));
+        mutations.push((
+            "alternative whitespace",
+            replace_once(
+                &exact,
+                ",\"authoritative\":false",
+                ", \"authoritative\":false",
+            ),
+        ));
+
+        let child_json = |child: &ProvisionalDirectChildEvidence| {
+            format!(
+                "{{\"module\":{},\"subject_sha256\":{},\"olean_sha256\":{},\"provisional_sha256\":{}}}",
+                serde_json::to_string(&child.module).unwrap(),
+                serde_json::to_string(&child.subject_sha256).unwrap(),
+                serde_json::to_string(&child.olean_sha256).unwrap(),
+                serde_json::to_string(&child.provisional_sha256).unwrap(),
+            )
+        };
+        let first = child_json(&fixture.direct_children[0]);
+        let second = child_json(&fixture.direct_children[1]);
+        let ordered = format!("[{first},{second}]");
+        mutations.push((
+            "reordered children",
+            replace_once(&exact, &ordered, &format!("[{second},{first}]")),
+        ));
+        mutations.push((
+            "duplicate child identity",
+            replace_once(&exact, &ordered, &format!("[{first},{first}]")),
+        ));
+        mutations.push((
+            "uppercase child digest",
+            replace_once(
+                &exact,
+                &fixture.direct_children[0].subject_sha256,
+                &fixture.direct_children[0].subject_sha256.to_uppercase(),
+            ),
+        ));
+        mutations.push((
+            "wrong child olean digest",
+            replace_once(
+                &exact,
+                &fixture.direct_children[0].olean_sha256,
+                &wrong_digest,
+            ),
+        ));
+        mutations.push((
+            "wrong child provisional digest",
+            replace_once(
+                &exact,
+                &fixture.direct_children[0].provisional_sha256,
+                &wrong_digest,
+            ),
+        ));
+        mutations.push((
+            "wrong child module",
+            replace_once(
+                &exact,
+                "\"module\":\"Dep_first\"",
+                "\"module\":\"Dep_forged\"",
+            ),
+        ));
+
+        for (description, mutation) in mutations {
+            assert!(
+                fixture.parse(&mutation).is_err(),
+                "{description} unexpectedly passed:\n{}",
+                String::from_utf8_lossy(&mutation)
+            );
+        }
+        assert_eq!(
+            exact_text.matches("\"proof_policy\"").count(),
+            1,
+            "the outer policy field occurs once; its nested subject spelling is JSON-escaped"
+        );
+    }
+
+    #[test]
+    fn provisional_declaration_evidence_constructor_rejects_bad_hashes_and_child_order() {
+        let fixture = ProvisionalEvidenceFixture::new();
+        for invalid in [
+            "",
+            "0",
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcde",
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0",
+            "ABCDEF0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
+            "g123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        ] {
+            assert!(require_lowercase_sha256(invalid, "test digest").is_err());
+        }
+
+        assert!(
+            ProvisionalDeclarationEvidence::new(
+                &fixture.subject,
+                "not-a-digest",
+                fixture.candidate_olean_sha256.clone(),
+                fixture.inventory_result.clone(),
+                fixture.direct_children.clone(),
+            )
+            .is_err()
+        );
+
+        let mut reversed = fixture.direct_children.clone();
+        reversed.reverse();
+        assert!(
+            ProvisionalDeclarationEvidence::new(
+                &fixture.subject,
+                fixture.proof_ready_sha256.clone(),
+                fixture.candidate_olean_sha256.clone(),
+                fixture.inventory_result.clone(),
+                reversed,
+            )
+            .is_err(),
+            "direct child identities cannot be reordered independently of subject dependencies"
+        );
+
+        let mut duplicate_subject = fixture.subject.clone();
+        duplicate_subject.dependencies[1] = duplicate_subject.dependencies[0].clone();
+        let mut duplicate_children = fixture.direct_children.clone();
+        duplicate_children[1] = duplicate_children[0].clone();
+        assert!(
+            ProvisionalDeclarationEvidence::new(
+                &duplicate_subject,
+                fixture.proof_ready_sha256,
+                fixture.candidate_olean_sha256,
+                fixture.inventory_result,
+                duplicate_children,
+            )
+            .is_err(),
+            "duplicate dependency and child identities fail closed"
+        );
     }
 
     #[test]
