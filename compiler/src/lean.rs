@@ -9,7 +9,7 @@
 use crate::diag::Diagnostic;
 use crate::span::Span;
 use crate::vcgen::{Obligation, VcResult};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::os::fd::AsRawFd;
@@ -361,7 +361,7 @@ const DECLARATION_OBSERVATION_SCHEMA: &str = "sable-declaration-observation-v1";
 /// Exact recursive Lean `Name` identity. Printable names are insufficient for
 /// hygienic components, so the transport preserves anonymous/str/num shape.
 #[cfg_attr(not(test), allow(dead_code))]
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum ObservedName {
     Anonymous,
     Str {
@@ -438,6 +438,64 @@ pub(crate) struct DeclarationModuleInventory {
     pub(crate) constants: Vec<ObservedConstantSlot>,
     pub(crate) extra_const_names: Vec<ObservedName>,
     pub(crate) extension_families: Vec<ObservedExtensionFamily>,
+}
+
+/// Source-side role of one explicit declaration that the coarse inventory
+/// preflight can match by exact structural name and `ConstantInfo` kind.
+/// These roles deliberately do not claim body, type, attribute, or ownership
+/// correspondence.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum DeclarationInventoryExplicitRole {
+    StructureRoot {
+        root_index: usize,
+    },
+    DefinitionRoot {
+        root_index: usize,
+    },
+    TheoremRoot {
+        root_index: usize,
+    },
+    TerminalSentinel {
+        root_index: usize,
+    },
+    StructureField {
+        root_index: usize,
+        field_index: usize,
+    },
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DeclarationInventoryExplicitMatch {
+    pub(crate) role: DeclarationInventoryExplicitRole,
+    pub(crate) name: ObservedName,
+    pub(crate) slot_index: usize,
+    pub(crate) kind: ObservedConstantKind,
+}
+
+/// One candidate-local constant not covered by the explicit source envelope.
+/// Its Lean safety bit is known to be `safe`, but that is not a declaration-
+/// policy verdict: the constant remains wholly unclassified.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DeclarationInventoryUnclassifiedConstant {
+    pub(crate) name: ObservedName,
+    pub(crate) slot_index: usize,
+    pub(crate) kind: ObservedConstantKind,
+}
+
+/// Coarse, denial-only result over one already-bound raw inventory. Success
+/// means only that the narrow rejection rules ran and the explicit names had
+/// compatible top-level kinds. It is never candidate acceptance and grants no
+/// cache or proof authority; every unmatched constant stays visible below.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DeclarationInventoryPreflight {
+    pub(crate) observational: bool,
+    pub(crate) authoritative: bool,
+    pub(crate) explicit_matches: Vec<DeclarationInventoryExplicitMatch>,
+    pub(crate) unclassified_constants: Vec<DeclarationInventoryUnclassifiedConstant>,
 }
 
 /// An opaque, compiler-owned path reserved for a future freshly compiled
@@ -573,6 +631,7 @@ pub(crate) struct CompiledDeclarationObservation {
     lean_stdout_sha256: String,
     lean_messages: Vec<LeanMessage>,
     declaration: DeclarationModuleObservation,
+    inventory_preflight: DeclarationInventoryPreflight,
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -3168,6 +3227,305 @@ fn parse_declaration_inventory_output(
     })
 }
 
+/// Convert Sable's deliberately narrow compiler-owned Lean name spelling to
+/// the exact recursive `Name.str` shape emitted by Lean. This does not parse
+/// arbitrary Lean identifiers: numeric, quoted, hygienic, empty, and non-ASCII
+/// components are rejected instead of being compared through display text.
+fn observed_ascii_dotted_name(name: &str) -> Result<ObservedName, String> {
+    if name.is_empty() {
+        return Err("expected Lean declaration name is empty".into());
+    }
+    let mut observed = ObservedName::Anonymous;
+    for component in name.split('.') {
+        let bytes = component.as_bytes();
+        let Some(first) = bytes.first().copied() else {
+            return Err(format!(
+                "expected Lean declaration name `{name}` has an empty component"
+            ));
+        };
+        if !(first.is_ascii_alphabetic() || first == b'_')
+            || (first == b'_' && bytes.len() == 1)
+            || !bytes[1..]
+                .iter()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(*byte, b'_' | b'\''))
+        {
+            return Err(format!(
+                "expected Lean declaration name `{name}` is outside the pinned ASCII dotted/apostrophe spelling"
+            ));
+        }
+        observed = ObservedName::Str {
+            prefix: Box::new(observed),
+            value: component.to_owned(),
+        };
+    }
+    Ok(observed)
+}
+
+fn observed_name_has_terminal_sentinel_prefix(name: &ObservedName) -> bool {
+    match name {
+        ObservedName::Anonymous => false,
+        ObservedName::Str { prefix, value } => {
+            matches!(
+                prefix.as_ref(),
+                ObservedName::Str {
+                    prefix: outer,
+                    value: namespace,
+                } if matches!(outer.as_ref(), ObservedName::Anonymous)
+                    && namespace == "SableGenerated"
+                    && value.starts_with("complete_")
+            ) || observed_name_has_terminal_sentinel_prefix(prefix)
+        }
+        ObservedName::Num { prefix, .. } => observed_name_has_terminal_sentinel_prefix(prefix),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ExpectedInventoryDeclaration {
+    role: DeclarationInventoryExplicitRole,
+    name: ObservedName,
+}
+
+fn explicit_inventory_kind_matches(
+    role: &DeclarationInventoryExplicitRole,
+    kind: ObservedConstantKind,
+) -> bool {
+    match role {
+        DeclarationInventoryExplicitRole::StructureRoot { .. } => {
+            kind == ObservedConstantKind::Inductive
+        }
+        DeclarationInventoryExplicitRole::DefinitionRoot { .. } => {
+            kind == ObservedConstantKind::Definition
+        }
+        DeclarationInventoryExplicitRole::TheoremRoot { .. }
+        | DeclarationInventoryExplicitRole::TerminalSentinel { .. } => {
+            kind == ObservedConstantKind::Theorem
+        }
+        // Lean records projections whose result is in `Prop` as theorem
+        // constants; data-valued projections are ordinary definitions.
+        DeclarationInventoryExplicitRole::StructureField { .. } => matches!(
+            kind,
+            ObservedConstantKind::Definition | ObservedConstantKind::Theorem
+        ),
+    }
+}
+
+/// Apply only the coarse rejection rules supported by the raw v1 inventory.
+/// This intentionally does not inspect types/bodies, prove auxiliary
+/// attribution, authenticate imports or a module header, interpret extension
+/// payloads, or close transitive axioms.
+fn preflight_declaration_inventory(
+    envelope: &ExpectedDeclarationEnvelope,
+    inventory: &DeclarationModuleInventory,
+) -> Result<DeclarationInventoryPreflight, String> {
+    let Some(last_root_index) = envelope.roots.len().checked_sub(1) else {
+        return Err("declaration inventory preflight expected a nonempty envelope".into());
+    };
+    for (root_index, root) in envelope.roots.iter().enumerate() {
+        let is_terminal = matches!(&root.kind, ExpectedDeclarationKind::TerminalSentinel);
+        if is_terminal != (root_index == last_root_index) {
+            return Err(
+                "declaration inventory preflight requires exactly one terminal sentinel and requires it to be the final explicit root"
+                    .into(),
+            );
+        }
+    }
+
+    let mut expected_names = BTreeSet::new();
+    let mut expected = Vec::new();
+    for (root_index, root) in envelope.roots.iter().enumerate() {
+        let role = match &root.kind {
+            ExpectedDeclarationKind::Structure { .. } => {
+                DeclarationInventoryExplicitRole::StructureRoot { root_index }
+            }
+            ExpectedDeclarationKind::Definition { .. } => {
+                DeclarationInventoryExplicitRole::DefinitionRoot { root_index }
+            }
+            ExpectedDeclarationKind::Theorem { .. } => {
+                DeclarationInventoryExplicitRole::TheoremRoot { root_index }
+            }
+            ExpectedDeclarationKind::TerminalSentinel => {
+                DeclarationInventoryExplicitRole::TerminalSentinel { root_index }
+            }
+        };
+        let name = observed_ascii_dotted_name(&root.name)?;
+        if !expected_names.insert(name.clone()) {
+            return Err(format!(
+                "declaration inventory preflight has duplicate explicit structural name `{}`",
+                root.name
+            ));
+        }
+        expected.push(ExpectedInventoryDeclaration { role, name });
+
+        if let ExpectedDeclarationKind::Structure { fields } = &root.kind {
+            for (field_index, field) in fields.iter().enumerate() {
+                let name = observed_ascii_dotted_name(field)?;
+                if !expected_names.insert(name.clone()) {
+                    return Err(format!(
+                        "declaration inventory preflight has duplicate explicit structural name `{field}`"
+                    ));
+                }
+                expected.push(ExpectedInventoryDeclaration {
+                    role: DeclarationInventoryExplicitRole::StructureField {
+                        root_index,
+                        field_index,
+                    },
+                    name,
+                });
+            }
+        }
+    }
+    let expected_sentinel = expected
+        .iter()
+        .find(|declaration| {
+            matches!(
+                &declaration.role,
+                DeclarationInventoryExplicitRole::TerminalSentinel { .. }
+            )
+        })
+        .expect("the envelope shape check established one terminal sentinel")
+        .name
+        .clone();
+    if !observed_name_has_terminal_sentinel_prefix(&expected_sentinel) {
+        return Err(
+            "declaration inventory preflight expected terminal sentinel is outside its reserved structural prefix"
+                .into(),
+        );
+    }
+
+    if !inventory.observational {
+        return Err("declaration inventory preflight requires observational inventory data".into());
+    }
+    if inventory.is_module {
+        return Err(
+            "declaration inventory preflight rejects module-system/multipart candidates".into(),
+        );
+    }
+    if !inventory.extra_const_names.is_empty() {
+        return Err(format!(
+            "declaration inventory preflight rejects {} code-generation extra constant name(s)",
+            inventory.extra_const_names.len()
+        ));
+    }
+
+    let mut constants_by_name = BTreeMap::new();
+    let mut constants = Vec::with_capacity(inventory.constants.len());
+    for (slot_index, slot) in inventory.constants.iter().enumerate() {
+        let (Some(const_name), Some(info_name), Some(kind), Some(safety)) = (
+            slot.const_name.as_ref(),
+            slot.info_name.as_ref(),
+            slot.kind,
+            slot.safety,
+        ) else {
+            return Err(format!(
+                "declaration inventory preflight constant slot {slot_index} does not contain both names, kind, and safety"
+            ));
+        };
+        if const_name != info_name {
+            return Err(format!(
+                "declaration inventory preflight constant slot {slot_index} has mismatched structural names"
+            ));
+        }
+        if matches!(const_name, ObservedName::Anonymous) {
+            return Err(format!(
+                "declaration inventory preflight constant slot {slot_index} has an anonymous name"
+            ));
+        }
+        match safety {
+            ObservedConstantSafety::Safe => {}
+            ObservedConstantSafety::Unsafe => {
+                return Err(format!(
+                    "declaration inventory preflight rejects unsafe constant in slot {slot_index}"
+                ));
+            }
+            ObservedConstantSafety::Partial => {
+                return Err(format!(
+                    "declaration inventory preflight rejects partial constant in slot {slot_index}"
+                ));
+            }
+        }
+        if kind == ObservedConstantKind::Axiom {
+            return Err(format!(
+                "declaration inventory preflight rejects candidate axiom in slot {slot_index}"
+            ));
+        }
+        if observed_name_has_terminal_sentinel_prefix(const_name)
+            && const_name != &expected_sentinel
+        {
+            return Err(format!(
+                "declaration inventory preflight rejects an unexpected declaration under the reserved terminal-sentinel prefix in slot {slot_index}"
+            ));
+        }
+        if constants_by_name
+            .insert(const_name.clone(), (slot_index, kind))
+            .is_some()
+        {
+            return Err(format!(
+                "declaration inventory preflight has duplicate constant structural name in slot {slot_index}"
+            ));
+        }
+        constants.push((slot_index, const_name.clone(), kind));
+    }
+
+    let mut explicit_matches = Vec::with_capacity(expected.len());
+    let mut matched_names = BTreeSet::new();
+    for declaration in expected {
+        let Some(&(slot_index, kind)) = constants_by_name.get(&declaration.name) else {
+            return Err(format!(
+                "declaration inventory preflight is missing explicit declaration {:?}",
+                declaration.role
+            ));
+        };
+        if !explicit_inventory_kind_matches(&declaration.role, kind) {
+            return Err(format!(
+                "declaration inventory preflight explicit declaration {:?} has incompatible observed kind {:?}",
+                declaration.role, kind
+            ));
+        }
+        matched_names.insert(declaration.name.clone());
+        explicit_matches.push(DeclarationInventoryExplicitMatch {
+            role: declaration.role,
+            name: declaration.name,
+            slot_index,
+            kind,
+        });
+    }
+
+    let unclassified_constants = constants
+        .into_iter()
+        .filter(|(_, name, _)| !matched_names.contains(name))
+        .map(
+            |(slot_index, name, kind)| DeclarationInventoryUnclassifiedConstant {
+                name,
+                slot_index,
+                kind,
+            },
+        )
+        .collect();
+    Ok(DeclarationInventoryPreflight {
+        observational: true,
+        authoritative: false,
+        explicit_matches,
+        unclassified_constants,
+    })
+}
+
+fn preflight_declaration_observation(
+    observation: &DeclarationModuleObservation,
+) -> Result<DeclarationInventoryPreflight, String> {
+    if !observation.observational || observation.authoritative {
+        return Err(
+            "declaration inventory preflight requires a bound non-authoritative observation".into(),
+        );
+    }
+    preflight_declaration_inventory(
+        &observation
+            .declaration_subject
+            .candidate
+            .declaration_envelope,
+        &observation.inventory,
+    )
+}
+
 fn validate_declaration_observation_subject(
     proof_environment_id: &str,
     proof_policy: &str,
@@ -3711,9 +4069,10 @@ pub(crate) fn compile_and_observe_declaration_module(
         {
             return Err(
                 "declaration observation source did not remain byte-identical across compilation and inventory"
-                    .into(),
+                .into(),
             );
         }
+        let inventory_preflight = preflight_declaration_observation(&declaration)?;
 
         CompiledDeclarationObservation {
             observational: true,
@@ -3729,6 +4088,7 @@ pub(crate) fn compile_and_observe_declaration_module(
             lean_stdout: lean_output.stdout,
             lean_messages: lean_output.messages,
             declaration,
+            inventory_preflight,
         }
     };
 
@@ -4932,6 +5292,109 @@ mod proof_build_tests {
         .to_vec()
     }
 
+    fn preflight_name(name: &str) -> ObservedName {
+        observed_ascii_dotted_name(name).expect("fixture uses the pinned explicit-name spelling")
+    }
+
+    fn preflight_slot(name: ObservedName, kind: ObservedConstantKind) -> ObservedConstantSlot {
+        ObservedConstantSlot {
+            const_name: Some(name.clone()),
+            info_name: Some(name),
+            kind: Some(kind),
+            safety: Some(ObservedConstantSafety::Safe),
+        }
+    }
+
+    fn declaration_preflight_fixture() -> (ExpectedDeclarationEnvelope, DeclarationModuleInventory)
+    {
+        let envelope = ExpectedDeclarationEnvelope {
+            roots: vec![
+                ExpectedDeclarationRoot {
+                    name: "Root.Record".into(),
+                    kind: ExpectedDeclarationKind::Structure {
+                        fields: vec!["Root.Record.data".into(), "Root.Record.proof".into()],
+                    },
+                },
+                ExpectedDeclarationRoot {
+                    name: "Root.definition".into(),
+                    kind: ExpectedDeclarationKind::Definition {
+                        recursive: true,
+                        noncomputable: true,
+                        simp: false,
+                    },
+                },
+                ExpectedDeclarationRoot {
+                    name: "Root.fact".into(),
+                    kind: ExpectedDeclarationKind::Theorem {
+                        simp: true,
+                        sable_fact: true,
+                    },
+                },
+                ExpectedDeclarationRoot {
+                    name: "SableGenerated.complete_deadbeef".into(),
+                    kind: ExpectedDeclarationKind::TerminalSentinel,
+                },
+            ],
+        };
+        let private_auxiliary = ObservedName::Num {
+            prefix: Box::new(ObservedName::Str {
+                prefix: Box::new(ObservedName::Anonymous),
+                value: "_private".into(),
+            }),
+            value: 7,
+        };
+        // The explicit constants are intentionally not in envelope order.
+        // The private numeric name and constructor remain unclassified.
+        let inventory = DeclarationModuleInventory {
+            observational: true,
+            is_module: false,
+            imports: vec![ObservedModuleImport {
+                module: preflight_name("Sable"),
+                import_all: true,
+                is_exported: false,
+                is_meta: false,
+            }],
+            constants: vec![
+                preflight_slot(private_auxiliary, ObservedConstantKind::Opaque),
+                preflight_slot(
+                    preflight_name("SableGenerated.complete_deadbeef"),
+                    ObservedConstantKind::Theorem,
+                ),
+                preflight_slot(
+                    preflight_name("Root.Record.proof"),
+                    ObservedConstantKind::Theorem,
+                ),
+                preflight_slot(
+                    preflight_name("Root.Record"),
+                    ObservedConstantKind::Inductive,
+                ),
+                preflight_slot(
+                    preflight_name("Root.Record.data"),
+                    ObservedConstantKind::Definition,
+                ),
+                preflight_slot(
+                    preflight_name("Root.definition"),
+                    ObservedConstantKind::Definition,
+                ),
+                preflight_slot(preflight_name("Root.fact"), ObservedConstantKind::Theorem),
+                preflight_slot(
+                    preflight_name("Root.Record.mk"),
+                    ObservedConstantKind::Constructor,
+                ),
+                preflight_slot(
+                    preflight_name("Root.unclassifiedQuotient"),
+                    ObservedConstantKind::Quotient,
+                ),
+            ],
+            extra_const_names: Vec::new(),
+            extension_families: vec![ObservedExtensionFamily {
+                name: preflight_name("Lean.exampleExtension"),
+                count: 2,
+            }],
+        };
+        (envelope, inventory)
+    }
+
     #[test]
     fn declaration_audit_subject_has_one_exact_ordered_serialization() {
         let subject = DeclarationAuditSubject::new(
@@ -5902,6 +6365,248 @@ mod proof_build_tests {
     }
 
     #[test]
+    fn declaration_preflight_maps_only_exact_ascii_dotted_names() {
+        assert_eq!(
+            observed_ascii_dotted_name("SableR_Node.proof'")
+                .expect("the narrow dotted/apostrophe spelling maps exactly"),
+            ObservedName::Str {
+                prefix: Box::new(ObservedName::Str {
+                    prefix: Box::new(ObservedName::Anonymous),
+                    value: "SableR_Node".into(),
+                }),
+                value: "proof'".into(),
+            }
+        );
+        for invalid in [
+            "",
+            ".Root",
+            "Root.",
+            "Root..field",
+            "Root.7",
+            "7Root",
+            "_",
+            "Root.«field»",
+            "Root.field-name",
+            "Røot.field",
+        ] {
+            assert!(
+                observed_ascii_dotted_name(invalid).is_err(),
+                "`{invalid}` is outside the pinned explicit-name spelling"
+            );
+        }
+        let nested = observed_ascii_dotted_name("Root.field").expect("valid nested name");
+        assert_ne!(
+            nested,
+            ObservedName::Str {
+                prefix: Box::new(ObservedName::Anonymous),
+                value: "Root.field".into(),
+            },
+            "a printable dotted component is not a structural dotted name"
+        );
+        assert_ne!(
+            nested,
+            ObservedName::Num {
+                prefix: Box::new(preflight_name("Root")),
+                value: 1,
+            },
+            "numeric hygienic components are never inferred from text"
+        );
+    }
+
+    #[test]
+    fn declaration_preflight_matches_explicit_names_and_retains_every_unknown() {
+        let (envelope, inventory) = declaration_preflight_fixture();
+        let preflight = preflight_declaration_inventory(&envelope, &inventory)
+            .expect("the coarse denial-only fixture passes");
+
+        assert!(preflight.observational);
+        assert!(!preflight.authoritative);
+        assert_eq!(preflight.explicit_matches.len(), 6);
+        assert_eq!(
+            preflight
+                .explicit_matches
+                .iter()
+                .map(|matched| matched.slot_index)
+                .collect::<Vec<_>>(),
+            vec![3, 4, 2, 5, 6, 1],
+            "lookup is by exact structural name while output retains envelope order"
+        );
+        assert!(matches!(
+            &preflight.explicit_matches[0].role,
+            DeclarationInventoryExplicitRole::StructureRoot { root_index: 0 }
+        ));
+        assert!(matches!(
+            &preflight.explicit_matches[2].role,
+            DeclarationInventoryExplicitRole::StructureField {
+                root_index: 0,
+                field_index: 1,
+            }
+        ));
+        assert!(matches!(
+            &preflight.explicit_matches[5].role,
+            DeclarationInventoryExplicitRole::TerminalSentinel { root_index: 3 }
+        ));
+        assert_eq!(
+            preflight
+                .unclassified_constants
+                .iter()
+                .map(|constant| (constant.slot_index, constant.kind))
+                .collect::<Vec<_>>(),
+            vec![
+                (0, ObservedConstantKind::Opaque),
+                (7, ObservedConstantKind::Constructor),
+                (8, ObservedConstantKind::Quotient),
+            ],
+            "safe-bit constants outside the explicit envelope remain policy-unclassified in slot order"
+        );
+        assert!(matches!(
+            &preflight.unclassified_constants[0].name,
+            ObservedName::Num { value: 7, .. }
+        ));
+        assert_eq!(inventory.imports.len(), 1);
+        assert_eq!(inventory.extension_families.len(), 1);
+        assert_eq!(inventory.extension_families[0].count, 2);
+    }
+
+    #[test]
+    fn declaration_preflight_rejects_every_global_denial_condition() {
+        let (envelope, base) = declaration_preflight_fixture();
+        let mut cases = Vec::new();
+
+        let mut inventory = base.clone();
+        inventory.observational = false;
+        cases.push(("non-observational input", inventory));
+
+        let mut inventory = base.clone();
+        inventory.is_module = true;
+        cases.push(("module-system output", inventory));
+
+        let mut inventory = base.clone();
+        inventory
+            .extra_const_names
+            .push(preflight_name("Root.codegen_extra"));
+        cases.push(("code-generation extras", inventory));
+
+        let mut inventory = base.clone();
+        inventory.constants[3].const_name = None;
+        cases.push(("missing constNames side", inventory));
+
+        let mut inventory = base.clone();
+        inventory.constants[3].kind = None;
+        cases.push(("missing kind", inventory));
+
+        let mut inventory = base.clone();
+        inventory.constants[3].info_name = Some(preflight_name("Root.Other"));
+        cases.push(("mismatched parallel names", inventory));
+
+        let mut inventory = base.clone();
+        let duplicate = inventory.constants[3].clone();
+        inventory.constants.push(duplicate);
+        cases.push(("duplicate structural name", inventory));
+
+        let mut inventory = base.clone();
+        inventory.constants[0].kind = Some(ObservedConstantKind::Axiom);
+        cases.push(("candidate axiom", inventory));
+
+        let mut inventory = base.clone();
+        inventory.constants[0].safety = Some(ObservedConstantSafety::Unsafe);
+        cases.push(("unclassified unsafe constant", inventory));
+
+        let mut inventory = base.clone();
+        inventory.constants[0].safety = Some(ObservedConstantSafety::Partial);
+        cases.push(("unclassified partial constant", inventory));
+
+        let mut inventory = base.clone();
+        inventory.constants[0].const_name = Some(ObservedName::Anonymous);
+        inventory.constants[0].info_name = Some(ObservedName::Anonymous);
+        cases.push(("anonymous constant", inventory));
+
+        let mut inventory = base;
+        inventory.constants.push(preflight_slot(
+            preflight_name("SableGenerated.complete_unexpected"),
+            ObservedConstantKind::Theorem,
+        ));
+        cases.push(("additional reserved sentinel", inventory));
+
+        for (description, inventory) in cases {
+            assert!(
+                preflight_declaration_inventory(&envelope, &inventory).is_err(),
+                "{description} must fail closed"
+            );
+        }
+    }
+
+    #[test]
+    fn declaration_preflight_rejects_missing_wrong_or_ambiguous_explicit_declarations() {
+        let (base_envelope, base_inventory) = declaration_preflight_fixture();
+        let mut cases = Vec::new();
+
+        let mut inventory = base_inventory.clone();
+        inventory.constants.remove(3);
+        cases.push(("missing structure root", base_envelope.clone(), inventory));
+
+        let mut inventory = base_inventory.clone();
+        inventory.constants.remove(4);
+        cases.push(("missing structure field", base_envelope.clone(), inventory));
+
+        for (description, slot, kind) in [
+            ("wrong structure kind", 3, ObservedConstantKind::Definition),
+            ("wrong field kind", 4, ObservedConstantKind::Constructor),
+            ("wrong definition kind", 5, ObservedConstantKind::Theorem),
+            ("wrong theorem kind", 6, ObservedConstantKind::Definition),
+            ("wrong sentinel kind", 1, ObservedConstantKind::Definition),
+        ] {
+            let mut inventory = base_inventory.clone();
+            inventory.constants[slot].kind = Some(kind);
+            cases.push((description, base_envelope.clone(), inventory));
+        }
+
+        let mut envelope = base_envelope.clone();
+        envelope.roots.pop();
+        cases.push((
+            "missing expected sentinel",
+            envelope,
+            base_inventory.clone(),
+        ));
+
+        let mut envelope = base_envelope.clone();
+        envelope.roots[1].kind = ExpectedDeclarationKind::TerminalSentinel;
+        cases.push((
+            "non-final expected sentinel",
+            envelope,
+            base_inventory.clone(),
+        ));
+
+        let mut envelope = base_envelope.clone();
+        let duplicate_name = envelope.roots[1].name.clone();
+        envelope.roots[2].name = duplicate_name;
+        cases.push(("duplicate expected name", envelope, base_inventory.clone()));
+
+        let mut envelope = base_envelope.clone();
+        envelope.roots[1].name = "Root.7invalid".into();
+        cases.push((
+            "invalid expected spelling",
+            envelope,
+            base_inventory.clone(),
+        ));
+
+        let mut envelope = base_envelope.clone();
+        envelope.roots.last_mut().expect("sentinel root").name = "Root.complete_deadbeef".into();
+        cases.push((
+            "sentinel outside reserved prefix",
+            envelope,
+            base_inventory.clone(),
+        ));
+
+        for (description, envelope, inventory) in cases {
+            assert!(
+                preflight_declaration_inventory(&envelope, &inventory).is_err(),
+                "{description} must fail closed"
+            );
+        }
+    }
+
+    #[test]
     #[ignore = "cross-language canary; requires explicit built inventory executable and candidate olean paths"]
     fn declaration_inventory_cross_language_canary() {
         use std::io::Write as _;
@@ -6064,6 +6769,13 @@ mod proof_build_tests {
         assert_eq!(observation.declaration.expected_module_name, module_name);
         assert!(observation.declaration.inventory.observational);
         assert!(!observation.declaration.inventory.is_module);
+        assert!(observation.inventory_preflight.observational);
+        assert!(!observation.inventory_preflight.authoritative);
+        assert_eq!(observation.inventory_preflight.explicit_matches.len(), 1);
+        assert!(matches!(
+            &observation.inventory_preflight.explicit_matches[0].role,
+            DeclarationInventoryExplicitRole::TerminalSentinel { root_index: 0 }
+        ));
     }
 
     #[test]
