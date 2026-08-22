@@ -90,13 +90,13 @@ pub fn free_block_round_trip() -> u64 {
 ///     Sable.LeasedPointsToU64View.clear,
 ///     Sable.LeasedPointsToU64View.put,
 ///     Sable.BlockLeaseView.toCellU64, Sable.BlockLeaseView.toFree,
-///     Sable.FreeBlockView.toLease, Sable.FreeBlockView.prefix,
+///     Sable.FreeBlockView.toLease,
 ///     Sable.FreeBlockView.suffix, h_free8_take,
 ///     h_allocator_view6_create, h_mem_system,
 ///     Sable.AllocatorView.takeFree, Sable.AllocatorView.leaseAt,
 ///     Sable.AllocatorView.initial, Sable.SpanView.uninit]
 ///   unfold Sable.FreeBlockView.joinable
-///   simp [Sable.FreeBlockView.prefix, Sable.FreeBlockView.suffix]
+///   simp [Sable.FreeBlockView.prefix]
 
 /// discharge free_block_round_trip.allocator_put_free.2 by
 ///   unfold Sable.AllocatorView.canPutFree
