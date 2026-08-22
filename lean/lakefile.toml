@@ -9,3 +9,9 @@ name = "Sable"
 [[lean_exe]]
 name = "sable-proof-audit"
 root = "SableProofAudit"
+# The auditor loads the prelude with extensions and runs module initializers
+# through Lean's interpreter, which must resolve the executable's own native
+# symbols. Without this, Linux builds fail at runtime on the first `@[extern]`
+# initializer with "Could not find native implementation of external
+# declaration".
+supportInterpreter = true
